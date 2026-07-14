@@ -57,6 +57,8 @@ class ValidateMetrics:
     metrics: Optional[dict[str, Any]] = None
     global_steps: Optional[int] = None
     param_version: Optional[int] = None
+    first_sample_time: Optional[float] = None
+    cumulative_validation_time: Optional[float] = None
 
 
 def resolve_resume_path(config):

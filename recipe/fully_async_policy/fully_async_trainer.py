@@ -107,6 +107,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.progress_bar = None
         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
         self.last_ckpt_version = 0
+        self.cumulative_save_time = 0.0
+        self.rollouter_first_sample_time = None
+        self.rollouter_cumulative_validation_time = 0.0
         self.structured_metrics: dict[str, list[Any]] = defaultdict(list)
 
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
@@ -344,6 +347,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 self._save_checkpoint()
                 self.last_ckpt_version = self.current_param_version
+            self.cumulative_save_time += timing_raw.get("save_checkpoint", 0.0)
 
     def _save_checkpoint(self):
         # Warning: Currently, to align the training process and metrics of colocate,
@@ -506,7 +510,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.current_param_version += 1
         self.local_trigger_step = 1
         step_data = self.metrics_aggregator.get_aggregated_metrics()
-        step_data.update(process_structured_metrics(self.structured_metrics, allow_media = True))
+        allow_media = "wandb" in self.config.trainer.logger
+        step_data.update(process_structured_metrics(self.structured_metrics, allow_media=allow_media))
+        self._add_cumulative_time_metrics(step_data)
         self.structured_metrics = defaultdict(list)
         self.logger.log(
             data=step_data,
@@ -523,6 +529,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
         self.logger.log(data=timing_param_sync, step=self.current_param_version)
 
+    def _add_cumulative_time_metrics(self, step_data: dict, now: float = None):
+        if self.rollouter_first_sample_time is None:
+            return
+        now = time.time() if now is None else now
+        wall_time = now - self.rollouter_first_sample_time
+        step_data["fully_async/timing/wall_time_since_first_sample"] = wall_time
+        step_data["fully_async/timing/cumulative_validation_time"] = self.rollouter_cumulative_validation_time
+        step_data["fully_async/timing/cumulative_save_time"] = self.cumulative_save_time
+        step_data["fully_async/timing/cumulative_training_time"] = (
+            wall_time - self.rollouter_cumulative_validation_time - self.cumulative_save_time
+        )
+
     def _log_validation_data(self):
         """
         Log validation data
@@ -535,6 +553,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 break
 
             val_metrics: ValidateMetrics = ray.cloudpickle.loads(val_data)
+            if val_metrics.first_sample_time is not None:
+                self.rollouter_first_sample_time = val_metrics.first_sample_time
+            if val_metrics.cumulative_validation_time is not None:
+                self.rollouter_cumulative_validation_time = val_metrics.cumulative_validation_time
             if val_metrics.metrics:
                 self.logger.log(data=val_metrics.metrics, step=val_metrics.param_version)
                 pprint(
