@@ -143,6 +143,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.global_steps = 1
         self.idle_start_time = None
         self.version_start_time = None
+        # Wall-clock anchor for cumulative_training_time: set at the first
+        # training draw; pauses accumulate only post-anchor (val_before_train
+        # excluded).
+        self.first_sample_time = None
+        self.cumulative_validation_time = 0.0
 
         # Concurrency control
         # Modified by self.pause() or self._should_pause_generation()
@@ -246,8 +251,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             ) or (validate and self.val_reward_fn is not None):
                 with marked_timer("rollouter/validate_time", timing_raw, color="green"):
                     val_metrics: dict = self._validate()
+            val_time = timing_raw.get("rollouter/validate_time")
+            if val_time is not None and self.first_sample_time is not None:
+                self.cumulative_validation_time += val_time
             data = ValidateMetrics(
-                timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
+                timing_raw=timing_raw,
+                metrics=val_metrics,
+                global_steps=global_steps,
+                param_version=version,
+                first_sample_time=self.first_sample_time,
+                cumulative_validation_time=self.cumulative_validation_time,
             )
             await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
 
@@ -456,6 +469,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
+            if self.first_sample_time is None:
+                self.first_sample_time = time.time()
+                print(f"[FullyAsyncRollouter][Feed] First training sample drawn, t0={self.first_sample_time}")
             async with self.lock:
                 while self.paused or self.checkpointing:
                     await self.condition.wait()
