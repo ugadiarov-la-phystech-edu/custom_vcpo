@@ -446,10 +446,16 @@ class RayPPOTrainer:
             if len(v) == n:
                 base_data[k] = v
 
+        def _json_default(obj):
+            # numpy scalars/arrays (e.g. np.bool_ "acc" from math_dapo) are not JSON serializable
+            if hasattr(obj, "tolist"):
+                return obj.tolist()
+            return str(obj)
+
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=_json_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
