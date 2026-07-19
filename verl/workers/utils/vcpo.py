@@ -50,6 +50,9 @@ def allocate_grad_accum_buffers(
         accum_buffers: list[torch.Tensor] = []
         for grad_data in _iter_grad_buffers(modules):
             accum_buffers.append(torch.zeros_like(grad_data))
+    total_gb = sum(b.numel() * b.element_size() for b in accum_buffers) / 1024**3
+    dtypes = {str(b.dtype) for b in accum_buffers}
+    print(f"[vcpo] allocated grad accum buffers: {total_gb:.2f} GiB, dtypes={dtypes}")
     return accum_buffers
 
 def snapshot_grad_buffers(
