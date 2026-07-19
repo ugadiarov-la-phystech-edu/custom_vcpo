@@ -144,6 +144,7 @@ def get_model(
         if override_ddp_config is not None:
             ddp_config_dict.update(override_ddp_config)
         ddp_config = DistributedDataParallelConfig(**ddp_config_dict)
+        print(f"[get_model] DDP config resolved: {ddp_config_dict}")
         for model_chunk_idx, model_chunk in enumerate(model):
             ddp_model = DDP(
                 config=tfconfig,

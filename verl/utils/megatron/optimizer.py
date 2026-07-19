@@ -52,6 +52,8 @@ def init_megatron_optim_config(optim_config: dict, fp16: bool = False) -> Optimi
     override_config = optim_config.get("override_optimizer_config", {})
     if override_config:
         for k, v in override_config.items():
+            if k.endswith("_dtype") and isinstance(v, str):
+                v = getattr(torch, v)
             optim_args[k] = v
 
     print_rank_0(f"optimizer config after override: {optim_args}")
