@@ -23,22 +23,30 @@ import itertools
 import logging
 import os
 from contextlib import ExitStack
-from functools import partial
-from typing import Dict, Iterable, Tuple
 from dataclasses import asdict
+from functools import partial
+from typing import Iterable
 
 import torch
 import torch.distributed
 from megatron.core import parallel_state as mpu
 from megatron.core.distributed import finalize_model_grads
-from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
 
 # from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from omegaconf import OmegaConf
 from torch import nn
 
+from recipe.fully_async_policy.staleness_utils import (
+    TrajRecord,
+    compute_ess_info,
+    compute_grad_info,
+    compute_is_info,
+    compute_opob_baseline,
+    compute_staleness_statistics,
+)
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
@@ -51,14 +59,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
-from recipe.fully_async_policy.staleness_utils import (
-    TrajRecord,
-    compute_ess_info,
-    compute_grad_info,
-    compute_is_info,
-    compute_opob_baseline,
-    compute_staleness_statistics,
-)
+from verl.workers.actor.entropy_utils import log_entropy_and_apply_to_loss, should_calculate_entropy
 from verl.workers.utils.vcpo import (
     _get_local_model_grads_for_norm,
     accumulate_grad_buffers,
@@ -523,7 +524,6 @@ class MegatronPPOActor(BasePPOActor):
                     response_mask = modified_response_mask.bool()
                 advantages = data["advantages"]
 
-                entropy_coeff = self.config.entropy_coeff
                 loss_agg_mode = self.config.loss_agg_mode
 
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
@@ -564,9 +564,14 @@ class MegatronPPOActor(BasePPOActor):
             if calculate_entropy:
                 entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
                 if not forward_only:
-                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                    entropy_coeff = meta_info["entropy_coeff"]
-                    policy_loss = pg_loss - entropy_coeff * entropy_loss
+                    policy_loss = log_entropy_and_apply_to_loss(
+                        pg_loss=policy_loss,
+                        entropy=entropy,
+                        response_mask=response_mask,
+                        loss_agg_mode=loss_agg_mode,
+                        entropy_coeff=meta_info["entropy_coeff"],
+                        metrics=metrics,
+                    )
                 else:
                     ret_entropy = entropy
 
@@ -670,7 +675,12 @@ class MegatronPPOActor(BasePPOActor):
                         #     "`actor_rollout_ref.model.use_fused_kernels=True`. "
                         #     "The current `clone()` operation ensures correctness but increases memory usage."
                         # )
-                        entropy = vocab_parallel_entropy(logits)
+                        if self.config.entropy_coeff != 0:
+                            entropy = vocab_parallel_entropy(logits)
+                        else:
+                            # entropy is only logged, not part of the loss: no autograd graph needed
+                            with torch.no_grad():
+                                entropy = vocab_parallel_entropy(logits)
                         ret["entropy"] = entropy
                     else:
                         logits_bak = logits
@@ -760,7 +770,7 @@ class MegatronPPOActor(BasePPOActor):
         adv_scalar: float,
         *,
         microbatch_loss_scale: float = 1.0,
-    ) -> Tuple[float, float]:
+    ) -> tuple[float, float]:
         """
         Returns unscaled_grad_norm (not normalized by length), grad_norm.
         """
@@ -774,7 +784,9 @@ class MegatronPPOActor(BasePPOActor):
         else:
             # Use full local grads before any DP sharding to keep per-replica norms.
             grads = _get_local_model_grads_for_norm(self.actor_module)
-            unscaled_grad_norm = get_grad_norm_fp32(grads, grad_stats_parallel_group=mpu.get_tensor_model_parallel_group())
+            unscaled_grad_norm = get_grad_norm_fp32(
+                grads, grad_stats_parallel_group=mpu.get_tensor_model_parallel_group()
+            )
             if loss_agg_mode in ["seq-mean-token-mean"]:
                 unscaled_grad_norm *= response_len
 
@@ -808,8 +820,8 @@ class MegatronPPOActor(BasePPOActor):
             scale_baseline = 1
             if self.config.grad_baselining.scope == "group":
                 if norm_by_std and reward_std is not None and reward_std > 1e-8:
-                    scale_reward = (reward_scalar / reward_std) 
-                    scale_baseline = (1.0 / reward_std)
+                    scale_reward = reward_scalar / reward_std
+                    scale_baseline = 1.0 / reward_std
             else:
                 scale_reward = adv_scalar
                 scale_baseline = 1
@@ -842,7 +854,7 @@ class MegatronPPOActor(BasePPOActor):
         rollout_is_threshold: float | None,
         minibatch_idx: int = 0,
         do_grad_sync: bool = True,
-    ) -> Tuple[bool, Dict]:
+    ) -> tuple[bool, dict]:
         staleness_metrics = compute_ess_info(local_traj_records, rollout_is_threshold)
         minibatch_ess = staleness_metrics.get("ess")
         ess_ratio = staleness_metrics.get("ess_ratio")
@@ -918,7 +930,7 @@ class MegatronPPOActor(BasePPOActor):
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def update_policy_per_traj(self, dataloader: Iterable[DataProto], grad_baselining: bool = False) -> dict:
         """Update the policy with per-trajectory gradient norm capture.
-        
+
         Args:
             dataloader (Iterable[DataProto]): an iterator over the DataProto that returns by ``make_minibatch_iterator``
                 The keys of each data batch is described in the make_minibatch_iterator.
@@ -954,7 +966,7 @@ class MegatronPPOActor(BasePPOActor):
             for chunk in self.actor_module:
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            calculate_entropy = should_calculate_entropy(self.config)
             if minibatch.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = minibatch.meta_info["micro_batch_size"]
             else:
@@ -986,7 +998,7 @@ class MegatronPPOActor(BasePPOActor):
             if grad_baselining:
                 zero_grad_accum_buffers(score_gradient_buffers)
 
-            # Emulate Megatron schedule's loss scaling by num_microbatches=len(minibatch) 
+            # Emulate Megatron schedule's loss scaling by num_microbatches=len(minibatch)
             # Scaling loss instead of gradients avoids extra numeric/rounding differences
             minibatch.meta_info["loss_multiplier"] = microbatch_loss_scale
 
@@ -1031,7 +1043,9 @@ class MegatronPPOActor(BasePPOActor):
                         )
 
                 # Compute gradient norm statistics.
-                unscaled_grad_norm, grad_norm = self._compute_grad_norms(response_len, self.config.loss_agg_mode, adv_scalar, microbatch_loss_scale=microbatch_loss_scale)
+                unscaled_grad_norm, grad_norm = self._compute_grad_norms(
+                    response_len, self.config.loss_agg_mode, adv_scalar, microbatch_loss_scale=microbatch_loss_scale
+                )
 
                 traj_record = local_traj_records[traj_uid]
                 traj_record.grad_norm = grad_norm
@@ -1117,7 +1131,7 @@ class MegatronPPOActor(BasePPOActor):
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            calculate_entropy = should_calculate_entropy(self.config)
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:
