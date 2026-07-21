@@ -68,6 +68,7 @@ kl_loss_coef=0.0
 use_kl_in_reward=False
 kl_coef=0.0
 entropy_coeff=0
+calculate_entropy=True
 grad_clip=1.0
 
 lr=1e-6
@@ -177,6 +178,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.optim.weight_decay=${weight_decay} \
     actor_rollout_ref.actor.optim.clip_grad=${grad_clip} \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
+    actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.use_rollout_log_probs=${use_rollout_log_probs} \
     actor_rollout_ref.actor.update_policy_per_traj=${update_policy_per_traj} \
