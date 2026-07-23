@@ -119,24 +119,14 @@ def compute_global_ess_ratio(
 
 def compute_staleness_statistics(
     batch: DataProto, 
-    minibatch_idx: int, 
+    minibatch_idx: int,
     rollout_is_threshold: float | None,
     use_old_log_probs: bool = False,
+    epoch_idx: int = 0,
 ) -> Tuple[list[TrajRecord], Dict]:
-    """
-    Computes the local per-traj :class:`TrajRecord` list as well as ESS info.
-
-    Core fields populated here (see :class:`TrajRecord` for the full schema):
-        uid, group_uid, epoch_idx, minibatch_idx,
-        trainer_global_step, trainer_local_step,
-        param_version_start, param_version_end, trainer_param_version,
-        response_length, prompt_length, advantage_scalar, reward_scalar
-
-    The following fields are filled in later by the actor/trainer:
-        grad_norm, grad_norm_unscaled, traj_loss
-
-    When ``use_old_log_probs=True``, IS-related fields are also populated via
-    :func:`compute_is_info`.
+    """Compute the local per-trajectory :class:`TrajRecord` list and ESS info
+    (uid, group_uid, epoch_idx, minibatch_idx, ... populated here; see
+    :class:`TrajRecord` for the full schema).
     """
     traj_uids = batch.non_tensor_batch["traj_uid"]
     meta_info = getattr(batch, "meta_info", {}) or {}
@@ -182,7 +172,7 @@ def compute_staleness_statistics(
         record = TrajRecord(
             uid=traj_uid,
             group_uid=group_uid,
-            epoch_idx=0,
+            epoch_idx=int(epoch_idx),
             minibatch_idx=int(minibatch_idx),
             trainer_global_step=trainer_global_step,
             trainer_local_step=trainer_local_step,
