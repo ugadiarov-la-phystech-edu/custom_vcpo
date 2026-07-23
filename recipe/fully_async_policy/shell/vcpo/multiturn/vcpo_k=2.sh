@@ -47,7 +47,8 @@ max_response_length=12288
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 # ================= Megatron Parallelism =================
-train_tp=4
+# train_tp must not exceed n_gpus_training (2 by default on 4 GPUs)
+train_tp=2
 sequence_parallel=True
 train_pp=1
 train_cp=1
@@ -98,7 +99,7 @@ use_rollout_log_probs=True
 
 # ================= Multi-turn =================
 multi_turn_enable=True
-tool_config_path="recipe/fully_async_policy/code_sandbox/sandbox_tool_config.yaml"
+tool_config_path="recipe/fully_async_policy/code_sandbox/config/sandbox_tool_config.yaml"
 multi_turn_format="simple-tir"
 
 # ================= VCPO-specific =================
@@ -132,6 +133,7 @@ exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
 mkdir -p -- "${log_dir}"
+run_log_file="${log_dir}/run.log"
 
 # ================= Launch Sandbox =================
 sandbox_log_prefix="${log_dir}/code_sandbox_server"
@@ -253,7 +255,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.enable=${multi_turn_enable} \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
     actor_rollout_ref.rollout.multi_turn.format=${multi_turn_format} \
-    +ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_PORT="${SANDBOX_PORT}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_PORT="'${SANDBOX_PORT}'" \
     critic.megatron.tensor_model_parallel_size=${train_tp} \
     critic.megatron.pipeline_model_parallel_size=${train_pp} \
     critic.megatron.context_parallel_size=${train_cp} \
