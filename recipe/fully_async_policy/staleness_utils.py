@@ -119,9 +119,10 @@ def compute_global_ess_ratio(
 
 def compute_staleness_statistics(
     batch: DataProto, 
-    minibatch_idx: int, 
+    minibatch_idx: int,
     rollout_is_threshold: float | None,
     use_old_log_probs: bool = False,
+    epoch_idx: int = 0,
 ) -> Tuple[list[TrajRecord], Dict]:
     """
     Computes the local per-traj :class:`TrajRecord` list as well as ESS info.
@@ -182,7 +183,7 @@ def compute_staleness_statistics(
         record = TrajRecord(
             uid=traj_uid,
             group_uid=group_uid,
-            epoch_idx=0,
+            epoch_idx=int(epoch_idx),
             minibatch_idx=int(minibatch_idx),
             trainer_global_step=trainer_global_step,
             trainer_local_step=trainer_local_step,

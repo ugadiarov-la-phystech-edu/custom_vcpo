@@ -371,12 +371,21 @@ class MegatronPPOActor(BasePPOActor):
             data = data.select(select_keys, non_tensor_select_keys)
         else:
             data = data.select(batch_keys=select_keys)
-        return data.make_iterator(
+        n_minibatches_per_epoch = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
+        base_iterator = data.make_iterator(
             mini_batch_size=self.config.ppo_mini_batch_size,
             epochs=self.config.ppo_epochs,
             seed=self.config.data_loader_seed,
             dataloader_kwargs={"shuffle": self.config.shuffle},
         )
+
+        def _with_epoch_idx():
+            for i, minibatch in enumerate(base_iterator):
+                minibatch.meta_info["epoch_idx"] = i // n_minibatches_per_epoch
+                minibatch.meta_info["minibatch_idx_in_epoch"] = i % n_minibatches_per_epoch
+                yield minibatch
+
+        return _with_epoch_idx()
 
     def forward_backward_batch(
         self,
@@ -986,8 +995,10 @@ class MegatronPPOActor(BasePPOActor):
             minibatch_size = len(minibatch)
             microbatch_loss_scale = 1 / len(minibatch)
 
+            epoch_idx = int(minibatch.meta_info.get("epoch_idx", 0))
             local_traj_records, _ = compute_staleness_statistics(
-                minibatch, minibatch_idx, rollout_is_threshold, not skip_recompute_old_log_prob
+                minibatch, minibatch_idx, rollout_is_threshold, not skip_recompute_old_log_prob,
+                epoch_idx=epoch_idx,
             )
 
             if grad_baselining:
@@ -1088,7 +1099,7 @@ class MegatronPPOActor(BasePPOActor):
 
             minibatch_metrics["actor/minibatch_grad_info"] = [
                 {
-                    "epoch_idx": 0,
+                    "epoch_idx": epoch_idx,
                     "minibatch_idx": minibatch_idx,
                     "grad_norm": minibatch_metrics["actor/grad_norm"],
                     "trainer_global_step": minibatch.meta_info.get("trainer_global_step", -1),
