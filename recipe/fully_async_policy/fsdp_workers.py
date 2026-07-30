@@ -26,6 +26,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
     get_torch_device,
+    set_expandable_segments,
 )
 from verl.utils.fsdp_utils import (
     fsdp_version,
@@ -102,6 +103,15 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
 
 
 class DetachActorWorker(DetachNcclSync):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Trainer-process-only: expandable segments defragment the backward
+        # peak (bf16 FSDP2 + dynamic bsz OOMed on fragmentation, not
+        # capacity). Must NOT be set via the launch env: vLLM's sleep-mode
+        # allocator asserts against it and env vars reach the rollout
+        # processes.
+        set_expandable_segments(True)
+
     def _get_actor_params(self):
         assert self._is_actor
         params = self.actor_module_fsdp.state_dict()
