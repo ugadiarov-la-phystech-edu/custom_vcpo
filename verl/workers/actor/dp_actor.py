@@ -375,6 +375,24 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        # Deferred old-log-prob path (mirrors megatron_actor.update_policy): the trainer
+        # ships the batch without old_log_probs and without centrally computed IS weights;
+        # this actor anchors the ratio on its own forward pass and computes the
+        # rollout-correction weights per micro-batch instead.
+        skip_recompute_old_log_prob = bool(data.meta_info.get("skip_recompute_old_log_prob", False))
+        rollout_corr_config = None
+        if skip_recompute_old_log_prob:
+            rollout_corr_config = data.meta_info.get("rollout_corr_config")
+            if rollout_corr_config is None:
+                rollout_corr_config = self.config.policy_loss.get("rollout_correction", None)
+            if rollout_corr_config is None:
+                raise ValueError(
+                    "skip_recompute_old_log_prob=True requires rollout_corr_config in meta_info "
+                    "or policy_loss.rollout_correction in config."
+                )
+            if "rollout_log_probs" not in data.batch.keys():
+                raise ValueError("skip_recompute_old_log_prob=True requires rollout_log_probs in batch")
+
         select_keys = [
             "responses",
             "response_mask",
@@ -384,6 +402,8 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if skip_recompute_old_log_prob:
+            select_keys.remove("old_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
@@ -424,7 +444,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    old_log_prob = model_inputs["old_log_probs"]
+                    old_log_prob = None if skip_recompute_old_log_prob else model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
@@ -443,7 +463,35 @@ class DataParallelPPOActor(BasePPOActor):
                     )
 
                     # for fully_async_policy recipe
-                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
+                    if skip_recompute_old_log_prob:
+                        # Compute rollout-policy IS weights in the backward pass using this
+                        # update's own log-probs as the ratio anchor (see megatron_actor).
+                        from verl.trainer.ppo.rollout_corr_helper import (
+                            compute_rollout_correction_and_rejection_mask,
+                        )
+
+                        old_log_prob = log_prob.detach()
+                        rollout_is_weights_proto, modified_response_mask, deferred_corr_metrics = (
+                            compute_rollout_correction_and_rejection_mask(
+                                old_log_prob=old_log_prob,
+                                rollout_log_prob=model_inputs["rollout_log_probs"],
+                                response_mask=response_mask,
+                                rollout_is=rollout_corr_config.get("rollout_is", "token"),
+                                rollout_is_threshold=rollout_corr_config.get("rollout_is_threshold", 2.0),
+                                rollout_rs=rollout_corr_config.get("rollout_rs", None),
+                                rollout_rs_threshold=rollout_corr_config.get("rollout_rs_threshold", None),
+                                rollout_rs_threshold_lower=rollout_corr_config.get("rollout_rs_threshold_lower", None),
+                                rollout_token_veto_threshold=rollout_corr_config.get(
+                                    "rollout_token_veto_threshold", None
+                                ),
+                                rollout_is_batch_normalize=rollout_corr_config.get("rollout_is_batch_normalize", False),
+                            )
+                        )
+                        micro_batch_metrics.update(deferred_corr_metrics)
+                        if rollout_is_weights_proto is not None:
+                            model_inputs["rollout_is_weights"] = rollout_is_weights_proto.batch["rollout_is_weights"]
+                        response_mask = modified_response_mask.to(response_mask.dtype)
+                    elif hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
                     else:
                         if on_policy:
@@ -475,8 +523,13 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
+                    # or the deferred path above (metrics already computed there)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
-                    if loss_mode != "rollout_correction" and rollout_log_prob is not None:
+                    if (
+                        loss_mode != "rollout_correction"
+                        and rollout_log_prob is not None
+                        and not skip_recompute_old_log_prob
+                    ):
                         # Compute metrics using CURRENT policy π_θ vs π_rollout
                         # Tracks evolving off-policy gap as π_θ updates during mini-batch training
                         from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
