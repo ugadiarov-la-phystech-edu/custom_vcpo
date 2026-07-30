@@ -26,6 +26,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
     get_torch_device,
+    set_expandable_segments,
 )
 from verl.utils.megatron_utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu, per_tensor_generator
 from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
@@ -111,6 +112,10 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
 
 
 class DetachActorWorker(DetachNcclSync):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        set_expandable_segments(True)
+
     def _get_actor_params_generator(self):
         assert self._is_actor
         if self.bridge is not None:
