@@ -26,6 +26,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
     get_torch_device,
+    set_expandable_segments,
 )
 from verl.utils.megatron_utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu, per_tensor_generator
 from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
@@ -111,6 +112,18 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
 
 
 class DetachActorWorker(DetachNcclSync):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Trainer-process-only: expandable segments defragment the backward-pass
+        # peak. At tp=1 with 20480-token dynamic micro-batches the update OOMed
+        # on a ~9.6 GiB fp32 logits-sized alloc with ~10 GiB reserved-but-
+        # unallocated (Megatron 6+2 smoke, 2026-07-30) — capacity was sufficient,
+        # contiguity was not. Must NOT be set via the launch environment: vLLM's
+        # sleep-mode allocator hard-asserts against expandable segments
+        # (vllm/device_allocator/cumem.py), and env vars reach the rollout engine
+        # processes too. This worker class is trainer-only in this pipeline.
+        set_expandable_segments(True)
+
     def _get_actor_params_generator(self):
         assert self._is_actor
         if self.bridge is not None:
