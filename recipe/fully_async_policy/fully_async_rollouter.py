@@ -148,6 +148,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # excluded).
         self.first_sample_time = None
         self.cumulative_validation_time = 0.0
+        self.cumulative_checkpoint_pause = 0.0
 
         # Concurrency control
         # Modified by self.pause() or self._should_pause_generation()
@@ -282,6 +283,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         print(f"[FullyAsyncRollouter] Saved dataloader checkpoint to {dataloader_local_path}")
         if self.config.async_training.get("save_queue_state", True):
             print("[FullyAsyncRollouter] Pausing rollout to save queue state...")
+            # Only the queue-snapshot pause (not the dataloader save) shifts
+            # sample arrivals, so only it feeds the virtual timeline; taking
+            # pause_start inside the lock avoids double-counting time spent
+            # waiting behind a validation. Under stop-the-world saves the full
+            # window is accounted by end_save_pause instead — skip the
+            # narrower pause here.
+            pause_start = time.time()
             async with self.lock:
                 self.checkpointing = True
                 self.condition.notify_all()
@@ -310,6 +318,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 async with self.lock:
                     self.checkpointing = False
                 await self.resume()
+                if self.first_sample_time is not None:
+                    self.cumulative_checkpoint_pause += time.time() - pause_start
 
     def load_checkpoint(self):
         """Load checkpoint including dataloader state based on resume mode"""
@@ -604,6 +614,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             rollout_sample.param_version = self.current_param_version
             rollout_sample.rollout_status = await self.get_statistics()
             rollout_sample.agent_loop_output_list = []
+            # Stamp for the trainer's virtual timeline: the generation pauses
+            # that validation and checkpoint queue-snapshots have caused so
+            # far.
+            rollout_sample.enqueue_time = time.time()
+            rollout_sample.validation_pause_before = self.cumulative_validation_time
+            rollout_sample.checkpoint_pause_before = self.cumulative_checkpoint_pause
 
             success = await self.message_queue_client.put_sample(
                 sample=ray.cloudpickle.dumps(rollout_sample),

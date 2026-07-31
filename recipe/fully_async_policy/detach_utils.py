@@ -48,6 +48,13 @@ class RolloutSample:
     param_version_end: list[int]
     rollout_status: dict[str, Any]
 
+    # Virtual-timeline stamps for cumulative_training_time: enqueue wall-clock
+    # and the rollouter's validation/checkpoint pauses before it. Subtracting
+    # the pauses gives the sample's ready time in a no-validation-no-save run.
+    enqueue_time: Optional[float] = None
+    validation_pause_before: float = 0.0
+    checkpoint_pause_before: float = 0.0
+
 
 @dataclass
 class ValidateMetrics:
