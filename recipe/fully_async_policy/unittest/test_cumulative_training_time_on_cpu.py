@@ -17,11 +17,14 @@
   time only after the anchor exists
 - FullyAsyncTrainer accumulates checkpoint-save time, caches the rollouter
   values from ValidateMetrics, and computes the final metric
+- timing state survives a checkpoint round-trip (timing_state.json), so a
+  resumed run continues cumulative_training_time instead of restarting at zero
 
 Run: pytest recipe/fully_async_policy/unittest/test_cumulative_training_time_on_cpu.py
 """
 
 import asyncio
+import json
 import time
 
 import ray.cloudpickle
@@ -93,6 +96,15 @@ def _make_trainer(first_sample_time=None, cumulative_validation_time=0.0, cumula
     t.rollouter_first_sample_time = first_sample_time
     t.rollouter_cumulative_validation_time = cumulative_validation_time
     t.cumulative_save_time = cumulative_save_time
+    t.timing_wall_offset = 0.0
+    t.timing_validation_offset = 0.0
+    t.timing_save_offset = 0.0
+    t.virtual_free_time = None
+    t.virtual_training_time_offset = 0.0
+    t._step_virtual_start = None
+    t._step_actual_start = None
+    t._step_wait_valid_time = 0.0
+    t._step_save_time = 0.0
     t.current_param_version = 0
     t.last_ckpt_version = 0
     t.max_steps_duration = 0
@@ -235,7 +247,16 @@ def test_add_cumulative_time_metrics_math():
     assert step_data[TIMING_PREFIX + "wall_time_since_first_sample"] == 50.0
     assert step_data[TIMING_PREFIX + "cumulative_validation_time"] == 5.0
     assert step_data[TIMING_PREFIX + "cumulative_save_time"] == 2.0
-    assert step_data[TIMING_PREFIX + "cumulative_training_time"] == 43.0
+    # no batch has opened the virtual clock yet -> no exact metric
+    assert TIMING_PREFIX + "cumulative_training_time" not in step_data
+
+    # mid-step: started at virtual 120 / actual 130, 5s stalled on wait_last_valid
+    trainer._step_virtual_start = 120.0
+    trainer._step_actual_start = 130.0
+    trainer._step_wait_valid_time = 5.0
+    step_data = {}
+    trainer._add_cumulative_time_metrics(step_data, now=150.0)
+    assert step_data[TIMING_PREFIX + "cumulative_training_time"] == 120.0 + (150.0 - 130.0) - 5.0 - 100.0
 
 
 def test_add_cumulative_time_metrics_noop_without_anchor():
@@ -243,3 +264,254 @@ def test_add_cumulative_time_metrics_noop_without_anchor():
     step_data = {}
     trainer._add_cumulative_time_metrics(step_data, now=150.0)
     assert step_data == {}
+
+
+# ---------------------------------------------------------------- resume (timing_state.json)
+
+
+def test_timing_state_checkpoint_roundtrip(tmp_path):
+    saver = _make_trainer(first_sample_time=100.0, cumulative_validation_time=5.0, cumulative_save_time=2.0)
+    # mid-step save: virtual 120 / actual 130, 5s stalled on wait_last_valid
+    saver._step_virtual_start = 120.0
+    saver._step_actual_start = 130.0
+    saver._step_wait_valid_time = 5.0
+    saver._save_timing_state(str(tmp_path), save_start=150.0)
+
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    assert state == {
+        "wall_time_since_first_sample": 50.0,
+        "cumulative_validation_time": 5.0,
+        "cumulative_save_time": 2.0,
+        "cumulative_training_time": 35.0,  # virtual: 120 + (150-130) - 5 - 100
+    }
+
+    resumed = _make_trainer()
+    resumed._restore_timing_state(str(tmp_path))
+    assert resumed.timing_wall_offset == 50.0
+    assert resumed.timing_validation_offset == 5.0
+    assert resumed.timing_save_offset == 2.0
+    assert resumed.virtual_training_time_offset == 35.0
+
+    # resumed segment: 30s wall, 4s validation, 1s saving; a step opened at
+    # virtual 1010 / actual 1012 -> every metric continues from the totals.
+    resumed.rollouter_first_sample_time = 1000.0
+    resumed.rollouter_cumulative_validation_time = 4.0
+    resumed.cumulative_save_time = 1.0
+    resumed._step_virtual_start = 1010.0
+    resumed._step_actual_start = 1012.0
+    step_data = {}
+    resumed._add_cumulative_time_metrics(step_data, now=1030.0)
+    assert step_data[TIMING_PREFIX + "wall_time_since_first_sample"] == 80.0
+    assert step_data[TIMING_PREFIX + "cumulative_validation_time"] == 9.0
+    assert step_data[TIMING_PREFIX + "cumulative_save_time"] == 3.0
+    assert step_data[TIMING_PREFIX + "cumulative_training_time"] == (1010.0 + 18.0 - 1000.0) + 35.0
+
+
+def test_timing_state_save_carries_offsets_forward_without_anchor(tmp_path):
+    # A resumed run may checkpoint again before the rollouter reports its first
+    # sample; the previous run's totals must pass through unchanged.
+    trainer = _make_trainer(first_sample_time=None)
+    trainer.timing_wall_offset = 50.0
+    trainer.timing_validation_offset = 5.0
+    trainer.timing_save_offset = 2.0
+    trainer.virtual_training_time_offset = 35.0
+    trainer._save_timing_state(str(tmp_path), save_start=999.0)
+
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    assert state["wall_time_since_first_sample"] == 50.0
+    assert state["cumulative_validation_time"] == 5.0
+    assert state["cumulative_save_time"] == 2.0
+    assert state["cumulative_training_time"] == 35.0
+
+
+def test_timing_state_second_resume_chains_totals(tmp_path):
+    # run 1 -> checkpoint -> run 2 (with offsets) -> checkpoint -> run 3:
+    # totals must chain across multiple restarts, not just one.
+    run2 = _make_trainer(first_sample_time=200.0, cumulative_validation_time=3.0, cumulative_save_time=1.0)
+    run2.timing_wall_offset = 50.0
+    run2.timing_validation_offset = 5.0
+    run2.timing_save_offset = 2.0
+    run2.virtual_training_time_offset = 35.0
+    run2.virtual_free_time = 230.0  # between steps: last step ended at virtual 230
+    run2._save_timing_state(str(tmp_path), save_start=240.0)
+
+    run3 = _make_trainer()
+    run3._restore_timing_state(str(tmp_path))
+    assert run3.timing_wall_offset == 90.0
+    assert run3.timing_validation_offset == 8.0
+    assert run3.timing_save_offset == 3.0
+    assert run3.virtual_training_time_offset == (230.0 - 200.0) + 35.0
+
+
+def test_restore_timing_state_missing_file_keeps_zero_offsets(tmp_path):
+    trainer = _make_trainer()
+    trainer._restore_timing_state(str(tmp_path))
+    assert trainer.timing_wall_offset == 0.0
+    assert trainer.timing_validation_offset == 0.0
+    assert trainer.timing_save_offset == 0.0
+    assert trainer.virtual_training_time_offset == 0.0
+
+
+# ------------------------------------------------- virtual (no-validation) clock
+
+
+def _sample(enqueue_time, validation_pause_before=0.0, checkpoint_pause_before=0.0):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        enqueue_time=enqueue_time,
+        validation_pause_before=validation_pause_before,
+        checkpoint_pause_before=checkpoint_pause_before,
+    )
+
+
+def _run_step(trainer, consumer_end, samples, step_end, wait_valid=0.0, save_time=0.0):
+    """Drive one trainer step through the production virtual-clock hooks."""
+    trainer._step_wait_valid_time = wait_valid
+    trainer._step_save_time = save_time
+    trainer._open_virtual_step(consumer_end, samples)
+    trainer._advance_virtual_clock(now=step_end)
+    return trainer.virtual_free_time
+
+
+def test_virtual_clock_rollout_bound_matches_no_validation_run():
+    # Reference run (no validation): batches ready at t=10, 20 (R=10); trainer
+    # busy U=6 per step -> steps end at 16 and 26.
+    # Run with validation: an 8s validation pauses generation, so batch 2
+    # arrives at t=28 stamped (28, pause=8) -> virtual ready 20. The trainer
+    # idles 16..28 waiting; the metric must not count that induced wait.
+    trainer = _make_trainer(first_sample_time=0.0)
+    end1 = _run_step(trainer, consumer_end=10.0, samples=[_sample(10.0, 0.0)], step_end=16.0)
+    assert end1 == 16.0
+    end2 = _run_step(trainer, consumer_end=28.0, samples=[_sample(28.0, 8.0)], step_end=34.0)
+    assert end2 == 26.0, "virtual step 2 must end where the no-validation run ends"
+
+    step_data = {}
+    trainer._add_cumulative_time_metrics(step_data, now=34.0)
+    assert step_data[TIMING_PREFIX + "cumulative_training_time"] == 26.0
+
+
+def test_virtual_clock_trainer_bound_matches_no_validation_run():
+    # Reference run: batches ready at t=6, 12 (R=6); trainer busy U=10 -> steps
+    # end at 16 and 26; the trainer is the bottleneck throughout.
+    # Run with validation: batch 2 was enqueued at t=12 before an 8s validation
+    # (16..24); the trainer trains straight through it from backlog, so wall
+    # time is unchanged — and so must the metric be (a naive wall - validation
+    # subtraction would wrongly report 26 - 8 = 18 here).
+    trainer = _make_trainer(first_sample_time=0.0, cumulative_validation_time=8.0)
+    _run_step(trainer, consumer_end=6.0, samples=[_sample(6.0, 0.0)], step_end=16.0)
+    end2 = _run_step(trainer, consumer_end=16.0, samples=[_sample(12.0, 0.0)], step_end=26.0)
+    assert end2 == 26.0
+
+    step_data = {}
+    trainer._add_cumulative_time_metrics(step_data, now=26.0)
+    assert step_data[TIMING_PREFIX + "cumulative_training_time"] == 26.0
+
+
+def test_virtual_clock_excludes_wait_last_valid_stall():
+    # A 3s wait_last_valid stall inside the step is validation-caused and must
+    # not advance the virtual clock: 10s of measured step time -> 7s of busy.
+    trainer = _make_trainer(first_sample_time=0.0)
+    end = _run_step(trainer, consumer_end=10.0, samples=[_sample(10.0, 0.0)], step_end=20.0, wait_valid=3.0)
+    assert end == 17.0
+
+
+def test_virtual_clock_excludes_checkpoint_save_time():
+    # A 5s checkpoint save inside the step is not training and must not advance
+    # the virtual clock: 15s of measured step time -> 10s of busy.
+    trainer = _make_trainer(first_sample_time=0.0)
+    end = _run_step(trainer, consumer_end=10.0, samples=[_sample(10.0, 0.0)], step_end=25.0, save_time=5.0)
+    assert end == 20.0
+
+
+def test_open_virtual_step_takes_last_sample_and_handles_missing_stamps():
+    trainer = _make_trainer(first_sample_time=0.0)
+    trainer.virtual_free_time = 5.0
+    # batch ready = max over samples of (enqueue - val pause - ckpt pause)
+    #             = max(4, 9, 6) = 9
+    samples = [_sample(10.0, 6.0), _sample(11.0, 2.0), _sample(12.0, 5.0, checkpoint_pause_before=1.0)]
+    trainer._open_virtual_step(30.0, samples)
+    assert trainer._step_virtual_start == 9.0
+    assert trainer._step_actual_start == 30.0
+
+    # samples stamped before the checkpoint_pause field existed: pause = 0
+    from types import SimpleNamespace
+
+    trainer._open_virtual_step(35.0, [SimpleNamespace(enqueue_time=33.0, validation_pause_before=4.0)])
+    assert trainer._step_virtual_start == 29.0
+
+    # old-format samples without any stamps: fall back to the actual ready time
+    trainer._open_virtual_step(40.0, [SimpleNamespace()])
+    assert trainer._step_virtual_start == 40.0
+
+
+def test_rollouter_save_checkpoint_accumulates_pause(tmp_path):
+    def make_rollouter(first_sample_time, save_queue_state=True):
+        r = FullyAsyncRollouter.__new__(FullyAsyncRollouter)
+        r.condition = asyncio.Condition()
+        r.lock = r.condition._lock
+        r.checkpointing = False
+        r.dataloader_lock = asyncio.Lock()
+        r.train_dataloader = type("DL", (), {"state_dict": lambda self: {}})()
+        r.config = OmegaConf.create({"async_training": {"save_queue_state": save_queue_state}})
+        r.first_sample_time = first_sample_time
+        r.cumulative_checkpoint_pause = 0.0
+        r.global_steps = 1
+        r.staleness_samples = 0
+        r.total_generated_samples = 0
+        r.dropped_stale_samples = 0
+        r.processed_sample_count = 0
+        r.current_param_version = 1
+        r.message_queue_client = None
+
+        async def snapshot():
+            return {}
+
+        async def pause():
+            await asyncio.sleep(0.03)
+
+        async def resume():
+            pass
+
+        r._snapshot_internal_queues = snapshot
+        r.pause = pause
+        r.resume = resume
+        return r
+
+    # post-anchor: the pause window (>= the stubbed 0.03s pause) accumulates
+    rollouter = make_rollouter(first_sample_time=100.0)
+    asyncio.run(rollouter.save_checkpoint(str(tmp_path / "a")))
+    first = rollouter.cumulative_checkpoint_pause
+    assert first >= 0.03
+    asyncio.run(rollouter.save_checkpoint(str(tmp_path / "b")))
+    assert rollouter.cumulative_checkpoint_pause >= first + 0.03, "must accumulate across saves"
+
+    # pre-anchor: nothing accumulates
+    rollouter = make_rollouter(first_sample_time=None)
+    asyncio.run(rollouter.save_checkpoint(str(tmp_path / "c")))
+    assert rollouter.cumulative_checkpoint_pause == 0.0
+
+    # save_queue_state=False: no pause happens, nothing accumulates
+    rollouter = make_rollouter(first_sample_time=100.0, save_queue_state=False)
+    asyncio.run(rollouter.save_checkpoint(str(tmp_path / "d")))
+    assert rollouter.cumulative_checkpoint_pause == 0.0
+
+
+def test_advance_virtual_clock_noop_between_steps():
+    trainer = _make_trainer(first_sample_time=0.0)
+    trainer.virtual_free_time = 26.0
+    trainer._advance_virtual_clock(now=99.0)  # no open step: must not move
+    assert trainer.virtual_free_time == 26.0
+
+
+def test_restore_timing_state_old_format_falls_back_to_naive(tmp_path):
+    # Checkpoints written before the virtual-clock metric may lack the
+    # cumulative_training_time key entirely: fall back to wall - val - save.
+    (tmp_path / "timing_state.json").write_text(
+        json.dumps(
+            {"wall_time_since_first_sample": 50.0, "cumulative_validation_time": 5.0, "cumulative_save_time": 2.0}
+        )
+    )
+    trainer = _make_trainer()
+    trainer._restore_timing_state(str(tmp_path))
+    assert trainer.virtual_training_time_offset == 43.0
