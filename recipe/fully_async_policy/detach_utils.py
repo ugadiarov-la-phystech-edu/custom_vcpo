@@ -48,6 +48,10 @@ class RolloutSample:
     param_version_end: list[int]
     rollout_status: dict[str, Any]
 
+    enqueue_time: Optional[float] = None
+    validation_pause_before: float = 0.0
+    checkpoint_pause_before: float = 0.0
+
 
 @dataclass
 class ValidateMetrics:
