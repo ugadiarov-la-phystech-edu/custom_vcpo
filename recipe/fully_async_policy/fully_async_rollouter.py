@@ -30,7 +30,7 @@ from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.ppo.reward import compute_reward, load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
@@ -128,6 +128,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.bsz_per_dp_rank = int(config.async_training.get("bsz_per_dp_rank", 16))
         assert self.bsz_per_dp_rank > 0, "async_training.bsz_per_dp_rank must be positive"
+        # Elastic DAPO-style dynamic filtering: drop zero-advantage-variance
+        # groups at completion, but only while the queue already buffers
+        # >= min_buffered_batches full trainer batches (trainer-bound regime).
+        filtering_cfg = config.async_training.get("dynamic_filtering", None)
+        self.dynamic_filtering_enable = bool(filtering_cfg.get("enable", False)) if filtering_cfg else False
+        self.dynamic_filtering_min_buffered = (
+            float(filtering_cfg.get("min_buffered_batches", 1.0)) if filtering_cfg else 1.0
+        )
         self.max_required_samples = None
         self.max_concurrent_samples = None
         # queue size
@@ -138,6 +146,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.total_generated_samples = 0
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
+        self.filtered_degenerate_groups = 0
         self.processed_sample_count = 0
         # we start from step 1
         self.global_steps = 1
@@ -343,6 +352,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         "staleness_samples": self.staleness_samples,
                         "total_generated_samples": self.total_generated_samples,
                         "dropped_stale_samples": self.dropped_stale_samples,
+                        "filtered_degenerate_groups": self.filtered_degenerate_groups,
                         "processed_sample_count": self.processed_sample_count,
                         "current_param_version": self.current_param_version,
                     }
@@ -429,6 +439,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.staleness_samples = int(queue_state.get("staleness_samples", self.staleness_samples))
                 self.total_generated_samples = int(queue_state.get("total_generated_samples", self.total_generated_samples))
                 self.dropped_stale_samples = int(queue_state.get("dropped_stale_samples", self.dropped_stale_samples))
+                self.filtered_degenerate_groups = int(
+                    queue_state.get("filtered_degenerate_groups", self.filtered_degenerate_groups)
+                )
                 self.processed_sample_count = int(queue_state.get("processed_sample_count", self.processed_sample_count))
                 self.current_param_version = int(queue_state.get("current_param_version", self.current_param_version))
                 print(f"[FullyAsyncRollouter] Loaded rollout queue state from {queue_local_path}")
@@ -638,6 +651,40 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.pending_queue.task_done()
 
+    def _group_is_degenerate(self, rollout_sample: RolloutSample) -> bool:
+        """Score the completed group with the trainer's reward function (cheap,
+        rule-based for math) and report whether it carries zero advantage
+        signal: all n responses got the identical reward (all-correct or
+        all-wrong), so GRPO's group-centered advantages are exactly zero.
+        Mirrors DAPO's filter_groups rule (keep if std > 0 or group of 1).
+        Fails open: any scoring problem keeps the group."""
+        batch = rollout_sample.full_batch
+        if self.reward_fn is None or batch is None or len(batch) <= 1:
+            return False
+        try:
+            reward_tensor, _ = compute_reward(batch, self.reward_fn)
+            scores = reward_tensor.sum(dim=-1)
+            return bool((scores == scores[0]).all().item())
+        except Exception as e:
+            print(f"[FullyAsyncRollouter][Filter] scoring failed, keeping group: {e}")
+            return False
+
+    async def _should_drop_degenerate(self, rollout_sample: RolloutSample) -> bool:
+        """Elastic DAPO-style dynamic filtering (drop-side of the Tier-1 plan):
+        drop a degenerate group ONLY when the message queue already buffers at
+        least min_buffered_batches full trainer batches — i.e. only when the
+        pipeline is trainer-bound and the regeneration this drop licenses is
+        free. When the queue runs shallow (rollout-bound) everything passes
+        through, because there the trade would spend the scarce resource
+        (generation) to save the idle one (trainer compute). The queue depth is
+        the regime detector; no thresholds beyond required_samples."""
+        if not self.dynamic_filtering_enable:
+            return False
+        queue_size = await self.message_queue_client.get_queue_size()
+        if queue_size < self.dynamic_filtering_min_buffered * self.required_samples:
+            return False
+        return self._group_is_degenerate(rollout_sample)
+
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
@@ -653,6 +700,19 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
             )
             rollout_sample.param_version = self.current_param_version
+            if await self._should_drop_degenerate(rollout_sample):
+                # Zero-signal group dropped while a full batch is already
+                # buffered: decrement the staleness quota so the freed slot
+                # licenses a replacement generation within the same budget.
+                self.filtered_degenerate_groups += 1
+                self.staleness_samples -= 1
+                self.processed_sample_count += 1
+                if self.filtered_degenerate_groups % 10 == 1:
+                    print(
+                        f"[FullyAsyncRollouter][Filter] dropped degenerate group "
+                        f"{rollout_sample.sample_id} (total filtered: {self.filtered_degenerate_groups})"
+                    )
+                return
             rollout_sample.rollout_status = await self.get_statistics()
             rollout_sample.agent_loop_output_list = []
             # Stamp the sample for the trainer's virtual (no-validation-no-save)
@@ -859,6 +919,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
+            "count/filtered_degenerate_groups": self.filtered_degenerate_groups,
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,
