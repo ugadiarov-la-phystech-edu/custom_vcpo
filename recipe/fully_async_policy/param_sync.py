@@ -111,3 +111,9 @@ class ParameterSynchronizer:
         """Trigger rollout to save checkpoint(dataloader)"""
         print(f"[ParameterSynchronizer] Triggering checkpoint save at {local_global_step_folder} ...")
         return ray.get(self.rollouter.save_checkpoint.remote(local_global_step_folder))
+
+    def pause_rollouter_for_save(self):
+        return ray.get(self.rollouter.begin_save_pause.remote())
+
+    def resume_rollouter_after_save(self):
+        return ray.get(self.rollouter.end_save_pause.remote())

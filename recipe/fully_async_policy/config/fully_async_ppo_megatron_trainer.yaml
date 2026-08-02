@@ -33,6 +33,18 @@ async_training:
   # save partial rollouts and completed rollouts in the replay buffer queue
   save_queue_state: True
 
+  opportunistic_epochs:
+
+    enable: False
+
+    max_extra_epochs: 3
+
+    shuffle_seed: 1234
+
+  serialize_validation: False
+
+  pause_generation_during_save: False
+
 # Rollout config
 rollout:
 
