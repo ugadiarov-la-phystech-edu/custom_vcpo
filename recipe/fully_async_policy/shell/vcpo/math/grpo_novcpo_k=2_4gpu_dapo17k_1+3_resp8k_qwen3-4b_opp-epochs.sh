@@ -24,6 +24,10 @@
 #     of the base (32 groups x 8 responses = 256 sequences), but total
 #     concurrency halves -> this layout is heavily rollout-bound (R ~2x T at
 #     mini-batch 33: ~280 s generation vs ~130-150 s update per step).
+#   * use_dynamic_bsz=True, ppo_max_token_len=16384: token-budget micro-batch
+#     packing (1.5-3x faster updates per the 6+2 dynbsz measurements). Wall-
+#     clock neutral here (rollout-bound), but it lets more opportunistic extra
+#     epochs fit into each generation wait.
 #   * OPPORTUNISTIC PPO EPOCHS ON (this is the opportunistic arm): while the
 #     queue holds no full next batch, the trainer runs extra shuffled passes
 #     over the current 33-group batch (up to opportunistic_max_extra_epochs per
@@ -90,7 +94,14 @@ train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=33 # 33 groups = 3*11 divide by trainer dp=3 for any n
 micro_bsz_per_gpu=1
-use_dynamic_bsz=False
+# Dynamic token-budget micro-batching (pattern of the 6+2 dynbsz scripts):
+# packs ~2-5 seqs per micro-batch instead of 1, measured 1.5-3x faster updates.
+# Wall-clock neutral in this rollout-bound layout, but it multiplies the
+# opportunistic reuse: faster updates -> more extra epochs fit in the same
+# generation wait. 16384 = 2x the 8192 max seq; fp32 logits/entropy transients
+# ~10 GB at 151k vocab, comfortable next to the ~32 GB static at dp=3.
+use_dynamic_bsz=${use_dynamic_bsz:-True}
+ppo_max_token_len=${ppo_max_token_len:-16384}
 log_prob_micro_bsz_per_gpu=1
 
 # Concurrency knob is NOT a throughput lever here: this caps in-flight
@@ -169,7 +180,7 @@ save_freq=20             # checkpoint every 20 param versions (= every 20 steps 
 max_actor_ckpt_to_keep=1 # keep only the most recent checkpoint
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO k-${staleness_threshold} DAPO17K-AIME24 Qwen3-4B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 B-${train_prompt_mini_bsz} opp-epochs-${opportunistic_max_extra_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO k-${staleness_threshold} DAPO17K-AIME24 Qwen3-4B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 dynbsz B-${train_prompt_mini_bsz} opp-epochs-${opportunistic_max_extra_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -220,6 +231,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
@@ -253,6 +265,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.megatron.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.ref.megatron.param_offload=True \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
@@ -271,6 +284,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.n=${val_n:-1} \
     actor_rollout_ref.rollout.calculate_log_probs=${calculate_log_probs} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
     critic.megatron.tensor_model_parallel_size=${train_tp} \
     critic.megatron.pipeline_model_parallel_size=${train_pp} \
