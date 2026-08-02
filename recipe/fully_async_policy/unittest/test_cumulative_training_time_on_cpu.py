@@ -451,6 +451,8 @@ def test_rollouter_save_checkpoint_accumulates_pause(tmp_path):
         r.condition = asyncio.Condition()
         r.lock = r.condition._lock
         r.checkpointing = False
+        r._external_save_pause_active = False
+        r._external_save_pause_start = None
         r.dataloader_lock = asyncio.Lock()
         r.train_dataloader = type("DL", (), {"state_dict": lambda self: {}})()
         r.config = OmegaConf.create({"async_training": {"save_queue_state": save_queue_state}})
