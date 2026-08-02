@@ -462,6 +462,7 @@ def test_rollouter_save_checkpoint_accumulates_pause(tmp_path):
         r.staleness_samples = 0
         r.total_generated_samples = 0
         r.dropped_stale_samples = 0
+        r.filtered_degenerate_groups = 0
         r.processed_sample_count = 0
         r.current_param_version = 1
         r.message_queue_client = None

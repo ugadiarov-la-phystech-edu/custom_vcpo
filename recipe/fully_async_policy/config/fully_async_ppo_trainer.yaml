@@ -41,6 +41,12 @@ async_training:
 
     shuffle_seed: 1234
 
+  dynamic_filtering:
+
+    enable: False
+
+    min_buffered_batches: 1.0
+
   serialize_validation: False
 
   pause_generation_during_save: False
