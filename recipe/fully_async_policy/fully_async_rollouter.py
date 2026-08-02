@@ -149,6 +149,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.first_sample_time = None
         self.cumulative_validation_time = 0.0
         self.cumulative_checkpoint_pause = 0.0
+        # Stop-the-world saves: the trainer freezes generation for the whole
+        # save via begin/end_save_pause; save_checkpoint then skips its
+        # narrower pause.
+        self._external_save_pause_active = False
+        self._external_save_pause_start = None
 
         # Concurrency control
         # Modified by self.pause() or self._should_pause_generation()
@@ -267,6 +272,28 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             self.version_start_time = time.time()
 
+    async def begin_save_pause(self):
+        """Freeze generation for the entire checkpoint save (stop-the-world
+        saves).
+        """
+        async with self.lock:
+            self._external_save_pause_start = time.time()
+            self._external_save_pause_active = True
+            self.checkpointing = True
+            self.condition.notify_all()
+        await self.pause()
+
+    async def end_save_pause(self):
+        """Resume generation after a stop-the-world save and account the full
+        pause window (post-anchor only, like all virtual-clock accumulators)."""
+        async with self.lock:
+            self.checkpointing = False
+        await self.resume()
+        self._external_save_pause_active = False
+        if self._external_save_pause_start is not None and self.first_sample_time is not None:
+            self.cumulative_checkpoint_pause += time.time() - self._external_save_pause_start
+        self._external_save_pause_start = None
+
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
         # (pending/cancel/result queue and message queue).
@@ -282,18 +309,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         torch.save(dataloader_state_dict, dataloader_local_path)
         print(f"[FullyAsyncRollouter] Saved dataloader checkpoint to {dataloader_local_path}")
         if self.config.async_training.get("save_queue_state", True):
-            print("[FullyAsyncRollouter] Pausing rollout to save queue state...")
             # Only the queue-snapshot pause (not the dataloader save) shifts
             # sample arrivals, so only it feeds the virtual timeline; taking
             # pause_start inside the lock avoids double-counting time spent
             # waiting behind a validation. Under stop-the-world saves the full
             # window is accounted by end_save_pause instead — skip the
             # narrower pause here.
-            pause_start = time.time()
-            async with self.lock:
-                self.checkpointing = True
-                self.condition.notify_all()
-            await self.pause()
+            externally_paused = self._external_save_pause_active
+            if not externally_paused:
+                print("[FullyAsyncRollouter] Pausing rollout to save queue state...")
+                async with self.lock:
+                    pause_start = time.time()
+                    self.checkpointing = True
+                    self.condition.notify_all()
+                await self.pause()
 
             try:
                 queue_state = await self._snapshot_internal_queues()
@@ -315,11 +344,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 if self.message_queue_client is not None:
                     await self.message_queue_client.save_state(local_global_step_folder)
             finally:
-                async with self.lock:
-                    self.checkpointing = False
-                await self.resume()
-                if self.first_sample_time is not None:
-                    self.cumulative_checkpoint_pause += time.time() - pause_start
+                if not externally_paused:
+                    async with self.lock:
+                        self.checkpointing = False
+                    await self.resume()
+                    if self.first_sample_time is not None:
+                        self.cumulative_checkpoint_pause += time.time() - pause_start
 
     def load_checkpoint(self):
         """Load checkpoint including dataloader state based on resume mode"""

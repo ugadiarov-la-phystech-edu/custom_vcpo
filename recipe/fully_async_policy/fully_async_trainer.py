@@ -40,6 +40,33 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.debug import marked_timer
+from verl.utils.metric import reduce_metrics
+
+
+def make_opportunistic_minibatch_indices(uids, num_minibatches: int, rng) -> list[np.ndarray]:
+    """Split a batch into ``num_minibatches`` equal group-complete mini-batches
+    in shuffled group order. Raises ValueError on unequal group sizes or a
+    group count not divisible by ``num_minibatches``.
+    """
+    uids = np.asarray(uids)
+    indices_by_uid: dict[Any, list[int]] = {}
+    for idx, uid in enumerate(uids.tolist()):
+        indices_by_uid.setdefault(uid, []).append(idx)
+    group_uids = list(indices_by_uid.keys())
+    group_sizes = {len(v) for v in indices_by_uid.values()}
+    if len(group_sizes) != 1:
+        raise ValueError(f"Prompt groups have unequal sizes {sorted(group_sizes)}; cannot form equal mini-batches")
+    if len(group_uids) % num_minibatches != 0:
+        raise ValueError(f"{len(group_uids)} groups not divisible into {num_minibatches} mini-batches")
+    groups_per_minibatch = len(group_uids) // num_minibatches
+    perm = rng.permutation(len(group_uids))
+    minibatch_indices = []
+    for m in range(num_minibatches):
+        selected = []
+        for g in perm[m * groups_per_minibatch : (m + 1) * groups_per_minibatch]:
+            selected.extend(indices_by_uid[group_uids[g]])
+        minibatch_indices.append(np.asarray(selected, dtype=np.int64))
+    return minibatch_indices
 
 
 @ray.remote(num_cpus=10)
@@ -135,6 +162,19 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        # Opportunistic PPO epochs: extra shuffled mini-batch updates on the
+        # current batch while the queue does not yet hold a full next batch.
+        opportunistic_cfg = config.async_training.get("opportunistic_epochs", None)
+        self.opportunistic_enable = bool(opportunistic_cfg.get("enable", False)) if opportunistic_cfg else False
+        self.opportunistic_max_extra_epochs = (
+            int(opportunistic_cfg.get("max_extra_epochs", 3)) if opportunistic_cfg else 0
+        )
+        self.opportunistic_shuffle_seed = int(opportunistic_cfg.get("shuffle_seed", 1234)) if opportunistic_cfg else 0
+        # Stop-the-world accounting: freeze the pipeline during validation and
+        # generation during saves, so both become pure time translations and
+        # the clock/trajectory match a no-validation-no-save run.
+        self.serialize_validation = bool(config.async_training.get("serialize_validation", False))
+        self.pause_generation_during_save = bool(config.async_training.get("pause_generation_during_save", False))
         self.compute_prox_log_prob = self.config.async_training.compute_prox_log_prob
         total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
@@ -230,6 +270,66 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             print(f"[FullyAsyncTrainer] reward_scalar found with avg={avg_reward}")
         return 0, batch
 
+    def _run_opportunistic_epochs(self, batch, metrics, timing_raw):
+        """Opportunistic PPO epochs (rollout-bound elasticity): while the queue
+        lacks a full next batch, replay extra shuffled group-complete mini-
+        batch updates on the current batch (queue re-checked before every
+        mini-batch; at most max_extra_epochs full epochs; runs before the
+        parameter sync).
+        """
+        if not self.opportunistic_enable or self.opportunistic_max_extra_epochs <= 0:
+            return
+        extra_updates = 0
+        extra_epochs_completed = 0
+        queue_ready = False
+        with marked_timer("opportunistic_extra", timing_raw, color="yellow"):
+            rng = np.random.default_rng(self.opportunistic_shuffle_seed + self.global_steps)
+            for extra_epoch in range(1, self.opportunistic_max_extra_epochs + 1):
+                try:
+                    minibatch_indices = make_opportunistic_minibatch_indices(
+                        batch.non_tensor_batch["uid"], self.require_batches, rng
+                    )
+                except (KeyError, ValueError) as e:
+                    # A malformed batch (missing uids, unequal group sizes, ...)
+                    # must not kill the run over an *optional* extra pass.
+                    print(
+                        f"[FullyAsyncTrainer] opportunistic epochs skipped: cannot form mini-batches ({e})",
+                        flush=True,
+                    )
+                    break
+                epoch_metrics = defaultdict(list)
+                for minibatch_idx in minibatch_indices:
+                    if self.message_queue_client.get_queue_size_sync() >= self.required_samples:
+                        queue_ready = True
+                        break
+                    subset = batch.select_idxs(minibatch_idx)
+                    # select_idxs shares meta_info by reference; copy before stamping
+                    subset.meta_info = dict(batch.meta_info)
+                    subset.meta_info["global_token_num"] = subset.batch["attention_mask"].sum(dim=-1).tolist()
+                    subset.meta_info["opportunistic_extra_epoch"] = extra_epoch
+                    actor_output = self.actor_rollout_wg.update_actor(subset)
+                    for key, value in reduce_metrics(actor_output.meta_info["metrics"]).items():
+                        epoch_metrics[key].append(value)
+                    extra_updates += 1
+                # Per-extra-epoch actor/IS diagnostics (the scheduled pass keeps
+                # the unprefixed keys); partial epochs log whatever ran.
+                for key, values in epoch_metrics.items():
+                    if key.startswith("actor/") or key.startswith("rollout_corr/"):
+                        metrics[f"opportunistic/epoch_{extra_epoch}/{key}"] = float(np.mean(values))
+                if queue_ready:
+                    break
+                extra_epochs_completed += 1
+        metrics["opportunistic/extra_updates"] = extra_updates
+        metrics["opportunistic/extra_epochs_completed"] = extra_epochs_completed
+        metrics["opportunistic/extra_epochs"] = extra_updates / self.require_batches
+        if extra_updates > 0:
+            print(
+                f"[FullyAsyncTrainer] opportunistic epochs at step {self.global_steps}: "
+                f"{extra_updates} extra mini-batch updates "
+                f"({extra_epochs_completed} full epochs, cap {self.opportunistic_max_extra_epochs})",
+                flush=True,
+            )
+
     def _create_actor_rollout_classes(self):
         # create actor
         for role in [Role.Actor]:
@@ -315,6 +415,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None
                 )
                 self._log_rollout(batch, reward_extra_infos_dict, timing_raw)
+                self._run_opportunistic_epochs(batch, metrics, timing_raw)
 
             self._collect_metrics(batch, 0, metrics, timing_raw)
             structured_metrics = self.metrics_aggregator.add_step_metrics(
@@ -376,6 +477,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._step_save_time += timing_raw.get("save_checkpoint", 0.0)
 
     def _save_checkpoint(self):
+        if self.pause_generation_during_save:
+            # Stop-the-world save: freeze generation for the entire save (not
+            # just the queue snapshot); the rollouter accounts the pause at
+            # resume.
+            ray.get(self.param_synchronizer.pause_rollouter_for_save.remote())
+        try:
+            self._save_checkpoint_inner()
+        finally:
+            if self.pause_generation_during_save:
+                ray.get(self.param_synchronizer.resume_rollouter_after_save.remote())
+
+    def _save_checkpoint_inner(self):
         save_start = time.time()
         # Warning: Currently, to align the training process and metrics of colocate,
         # we use current_param_version instead of global step.
@@ -610,7 +723,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     self.current_param_version, validate=validate, global_steps=global_steps
                 )
             )
+        if self.serialize_validation and (validate or self._sync_triggers_validation()):
+            # Stop-the-world validation: block until the sweep completes
+            # instead of training ahead on backlog; generation is paused, so
+            # the whole pipeline freezes (a pure time translation of the no-
+            # validation schedule).
+            with marked_timer("timing_s/wait_validation_serialized", timing_param_sync):
+                ray.get(self.param_synchronizer.wait_last_valid.remote())
+            self._step_wait_valid_time += timing_param_sync["timing_s/wait_validation_serialized"]
         self.logger.log(data=timing_param_sync, step=self.current_param_version)
+
+    def _sync_triggers_validation(self) -> bool:
+        """Mirror of the rollouter's validation decision in update_param_version;
+        a false positive returns immediately and costs nothing.
+        """
+        test_freq = self.config.rollout.test_freq
+        return test_freq > 0 and self.current_param_version > 0 and self.current_param_version % test_freq == 0
 
     def _open_virtual_step(self, consumer_end: float, queue_samples: list):
         """Start this step on the virtual (no-validation-no-save) timeline: at
