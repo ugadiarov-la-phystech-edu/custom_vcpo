@@ -53,7 +53,8 @@ train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=33
 micro_bsz_per_gpu=1
-use_dynamic_bsz=False
+use_dynamic_bsz=${use_dynamic_bsz:-True}
+ppo_max_token_len=${ppo_max_token_len:-16384}
 log_prob_micro_bsz_per_gpu=1
 
 bsz_per_dp_rank=32
@@ -103,7 +104,7 @@ test_freq=${test_freq:-20}
 save_freq=20
 max_actor_ckpt_to_keep=1
 
-exp_name=${exp_name:-"GRPO-noVCPO k-${staleness_threshold} DAPO17K-AIME24 Qwen3-4B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 B-${train_prompt_mini_bsz} opp-epochs-${opportunistic_max_extra_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO k-${staleness_threshold} DAPO17K-AIME24 Qwen3-4B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 dynbsz B-${train_prompt_mini_bsz} opp-epochs-${opportunistic_max_extra_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -152,6 +153,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
@@ -185,6 +187,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.megatron.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.ref.megatron.param_offload=True \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
@@ -203,6 +206,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.n=${val_n:-1} \
     actor_rollout_ref.rollout.calculate_log_probs=${calculate_log_probs} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
     critic.megatron.tensor_model_parallel_size=${train_tp} \
     critic.megatron.pipeline_model_parallel_size=${train_pp} \
