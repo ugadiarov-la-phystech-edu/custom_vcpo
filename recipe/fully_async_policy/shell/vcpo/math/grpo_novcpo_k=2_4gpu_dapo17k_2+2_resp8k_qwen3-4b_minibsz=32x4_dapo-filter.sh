@@ -292,4 +292,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.skip_recompute_old_log_prob="${skip_recompute_old_log_prob}" \
     async_training.dynamic_filtering.enable="${dynamic_filtering_enable}" \
     async_training.dynamic_filtering.min_buffered_batches="${min_buffered_batches}" \
+    async_training.opportunistic_epochs.enable="${opportunistic_enable}" \
+    async_training.opportunistic_epochs.max_extra_epochs="${opportunistic_max_extra_epochs}" \
+    async_training.serialize_validation="${serialize_validation}" \
+    async_training.pause_generation_during_save="${pause_generation_during_save}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
