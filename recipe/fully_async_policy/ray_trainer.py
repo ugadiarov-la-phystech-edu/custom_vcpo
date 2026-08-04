@@ -19,8 +19,10 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import uuid
+from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
+from typing import Any
 
 import numpy as np
 import ray
@@ -47,6 +49,32 @@ from verl.utils.metric import (
     reduce_metrics,
 )
 from verl.utils.rollout_skip import RolloutSkip
+
+
+def make_opportunistic_minibatch_indices(uids, num_minibatches: int, rng) -> list[np.ndarray]:
+    """Split a batch into ``num_minibatches`` equal group-complete mini-batches
+    in shuffled group order. Raises ValueError on unequal group sizes or a
+    group count not divisible by ``num_minibatches``.
+    """
+    uids = np.asarray(uids)
+    indices_by_uid: dict[Any, list[int]] = {}
+    for idx, uid in enumerate(uids.tolist()):
+        indices_by_uid.setdefault(uid, []).append(idx)
+    group_uids = list(indices_by_uid.keys())
+    group_sizes = {len(v) for v in indices_by_uid.values()}
+    if len(group_sizes) != 1:
+        raise ValueError(f"Prompt groups have unequal sizes {sorted(group_sizes)}; cannot form equal mini-batches")
+    if len(group_uids) % num_minibatches != 0:
+        raise ValueError(f"{len(group_uids)} groups not divisible into {num_minibatches} mini-batches")
+    groups_per_minibatch = len(group_uids) // num_minibatches
+    perm = rng.permutation(len(group_uids))
+    minibatch_indices = []
+    for m in range(num_minibatches):
+        selected = []
+        for g in perm[m * groups_per_minibatch : (m + 1) * groups_per_minibatch]:
+            selected.extend(indices_by_uid[group_uids[g]])
+        minibatch_indices.append(np.asarray(selected, dtype=np.int64))
+    return minibatch_indices
 
 
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
@@ -474,13 +502,67 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # implement critic warmup
         if self.config.trainer.critic_warmup <= self.global_steps:
-            # update actor
-            with marked_timer("update_actor", timing_raw, color="red"):
-                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                actor_output = self.actor_rollout_wg.update_actor(batch)
-            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-            metrics.update(actor_output_metrics)
+            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+            async_training = self.config.get("async_training", None)
+            ppo_epochs = async_training.get("ppo_epochs", None) if async_training is not None else None
+            if ppo_epochs is None:
+                # update actor on the whole pull in one call (the worker runs
+                # its internal mini-batch loop over require_batches mini-batches)
+                with marked_timer("update_actor", timing_raw, color="red"):
+                    actor_output = self.actor_rollout_wg.update_actor(batch)
+                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                metrics.update(actor_output_metrics)
+            else:
+                self._update_actor_fractional_epochs(batch, float(ppo_epochs), metrics, timing_raw)
         return batch, reward_extra_infos_dict
+
+    def _update_actor_fractional_epochs(self, batch, ppo_epochs: float, metrics, timing_raw):
+        """Scheduled actor update with a possibly non-integer number of PPO
+        epochs (``async_training.ppo_epochs``): run max(1, round(f *
+        require_batches)) mini-batch updates over reshuffled group-complete
+        splits (0.25 with require_batches=4 -> 1 mini-batch; 1.0 -> full
+        shuffled pass). Metrics average under the usual keys; falls back to
+        one whole-batch update if the batch cannot be split.
+        """
+        async_training = self.config.async_training
+        require_batches = int(async_training.get("require_batches", 1))
+        shuffle_seed = int(async_training.get("ppo_epochs_shuffle_seed", 1234))
+        total_updates = max(1, round(ppo_epochs * require_batches))
+        rng = np.random.default_rng(shuffle_seed + self.global_steps)
+        update_metrics = defaultdict(list)
+        updates_done = 0
+        with marked_timer("update_actor", timing_raw, color="red"):
+            while updates_done < total_updates:
+                try:
+                    minibatch_indices = make_opportunistic_minibatch_indices(
+                        batch.non_tensor_batch["uid"], require_batches, rng
+                    )
+                except (KeyError, ValueError) as e:
+                    print(
+                        f"[FullyAsyncRayPPOTrainer] fractional ppo_epochs cannot split the batch ({e}); "
+                        f"falling back to one whole-batch update",
+                        flush=True,
+                    )
+                    actor_output = self.actor_rollout_wg.update_actor(batch)
+                    for key, value in reduce_metrics(actor_output.meta_info["metrics"]).items():
+                        update_metrics[key].append(value)
+                    updates_done += require_batches  # one whole-batch pass == one epoch
+                    break
+                for minibatch_idx in minibatch_indices:
+                    if updates_done >= total_updates:
+                        break
+                    subset = batch.select_idxs(minibatch_idx)
+                    # select_idxs shares meta_info by reference; copy before stamping
+                    subset.meta_info = dict(batch.meta_info)
+                    subset.meta_info["global_token_num"] = subset.batch["attention_mask"].sum(dim=-1).tolist()
+                    actor_output = self.actor_rollout_wg.update_actor(subset)
+                    for key, value in reduce_metrics(actor_output.meta_info["metrics"]).items():
+                        update_metrics[key].append(value)
+                    updates_done += 1
+        for key, values in update_metrics.items():
+            metrics[key] = float(np.mean(values))
+        metrics["actor/ppo_epoch_updates"] = updates_done
+        metrics["actor/ppo_epochs_effective"] = updates_done / require_batches
 
     def _log_rollout(self, batch, reward_extra_infos_dict, timing_raw):
         # Log rollout generations if enabled
