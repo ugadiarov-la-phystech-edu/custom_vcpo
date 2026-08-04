@@ -488,6 +488,14 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         )
                         micro_batch_metrics.update(deferred_corr_metrics)
+                        if rollout_corr_config.get("log_probs_pearson_corr", False):
+                            from verl.utils.debug.metrics import rollout_actor_probs_pearson_corr
+
+                            micro_batch_metrics["training/rollout_actor_probs_pearson_corr"] = (
+                                rollout_actor_probs_pearson_corr(
+                                    old_log_prob, model_inputs["rollout_log_probs"], response_mask
+                                )
+                            )
                         if rollout_is_weights_proto is not None:
                             model_inputs["rollout_is_weights"] = rollout_is_weights_proto.batch["rollout_is_weights"]
                         response_mask = modified_response_mask.to(response_mask.dtype)

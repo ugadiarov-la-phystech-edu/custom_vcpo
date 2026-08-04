@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import logging
+import math
 
 import torch
 
@@ -53,6 +54,22 @@ def pearson_correlation_coefficient(tensor1: torch.Tensor, tensor2: torch.Tensor
     mt2 = torch.masked_select(tensor2, mask)
     result = torch.corrcoef(torch.stack([mt1, mt2], dim=0))
     return result[0][1].detach().item()
+
+
+def rollout_actor_probs_pearson_corr(
+    log_prob: torch.Tensor, rollout_log_prob: torch.Tensor, response_mask: torch.Tensor
+) -> float:
+    """Pearson correlation between exp(policy log-probs) and exp(rollout log-
+    probs) over valid response tokens. NaN-robust wrapper for per-micro- batch
+    logging: shape mismatch, <2 valid tokens, or zero variance -> 0.0.
+    """
+    mask = response_mask.bool()
+    if log_prob.shape != rollout_log_prob.shape or mask.shape != log_prob.shape:
+        return 0.0
+    if int(mask.sum().item()) < 2:
+        return 0.0
+    corr = float(pearson_correlation_coefficient(torch.exp(log_prob), torch.exp(rollout_log_prob), mask))
+    return corr if math.isfinite(corr) else 0.0
 
 
 def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
