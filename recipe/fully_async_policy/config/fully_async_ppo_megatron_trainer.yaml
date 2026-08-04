@@ -18,6 +18,18 @@ async_training:
   # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
   require_batches: 1
 
+  # Non-integer scheduled PPO epochs over each pulled batch (driver-side).
+  # null keeps the single whole-batch update_actor call (worker-internal
+  # mini-batch loop over require_batches mini-batches). A float f instead runs
+  # max(1, round(f * require_batches)) group-complete shuffled mini-batch
+  # updates, reshuffled each epoch: with require_batches=4, f=0.25 trains on
+  # one random mini-batch (a quarter of the pull), f=1.0 covers the whole
+  # batch once in shuffled order, f=1.5 adds a reshuffled half replay.
+  ppo_epochs: null
+
+  # Seed for the per-step group shuffle of the fractional ppo_epochs path
+  ppo_epochs_shuffle_seed: 1234
+
   # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
   partial_rollout: True
 

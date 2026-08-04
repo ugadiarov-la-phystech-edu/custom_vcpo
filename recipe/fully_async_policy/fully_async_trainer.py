@@ -32,7 +32,7 @@ from recipe.fully_async_policy.detach_utils import (
     process_structured_metrics
 )
 from recipe.fully_async_policy.message_queue import MessageQueueClient
-from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
+from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer, make_opportunistic_minibatch_indices
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -43,34 +43,8 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 
 
-def make_opportunistic_minibatch_indices(uids, num_minibatches: int, rng) -> list[np.ndarray]:
-    """Split a batch into ``num_minibatches`` group-complete mini-batches in a
-    shuffled group order.
-
-    Every mini-batch receives all responses of ``n_groups/num_minibatches``
-    whole prompt-groups, so group-keyed features (GRPO advantages, OPOB's
-    dp_group_key) stay intact and all mini-batches have equal sequence counts
-    (required for even DP dispatch). Returns index arrays into the batch.
-    """
-    uids = np.asarray(uids)
-    indices_by_uid: dict[Any, list[int]] = {}
-    for idx, uid in enumerate(uids.tolist()):
-        indices_by_uid.setdefault(uid, []).append(idx)
-    group_uids = list(indices_by_uid.keys())
-    group_sizes = {len(v) for v in indices_by_uid.values()}
-    if len(group_sizes) != 1:
-        raise ValueError(f"Prompt groups have unequal sizes {sorted(group_sizes)}; cannot form equal mini-batches")
-    if len(group_uids) % num_minibatches != 0:
-        raise ValueError(f"{len(group_uids)} groups not divisible into {num_minibatches} mini-batches")
-    groups_per_minibatch = len(group_uids) // num_minibatches
-    perm = rng.permutation(len(group_uids))
-    minibatch_indices = []
-    for m in range(num_minibatches):
-        selected = []
-        for g in perm[m * groups_per_minibatch : (m + 1) * groups_per_minibatch]:
-            selected.extend(indices_by_uid[group_uids[g]])
-        minibatch_indices.append(np.asarray(selected, dtype=np.int64))
-    return minibatch_indices
+# make_opportunistic_minibatch_indices moved to ray_trainer (imported above) so
+# the fractional-ppo_epochs update path can use it too.
 
 
 @ray.remote(num_cpus=10)
