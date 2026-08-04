@@ -18,6 +18,10 @@ async_training:
   # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
   require_batches: 1
 
+  ppo_epochs: null
+
+  ppo_epochs_shuffle_seed: 1234
+
   # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
   partial_rollout: True
 
