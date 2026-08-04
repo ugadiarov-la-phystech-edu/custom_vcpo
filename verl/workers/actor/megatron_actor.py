@@ -533,6 +533,12 @@ class MegatronPPOActor(BasePPOActor):
                         )
                     )
                     stats.update(rollout_corr_metrics)
+                    if rollout_corr_cfg.get("log_probs_pearson_corr", False):
+                        from verl.utils.debug.metrics import rollout_actor_probs_pearson_corr
+
+                        stats["training/rollout_actor_probs_pearson_corr"] = rollout_actor_probs_pearson_corr(
+                            old_log_prob, rollout_log_prob, response_mask
+                        )
                     if rollout_is_weights_proto is not None:
                         data["rollout_is_weights"] = rollout_is_weights_proto.batch["rollout_is_weights"]
                     response_mask = modified_response_mask.bool()

@@ -130,6 +130,14 @@ class RolloutCorrectionConfig(BaseConfig):
             - Only affects IS weight values, not rejection sampling
             Default: False (no batch normalization)
 
+        log_probs_pearson_corr (bool): Log training/rollout_actor_probs_pearson_corr
+            (https://arxiv.org/pdf/2506.13585) from the deferred correction path.
+            - Pearson correlation between exp(policy log-probs) and
+              exp(rollout log-probs) over response tokens, computed per
+              micro-batch inside the update (skip_recompute_old_log_prob path)
+              at no extra forward-pass cost
+            Default: False (not logged)
+
     Example:
         # Create with defaults
         config = RolloutCorrectionConfig()
@@ -157,6 +165,7 @@ class RolloutCorrectionConfig(BaseConfig):
     bypass_mode: bool = False
     use_policy_gradient: bool = False
     rollout_is_batch_normalize: bool = False
+    log_probs_pearson_corr: bool = False
 
     @classmethod
     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
