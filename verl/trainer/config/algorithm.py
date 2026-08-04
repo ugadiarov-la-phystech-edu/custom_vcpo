@@ -157,6 +157,7 @@ class RolloutCorrectionConfig(BaseConfig):
     bypass_mode: bool = False
     use_policy_gradient: bool = False
     rollout_is_batch_normalize: bool = False
+    log_probs_pearson_corr: bool = False
 
     @classmethod
     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
