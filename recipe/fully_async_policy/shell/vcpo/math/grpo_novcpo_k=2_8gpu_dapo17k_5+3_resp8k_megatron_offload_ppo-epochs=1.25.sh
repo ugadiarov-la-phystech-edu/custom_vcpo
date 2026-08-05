@@ -12,12 +12,13 @@
 # (5 rollout + 3 trainer GPUs, Megatron backend, HDO full CPU offload,
 # B-33x4, fixed micro-batching) with the elastic mechanisms turned OFF and a
 # fractional scheduled update instead:
-#   * ppo_epochs=0.25 (async_training.ppo_epochs): per trainer step the pull
+#   * ppo_epochs=1.25 (async_training.ppo_epochs): per trainer step the pull
 #     is still 33*4=132 groups (rollouter identical to the B-132 baseline),
-#     but the trainer runs only round(0.25*4)=1 AdamW update on one randomly
-#     chosen group-complete 33-group mini-batch — a quarter of the data is
-#     trained on, the rest is discarded. Ablation arm isolating the effect of
-#     update count at fixed generation throughput and staleness.
+#     and the trainer runs round(1.25*4)=5 AdamW updates: one full shuffled
+#     pass over the 4 group-complete 33-group mini-batches, then one extra
+#     update on a reshuffled mini-batch (a quarter of the data replayed).
+#     Ablation arm isolating the effect of update count at fixed generation
+#     throughput and staleness.
 #   * OPPORTUNISTIC PPO EPOCHS OFF, DAPO FILTERING OFF.
 #   * serialize_validation=True / pause_generation_during_save=True kept:
 #     stop-the-world validation and checkpoint saves — pure time translations
@@ -129,10 +130,10 @@ partial_rollout=True
 use_rollout_log_probs=True
 
 # ================= Fractional scheduled PPO epochs =================
-# round(ppo_epochs * require_batches) = 1 driver-side AdamW update per trainer
-# step, on one randomly chosen group-complete 33-group mini-batch out of the
-# 132-group pull. The other 3 mini-batches are pulled but not trained on.
-ppo_epochs=${ppo_epochs:-0.25}
+# round(ppo_epochs * require_batches) = 5 driver-side AdamW updates per trainer
+# step: one full shuffled epoch over the 4 group-complete 33-group mini-batches
+# of the 132-group pull, plus one extra update on a reshuffled mini-batch.
+ppo_epochs=${ppo_epochs:-1.25}
 ppo_epochs_shuffle_seed=${ppo_epochs_shuffle_seed:-1234}
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
