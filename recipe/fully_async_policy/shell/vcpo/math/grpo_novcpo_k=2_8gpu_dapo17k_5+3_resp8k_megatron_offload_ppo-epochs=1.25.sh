@@ -116,6 +116,9 @@ rollout_rs=null
 rollout_rs_threshold=null
 bypass_mode=False
 use_policy_gradient=False
+# Log training/rollout_actor_probs_pearson_corr (exp of policy vs rollout
+# log-probs over response tokens) from the deferred correction path
+log_probs_pearson_corr=${log_probs_pearson_corr:-True}
 
 skip_recompute_old_log_prob=True
 compute_prox_log_prob=False
@@ -195,6 +198,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold} \
     algorithm.rollout_correction.bypass_mode=${bypass_mode} \
     algorithm.rollout_correction.use_policy_gradient=${use_policy_gradient} \
+    algorithm.rollout_correction.log_probs_pearson_corr=${log_probs_pearson_corr} \
     actor_rollout_ref.actor.strategy=megatron \
     critic.strategy=megatron \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
