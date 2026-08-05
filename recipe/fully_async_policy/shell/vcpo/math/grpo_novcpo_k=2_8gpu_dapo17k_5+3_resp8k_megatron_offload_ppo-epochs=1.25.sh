@@ -115,10 +115,9 @@ partial_rollout=True
 use_rollout_log_probs=True
 
 # ================= Fractional scheduled PPO epochs =================
-# round(ppo_epochs * require_batches) = 1 driver-side AdamW update per step on
-# one randomly chosen group-complete 33-group mini-batch; the rest of the pull
-# is not trained on.
-ppo_epochs=${ppo_epochs:-0.25}
+# round(ppo_epochs * require_batches) = 5 driver-side AdamW updates per step:
+# one full shuffled epoch over the 4 mini-batches plus one reshuffled extra.
+ppo_epochs=${ppo_epochs:-1.25}
 ppo_epochs_shuffle_seed=${ppo_epochs_shuffle_seed:-1234}
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
