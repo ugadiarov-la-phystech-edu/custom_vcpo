@@ -92,7 +92,7 @@ num_minibatches_per_update=4
 partial_rollout=True
 use_rollout_log_probs=True
 
-ppo_epochs=${ppo_epochs:-0.25}
+ppo_epochs=${ppo_epochs:-1.25}
 ppo_epochs_shuffle_seed=${ppo_epochs_shuffle_seed:-1234}
 
 dynamic_filtering_enable=${dynamic_filtering_enable:-False}
