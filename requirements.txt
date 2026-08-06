@@ -2,7 +2,7 @@
 accelerate
 codetiming
 datasets
-dill
+dill<0.3.9
 hydra-core
 liger-kernel
 numpy<2.0.0
@@ -15,8 +15,8 @@ pre-commit
 ray[default]
 tensordict>=0.8.0,<=0.10.0,!=0.9.0
 torchdata
-transformers
-# vllm==0.8.4
+transformers<5
+# vllm==0.11.0
 wandb
 packaging>=20.0
 uvicorn
