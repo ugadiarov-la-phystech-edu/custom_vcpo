@@ -51,6 +51,18 @@ async_training:
 
     min_buffered_batches: 1.0
 
+  replay_buffer:
+
+    enable: False
+
+    tau: 4.0
+
+    staleness_threshold: 8
+
+    requires_mini_batches: 2
+
+    sampling_seed: 1234
+
   serialize_validation: False
 
   pause_generation_during_save: False

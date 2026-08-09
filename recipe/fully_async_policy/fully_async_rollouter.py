@@ -133,6 +133,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.dynamic_filtering_min_buffered = (
             float(filtering_cfg.get("min_buffered_batches", 1.0)) if filtering_cfg else 1.0
         )
+        replay_cfg = config.async_training.get("replay_buffer", None)
+        self.replay_mode = bool(replay_cfg.get("enable", False)) if replay_cfg else False
+        if self.replay_mode:
+            assert not self.dynamic_filtering_enable, (
+                "replay_buffer mode subsumes dynamic_filtering (insertion gate is always on); "
+                "disable async_training.dynamic_filtering"
+            )
+        self.norm_adv_by_std_in_grpo = bool(config.algorithm.get("norm_adv_by_std_in_grpo", True))
+        self.groups_completed_total = 0
+        self.all_correct_groups_total = 0
+        self.all_wrong_groups_total = 0
+        self.groups_completed_window = 0
+        self.all_correct_groups_window = 0
+        self.all_wrong_groups_window = 0
         self.max_required_samples = None
         self.max_concurrent_samples = None
         # queue size
@@ -260,6 +274,25 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             val_time = timing_raw.get("rollouter/validate_time")
             if val_time is not None and self.first_sample_time is not None:
                 self.cumulative_validation_time += val_time
+            if getattr(self, "replay_mode", False):
+                if self.groups_completed_total > 0:
+                    timing_raw["fully_async/groups/all_correct_ratio_total"] = (
+                        self.all_correct_groups_total / self.groups_completed_total
+                    )
+                    timing_raw["fully_async/groups/all_wrong_ratio_total"] = (
+                        self.all_wrong_groups_total / self.groups_completed_total
+                    )
+                if self.groups_completed_window > 0:
+                    timing_raw["fully_async/groups/all_correct_ratio"] = (
+                        self.all_correct_groups_window / self.groups_completed_window
+                    )
+                    timing_raw["fully_async/groups/all_wrong_ratio"] = (
+                        self.all_wrong_groups_window / self.groups_completed_window
+                    )
+                timing_raw["fully_async/groups/completed_total"] = self.groups_completed_total
+                self.groups_completed_window = 0
+                self.all_correct_groups_window = 0
+                self.all_wrong_groups_window = 0
             data = ValidateMetrics(
                 timing_raw=timing_raw,
                 metrics=val_metrics,
@@ -324,6 +357,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         "filtered_degenerate_groups": self.filtered_degenerate_groups,
                         "processed_sample_count": self.processed_sample_count,
                         "current_param_version": self.current_param_version,
+                        "groups_completed_total": getattr(self, "groups_completed_total", 0),
+                        "all_correct_groups_total": getattr(self, "all_correct_groups_total", 0),
+                        "all_wrong_groups_total": getattr(self, "all_wrong_groups_total", 0),
                     }
                 )
 
@@ -413,6 +449,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 )
                 self.processed_sample_count = int(queue_state.get("processed_sample_count", self.processed_sample_count))
                 self.current_param_version = int(queue_state.get("current_param_version", self.current_param_version))
+                self.groups_completed_total = int(
+                    queue_state.get("groups_completed_total", self.groups_completed_total)
+                )
+                self.all_correct_groups_total = int(
+                    queue_state.get("all_correct_groups_total", self.all_correct_groups_total)
+                )
+                self.all_wrong_groups_total = int(
+                    queue_state.get("all_wrong_groups_total", self.all_wrong_groups_total)
+                )
                 print(f"[FullyAsyncRollouter] Loaded rollout queue state from {queue_local_path}")
             else:
                 print(f"[FullyAsyncRollouter] WARNING: No rollout queue state found at {queue_local_path}, skipping load")
@@ -620,17 +665,54 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.pending_queue.task_done()
 
-    def _group_is_degenerate(self, rollout_sample: RolloutSample) -> bool:
+    def _score_group(self, rollout_sample: RolloutSample) -> torch.Tensor | None:
         batch = rollout_sample.full_batch
         if self.reward_fn is None or batch is None or len(batch) <= 1:
-            return False
+            return None
         try:
             reward_tensor, _ = compute_reward(batch, self.reward_fn)
-            scores = reward_tensor.sum(dim=-1)
-            return bool((scores == scores[0]).all().item())
+            return reward_tensor.sum(dim=-1)
         except Exception as e:
-            print(f"[FullyAsyncRollouter][Filter] scoring failed, keeping group: {e}")
+            print(f"[FullyAsyncRollouter][Filter] scoring failed: {e}")
+            return None
+
+    def _group_is_degenerate(self, rollout_sample: RolloutSample) -> bool:
+        scores = self._score_group(rollout_sample)
+        if scores is None:
             return False
+        return bool((scores == scores[0]).all().item())
+
+    def _prepare_replay_group(self, rollout_sample: RolloutSample) -> bool:
+        scores = self._score_group(rollout_sample)
+        self.groups_completed_total += 1
+        self.groups_completed_window += 1
+        if scores is None:
+            print(
+                f"[FullyAsyncRollouter][Replay] group {rollout_sample.sample_id} "
+                "unscorable, dropping"
+            )
+            return False
+        if bool((scores == scores[0]).all().item()):
+            if float(scores[0].item()) > 0:
+                self.all_correct_groups_total += 1
+                self.all_correct_groups_window += 1
+            else:
+                self.all_wrong_groups_total += 1
+                self.all_wrong_groups_window += 1
+            return False
+        scores_f = scores.float()
+        mean = torch.mean(scores_f)
+        std = torch.std(scores_f)
+        if self.norm_adv_by_std_in_grpo:
+            advantages = (scores_f - mean) / (std + 1e-6)
+        else:
+            advantages = scores_f - mean
+        batch = rollout_sample.full_batch
+        batch.non_tensor_batch["reward_scalar"] = np.array(scores_f.tolist(), dtype=np.float32)
+        batch.non_tensor_batch["advantage_scalar"] = np.array(advantages.tolist(), dtype=np.float32)
+        param_version_start = batch.non_tensor_batch["param_version_start"]
+        rollout_sample.group_version = int(min(int(v) for v in param_version_start))
+        return True
 
     async def _should_drop_degenerate(self, rollout_sample: RolloutSample) -> bool:
         if not self.dynamic_filtering_enable:
@@ -655,7 +737,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
             )
             rollout_sample.param_version = self.current_param_version
-            if await self._should_drop_degenerate(rollout_sample):
+            if getattr(self, "replay_mode", False):
+                drop_group = not self._prepare_replay_group(rollout_sample)
+            else:
+                drop_group = await self._should_drop_degenerate(rollout_sample)
+            if drop_group:
                 self.filtered_degenerate_groups += 1
                 self.staleness_samples -= 1
                 self.processed_sample_count += 1

@@ -51,6 +51,7 @@ class RolloutSample:
     enqueue_time: Optional[float] = None
     validation_pause_before: float = 0.0
     checkpoint_pause_before: float = 0.0
+    group_version: int = 0
 
 
 @dataclass
@@ -281,6 +282,29 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
             payload["staleness/ess_ratio_clipped"] = float(np.mean(ess_ratio_clipped))
         if ess_scaled_lr:
             payload["actor/ess_scaled_lr"] = float(np.mean(ess_scaled_lr))
+
+    replay_hist_keys = {
+        "replay/minibatch_staleness_hist": "Mini-batch group staleness",
+        "replay/buffer_staleness_hist": "Replay buffer group staleness",
+    }
+    for key, title in replay_hist_keys.items():
+        values = structured_metrics.get(key)
+        if not values:
+            continue
+        values = [float(v) for v in values]
+        payload[key.replace("_hist", "_p50")] = float(np.percentile(values, 50))
+        if allow_media:
+            import matplotlib.pyplot as plt
+            import wandb
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            max_staleness = int(max(values))
+            ax.hist(values, bins=range(0, max_staleness + 2), alpha=0.8, align="left")
+            ax.set_title(title)
+            ax.set_xlabel("model updates behind current version")
+            ax.set_ylabel("groups")
+            payload[key] = wandb.Image(fig)
+            plt.close(fig)
 
     # 2) actor/minibatch_grad_info: list[dict]
     # grad_info_entries = []
