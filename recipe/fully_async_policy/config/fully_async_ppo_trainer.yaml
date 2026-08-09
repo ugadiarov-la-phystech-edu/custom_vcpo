@@ -82,6 +82,39 @@ async_training:
     # degenerate groups are dropped
     min_buffered_batches: 1.0
 
+  # Replay-buffer training mode: decouple generation from updating. The
+  # rollouter scores every completed group and drops zero-advantage-variance
+  # ones (DAPO filtering, always on), freezing GRPO advantages and behavior
+  # log-probs at insertion. The trainer keeps drained groups in a
+  # version-aware buffer, composes each optimizer mini-batch
+  # (ppo_mini_batch_size groups) as all not-yet-trained-on groups (oldest
+  # first) plus a sample of used groups weighted by 2^(-staleness/tau), syncs
+  # weights after EVERY update (requires trigger_parameter_sync_step=1,
+  # require_batches=1, skip_recompute_old_log_prob=True), evicts groups
+  # staler than staleness_threshold updates, and pauses only while the buffer
+  # holds fewer than requires_mini_batches full mini-batches.
+  replay_buffer:
+
+    # Master switch; False keeps the FIFO trainer exactly as before
+    enable: False
+
+    # Score half-life in model updates: score = 2^(-group_staleness / tau)
+    tau: 4.0
+
+    # Evict groups whose version < current_model_version - staleness_threshold
+    # (measured in model updates; align async_training.staleness_threshold
+    # with this so generation is not licensed beyond what eviction keeps)
+    staleness_threshold: 8
+
+    # Both the warm-up length and the pause watermark; may be fractional
+    # (e.g. 1.5). Warm-up: the first ceil(requires_mini_batches) updates each
+    # consume a fresh mini-batch of unseen groups. Watermark: training pauses
+    # while the buffer holds < requires_mini_batches * ppo_mini_batch_size groups
+    requires_mini_batches: 2
+
+    # Seed for the weighted without-replacement sampling of replayed groups
+    sampling_seed: 1234
+
   # Stop-the-world validation: after a sync that triggers validation, the
   # trainer blocks until the validation sweep completes instead of training
   # ahead on backlog. With generation already paused, the whole pipeline

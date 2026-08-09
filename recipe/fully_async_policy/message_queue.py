@@ -117,6 +117,20 @@ class MessageQueue:
             self.total_consumed += 1
             return data, len(self.queue)
 
+    async def get_available_samples(self) -> list[Any]:
+        """Pop and return everything currently queued, without waiting.
+
+        Used by the replay-buffer trainer to drain the transport queue between
+        updates. The returned list may contain the ``None`` termination
+        sentinel — the caller is responsible for handling it. Returns an empty
+        list when the queue is empty.
+        """
+        async with self._lock:
+            drained = list(self.queue)
+            self.queue.clear()
+            self.total_consumed += len(drained)
+            return drained
+
     async def update_param_version(self, version: int):
         """Update current parameter version"""
         async with self._lock:
@@ -276,6 +290,15 @@ class MessageQueueClient:
         """Get single sample from queue, wait until one is available (async)"""
         future = self.queue_actor.get_sample.remote()
         return await asyncio.wrap_future(future.future())
+
+    async def get_available_samples(self) -> list[Any]:
+        """Drain all currently queued samples without waiting (async)"""
+        future = self.queue_actor.get_available_samples.remote()
+        return await asyncio.wrap_future(future.future())
+
+    def get_available_samples_sync(self) -> list[Any]:
+        """Drain all currently queued samples without waiting (sync)"""
+        return ray.get(self.queue_actor.get_available_samples.remote())
 
     async def get_queue_size(self) -> int:
         """Get queue size (async)"""

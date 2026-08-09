@@ -258,8 +258,18 @@ class _TensorboardAdapter:
         self.writer = SummaryWriter(tensorboard_dir)
 
     def log(self, data, step):
+        import numpy as np
+
         for key in data:
-            self.writer.add_scalar(key, data[key], step)
+            value = data[key]
+            if isinstance(value, (list, tuple, np.ndarray)):
+                # Value distributions (e.g. replay-buffer staleness) become
+                # native tensorboard histograms with the per-step slider.
+                value = np.asarray(value)
+                if value.size > 0:
+                    self.writer.add_histogram(key, value, step)
+            else:
+                self.writer.add_scalar(key, value, step)
 
     def finish(self):
         self.writer.close()

@@ -136,6 +136,26 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.dynamic_filtering_min_buffered = (
             float(filtering_cfg.get("min_buffered_batches", 1.0)) if filtering_cfg else 1.0
         )
+        # Replay-buffer mode: every completed group is scored at the rollouter —
+        # degenerate (zero-advantage-variance) groups are dropped unconditionally
+        # (DAPO filtering with min_buffered_batches=0 semantics), kept groups get
+        # frozen GRPO advantages and a group model-version stamp.
+        replay_cfg = config.async_training.get("replay_buffer", None)
+        self.replay_mode = bool(replay_cfg.get("enable", False)) if replay_cfg else False
+        if self.replay_mode:
+            assert not self.dynamic_filtering_enable, (
+                "replay_buffer mode subsumes dynamic_filtering (insertion gate is always on); "
+                "disable async_training.dynamic_filtering"
+            )
+        self.norm_adv_by_std_in_grpo = bool(config.algorithm.get("norm_adv_by_std_in_grpo", True))
+        # Group-outcome counters for replay-mode logging (total and
+        # since-last-parameter-sync windows).
+        self.groups_completed_total = 0
+        self.all_correct_groups_total = 0
+        self.all_wrong_groups_total = 0
+        self.groups_completed_window = 0
+        self.all_correct_groups_window = 0
+        self.all_wrong_groups_window = 0
         self.max_required_samples = None
         self.max_concurrent_samples = None
         # queue size
@@ -271,6 +291,28 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             val_time = timing_raw.get("rollouter/validate_time")
             if val_time is not None and self.first_sample_time is not None:
                 self.cumulative_validation_time += val_time
+            if getattr(self, "replay_mode", False):
+                # Group-outcome ratios (replay-mode item-18 metrics), logged by
+                # the trainer at this parameter version; the window counters
+                # cover the interval since the previous sync and reset here.
+                if self.groups_completed_total > 0:
+                    timing_raw["fully_async/groups/all_correct_ratio_total"] = (
+                        self.all_correct_groups_total / self.groups_completed_total
+                    )
+                    timing_raw["fully_async/groups/all_wrong_ratio_total"] = (
+                        self.all_wrong_groups_total / self.groups_completed_total
+                    )
+                if self.groups_completed_window > 0:
+                    timing_raw["fully_async/groups/all_correct_ratio"] = (
+                        self.all_correct_groups_window / self.groups_completed_window
+                    )
+                    timing_raw["fully_async/groups/all_wrong_ratio"] = (
+                        self.all_wrong_groups_window / self.groups_completed_window
+                    )
+                timing_raw["fully_async/groups/completed_total"] = self.groups_completed_total
+                self.groups_completed_window = 0
+                self.all_correct_groups_window = 0
+                self.all_wrong_groups_window = 0
             data = ValidateMetrics(
                 timing_raw=timing_raw,
                 metrics=val_metrics,
@@ -355,6 +397,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         "filtered_degenerate_groups": self.filtered_degenerate_groups,
                         "processed_sample_count": self.processed_sample_count,
                         "current_param_version": self.current_param_version,
+                        "groups_completed_total": getattr(self, "groups_completed_total", 0),
+                        "all_correct_groups_total": getattr(self, "all_correct_groups_total", 0),
+                        "all_wrong_groups_total": getattr(self, "all_wrong_groups_total", 0),
                     }
                 )
 
@@ -444,6 +489,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 )
                 self.processed_sample_count = int(queue_state.get("processed_sample_count", self.processed_sample_count))
                 self.current_param_version = int(queue_state.get("current_param_version", self.current_param_version))
+                self.groups_completed_total = int(
+                    queue_state.get("groups_completed_total", self.groups_completed_total)
+                )
+                self.all_correct_groups_total = int(
+                    queue_state.get("all_correct_groups_total", self.all_correct_groups_total)
+                )
+                self.all_wrong_groups_total = int(
+                    queue_state.get("all_wrong_groups_total", self.all_wrong_groups_total)
+                )
                 print(f"[FullyAsyncRollouter] Loaded rollout queue state from {queue_local_path}")
             else:
                 print(f"[FullyAsyncRollouter] WARNING: No rollout queue state found at {queue_local_path}, skipping load")
@@ -651,23 +705,71 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.pending_queue.task_done()
 
-    def _group_is_degenerate(self, rollout_sample: RolloutSample) -> bool:
+    def _score_group(self, rollout_sample: RolloutSample) -> torch.Tensor | None:
         """Score the completed group with the trainer's reward function (cheap,
-        rule-based for math) and report whether it carries zero advantage
-        signal: all n responses got the identical reward (all-correct or
-        all-wrong), so GRPO's group-centered advantages are exactly zero.
-        Mirrors DAPO's filter_groups rule (keep if std > 0 or group of 1).
-        Fails open: any scoring problem keeps the group."""
+        rule-based for math) and return the per-trajectory scalar rewards.
+        Returns None when scoring is impossible (no reward fn, group of 1, or
+        a scoring error)."""
         batch = rollout_sample.full_batch
         if self.reward_fn is None or batch is None or len(batch) <= 1:
-            return False
+            return None
         try:
             reward_tensor, _ = compute_reward(batch, self.reward_fn)
-            scores = reward_tensor.sum(dim=-1)
-            return bool((scores == scores[0]).all().item())
+            return reward_tensor.sum(dim=-1)
         except Exception as e:
-            print(f"[FullyAsyncRollouter][Filter] scoring failed, keeping group: {e}")
+            print(f"[FullyAsyncRollouter][Filter] scoring failed: {e}")
+            return None
+
+    def _group_is_degenerate(self, rollout_sample: RolloutSample) -> bool:
+        """Whether the completed group carries zero advantage signal: all n
+        responses got the identical reward (all-correct or all-wrong), so
+        GRPO's group-centered advantages are exactly zero. Mirrors DAPO's
+        filter_groups rule (keep if std > 0 or group of 1). Fails open: any
+        scoring problem keeps the group."""
+        scores = self._score_group(rollout_sample)
+        if scores is None:
             return False
+        return bool((scores == scores[0]).all().item())
+
+    def _prepare_replay_group(self, rollout_sample: RolloutSample) -> bool:
+        """Replay-mode insertion gate. Scores the group, updates the
+        all-correct/all-wrong counters, and for kept groups freezes the GRPO
+        statistics (per-trajectory reward and advantage scalars, mirroring
+        compute_grpo_outcome_advantage: std unbiased, epsilon=1e-6) and stamps
+        the group model version (min of the trajectories'
+        param_version_start). Returns True if the group should be enqueued."""
+        scores = self._score_group(rollout_sample)
+        self.groups_completed_total += 1
+        self.groups_completed_window += 1
+        if scores is None:
+            # Without scores the frozen advantages the trainer relies on cannot
+            # be computed — drop rather than enqueue an untrainable group.
+            print(
+                f"[FullyAsyncRollouter][Replay] group {rollout_sample.sample_id} "
+                "unscorable, dropping"
+            )
+            return False
+        if bool((scores == scores[0]).all().item()):
+            if float(scores[0].item()) > 0:
+                self.all_correct_groups_total += 1
+                self.all_correct_groups_window += 1
+            else:
+                self.all_wrong_groups_total += 1
+                self.all_wrong_groups_window += 1
+            return False
+        scores_f = scores.float()
+        mean = torch.mean(scores_f)
+        std = torch.std(scores_f)
+        if self.norm_adv_by_std_in_grpo:
+            advantages = (scores_f - mean) / (std + 1e-6)
+        else:
+            advantages = scores_f - mean
+        batch = rollout_sample.full_batch
+        batch.non_tensor_batch["reward_scalar"] = np.array(scores_f.tolist(), dtype=np.float32)
+        batch.non_tensor_batch["advantage_scalar"] = np.array(advantages.tolist(), dtype=np.float32)
+        param_version_start = batch.non_tensor_batch["param_version_start"]
+        rollout_sample.group_version = int(min(int(v) for v in param_version_start))
+        return True
 
     async def _should_drop_degenerate(self, rollout_sample: RolloutSample) -> bool:
         """Elastic DAPO-style dynamic filtering (drop-side of the Tier-1 plan):
@@ -700,7 +802,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
             )
             rollout_sample.param_version = self.current_param_version
-            if await self._should_drop_degenerate(rollout_sample):
+            if getattr(self, "replay_mode", False):
+                drop_group = not self._prepare_replay_group(rollout_sample)
+            else:
+                drop_group = await self._should_drop_degenerate(rollout_sample)
+            if drop_group:
                 # Zero-signal group dropped while a full batch is already
                 # buffered: decrement the staleness quota so the freed slot
                 # licenses a replacement generation within the same budget.
