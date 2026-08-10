@@ -46,6 +46,12 @@ WANT_UPDATES=${SMOKE_UPDATES:-2}
 DEADLINE=$(($(date +%s) + ${SMOKE_TIMEOUT:-3600}))
 mkdir -p "$(dirname "${LOG}")"
 
+# Ray block-buffers worker stdout: without this the milestone prints
+# ([vcpo] alloc, auto-calibrated base, [Replay] global_steps) sit in worker
+# pipes for many minutes and the log-based assertions below misfire even
+# though the run is healthy (observed on the first remote execution).
+export PYTHONUNBUFFERED=1
+
 # The launch script honors these env overrides. Full-size model and sequence
 # lengths (they set the memory peak); small mini-batch + short replay horizon
 # (they don't).

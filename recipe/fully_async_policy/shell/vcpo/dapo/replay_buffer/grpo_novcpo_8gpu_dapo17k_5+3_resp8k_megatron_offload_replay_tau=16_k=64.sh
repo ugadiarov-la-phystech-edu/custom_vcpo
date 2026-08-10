@@ -57,6 +57,9 @@ export RAY_ADDRESS="local"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export WANDB_MODE=disabled
 export VLLM_USE_FLASHINFER_SAMPLER=0
+# Unbuffered worker stdout: Ray block-buffers prints otherwise, lagging the
+# live log by minutes exactly when print volume is lowest (startup/stalls)
+export PYTHONUNBUFFERED=1
 
 # ================= Paths =================
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}

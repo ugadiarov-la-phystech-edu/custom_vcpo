@@ -48,6 +48,7 @@ MEMLOG="${LOG%.log}.gpumem.csv"
 mkdir -p "$(dirname "${LOG}")"
 
 # The launch script honors these env overrides.
+export PYTHONUNBUFFERED=1 # worker prints must reach the log promptly for the assertions below
 export MODEL_PATH=${SMOKE_MODEL:-"Qwen/Qwen3-1.7B"}
 export exp_name="SMOKE-replay-5+3" # keep TB/ckpt junk out of real run dirs
 export val_before_train=False
