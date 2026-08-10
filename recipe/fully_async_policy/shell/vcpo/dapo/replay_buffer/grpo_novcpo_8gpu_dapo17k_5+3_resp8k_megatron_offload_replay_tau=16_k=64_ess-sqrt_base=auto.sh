@@ -6,47 +6,59 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=grpo-novcpo-replay
+#SBATCH --job-name=grpo-novcpo-replay-ess
 
-# Replay-buffer arm (based on the 5+3 megatron-offload family:
-# grpo_novcpo_k=2_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=*.sh).
-# Generation and updating are decoupled through a trainer-side replay buffer:
-#   * The rollouter scores every completed 16-response group and drops
-#     zero-advantage-variance ones (DAPO filtering, always on). Kept groups
-#     enter the buffer with frozen GRPO advantages, cached vLLM behavior
-#     log-probs, and a model version = min(param_version_start) over the group.
-#   * Each optimizer update trains on ppo_mini_batch_size=33 groups: all
-#     not-yet-trained-on groups (oldest-inserted first, capped at 33) plus a
-#     without-replacement sample of used groups with p ~ 2^(-staleness/tau).
-#   * Weights sync to the rollouter after EVERY update
-#     (trigger_parameter_sync_step=1, require_batches=1); the model version
-#     ticks per update, so test/save freq are in update units now.
+# ESS-braked replay arm: identical to
+# grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=16_k=64.sh
+# (trainer-side replay buffer, tau=16, eviction k=64, rmb=1, sync after every
+# update, DAPO insertion gate, frozen advantages / behavior log-probs) plus
+# VCPO's ESS-guided LR scaling on the per-trajectory update path:
+#   * update_policy_per_traj=True: every mini-batch's sequence-level IS
+#     ratios against the cached behavior log-probs are DP-all-reduced into
+#     ess_ratio = (sum w)^2 / (B * sum w^2), logged as staleness/ess_ratio.
+#   * ess_scaling: the optimizer step's LR is scaled by
+#         min(1, ess_ratio / base_ess_ratio) ^ (1/2)   (sqrt rule, unclipped)
+#     for that step only. This is the brake the unbraked tau-16/k-64 run
+#     lacked: in its collapse precursors (token-IS mean 24-250, pearson<0.9)
+#     the ESS ratio plummets, so the LR shrinks exactly when the off-policy
+#     runaway starts, turning collapses into slowdowns.
+#   * base_ess_ratio=null (default): AUTO-CALIBRATED — the first update (the
+#     staleness-0 warm-up mini-batch, i.e. the empirical on-policy rho_on for
+#     this exact setup) runs unscaled, its measured ESS ratio becomes the
+#     base (logged as replay/ess_base, persisted in replay_buffer.pt), and
+#     braking starts from update 2. Override ess_base with an explicit value
+#     (e.g. 1.0 for the paper reference, or a measured operating point from
+#     ..._estimate_base_ess_ratio.sh) to skip auto-calibration. NOTE: auto
+#     mode is for fresh runs — resuming from a checkpoint without a stored
+#     base captures a mature-buffer (non-on-policy) reference instead.
+#   * Costs vs the unbraked arm: ~20% slower updates (per-traj grad
+#     accumulation + per-traj grad norms) and one extra grad-sized GPU
+#     buffer (~16 GB bf16 per trainer GPU on top of the ~58 GB HDO
+#     footprint) — watch peak memory on the first updates.
+#   * The effective LR is logged as replay/ess_scaled_lr (and
+#     actor/ess_scaled_lr + staleness/ess_ratio via structured metrics)
+#     every update.
+# Replay-arm notes that still apply:
 #   * Groups staler than replay_buffer.staleness_threshold=64 updates are
 #     evicted after each update; scores are recomputed each update. With
 #     tau=16 a staleness-64 group still carries sampling weight 2^-4 = 1/16 —
-#     deep replay is intended. NOTE: the buffer retains every kept group of
-#     the last 64 updates (~1000-1600 groups at the 5+3 arrival rate, roughly
-#     7-12 GB driver RAM and the same for replay_buffer.pt in checkpoints);
-#     watch replay/buffer_size and replay/minibatch_staleness_hist.
+#     deep replay is intended. The buffer retains every kept group of the
+#     last 64 updates (~1000-1600 groups, roughly 7-12 GB driver RAM and the
+#     same for replay_buffer.pt in checkpoints).
 #   * Warm-up/watermark: requires_mini_batches=1 — the first update consumes
 #     a fresh mini-batch of unseen groups; afterwards training pauses only
-#     while the buffer holds < 1*33 = 33 groups (the minimum that still
-#     composes a full mini-batch).
+#     while the buffer holds < 1*33 = 33 groups.
 #   * async_training.staleness_threshold=64 aligns the rollouter's generation
 #     quota with the eviction horizon (33*(64+1)=2145 groups licensed; in
 #     practice a stall backstop — concurrency caps at 165 in-flight).
-#   * IS vs the cached behavior log-probs happens in the backward pass
-#     (skip_recompute_old_log_prob=True, token-level threshold 2.0) — same
-#     correction as the baseline arms, now also covering replay staleness.
+#   * Model versions tick once per UPDATE: test/save freq are in update units.
 #   * serialize_validation=True / pause_generation_during_save=True kept:
 #     stop-the-world validation and checkpoint saves — pure time translations
-#     excluded from cumulative_training_time, so the trajectory and clock stay
-#     exactly comparable to the other arms.
+#     excluded from cumulative_training_time.
 # Base-script notes that still apply: trainer tp=1/dp=3 (sequence_parallel
 # needs TP>1), 33*16=528 seqs divide by DP=3, HDO full CPU offload with bf16
 # master weights (do NOT swap for use_precision_aware_optimizer without
-# optimizer_cpu_offload: silent stall, probe 2026-07-30). VCPO mechanisms
-# stay off.
+# optimizer_cpu_offload: silent stall, probe 2026-07-30). OPOB stays off.
 
 set -xeuo pipefail
 
@@ -98,7 +110,7 @@ precision_dtype="bfloat16"
 train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3 (528/3=176)
-micro_bsz_per_gpu=1
+micro_bsz_per_gpu=1 # per-traj path REQUIRES micro batch size 1 and use_dynamic_bsz=False
 use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
 
@@ -123,6 +135,17 @@ grad_clip=1.0
 lr=1e-6
 lr_warmup_steps=0
 weight_decay=0.1
+
+# ================= ESS-guided LR scaling (VCPO) =================
+update_policy_per_traj=True
+ess_enable=${ess_enable:-True}
+ess_rule=${ess_rule:-sqrt}  # sqrt | linear
+# rho_on reference; null = auto-calibrate from the first update's measured
+# ESS (fresh runs only), or set explicitly (1.0 = paper value for math)
+ess_base=${ess_base:-null}
+ess_use_clipped=False # ESS from unclipped ratios (paper): the brake must see what truncation hides
+ess_base_tag=${ess_base}
+[ "${ess_base_tag}" = "null" ] && ess_base_tag="auto"
 
 # ================= IS / Rollout Correction =================
 # Token-level truncated IS with PPO-clip loss against the *cached* behavior
@@ -182,7 +205,7 @@ save_freq=${save_freq:-20}
 max_actor_ckpt_to_keep=1 # keep only the most recent checkpoint
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -236,6 +259,11 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
+    actor_rollout_ref.actor.update_policy_per_traj=${update_policy_per_traj} \
+    actor_rollout_ref.actor.ess_scaling.enable=${ess_enable} \
+    actor_rollout_ref.actor.ess_scaling.scaling_rule=${ess_rule} \
+    actor_rollout_ref.actor.ess_scaling.base_ess_ratio=${ess_base} \
+    actor_rollout_ref.actor.ess_scaling.use_clipped=${ess_use_clipped} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \

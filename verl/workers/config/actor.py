@@ -62,7 +62,12 @@ class PolicyLossConfig(BaseConfig):
 class ESSScalingConfig(BaseConfig):
     enable: bool = False
     scaling_rule: str = "sqrt"  # "sqrt" | "linear"
-    base_ess_ratio: float = 1.0  # base ess_ratio for scaling
+    # Base (reference) ess_ratio for scaling: lr_scale = min(1, ess_ratio / base).
+    # None = auto-calibrate: the driver captures the first update's measured ESS
+    # ratio (on-policy rho_on) and passes it back via
+    # meta_info["ess_base_override"]; until then scaling is a no-op.
+    # Auto mode is supported by the replay-buffer trainer only.
+    base_ess_ratio: Optional[float] = None
     use_clipped: bool = False  # use ess ratios derived from clipped is weights
 
 

@@ -236,8 +236,9 @@ ess_scaling:
   # Scaling rule for learning-rate multiplier: "sqrt" or "linear"
   scaling_rule: sqrt
 
-  # Baseline ESS ratio used to compute LR multiplier
-  base_ess_ratio: 1.0
+  # Baseline ESS ratio used to compute LR multiplier. null = auto-calibrate
+  # from the first update's measured ESS (replay-buffer trainer only)
+  base_ess_ratio: null
 
   # Whether to use clipped ESS ratio instead of unclipped ESS ratio
   use_clipped: false

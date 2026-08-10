@@ -34,7 +34,7 @@
 #   NGPUS_PER_NODE=4 n_gpus_rollout=2   (36 seqs still divide DP=2).
 #
 # Usage (training environment activated):
-#   bash recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer/smoke_test_replay_5+3.sh
+#   bash "recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=16_k=64_smoke_test.sh"
 # Env knobs: SMOKE_TIMEOUT (s, default 3600), SMOKE_LOG (log path),
 #            SMOKE_MODEL (default Qwen/Qwen3-1.7B), SMOKE_PROMPTS (default 200).
 

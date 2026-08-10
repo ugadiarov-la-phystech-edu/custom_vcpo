@@ -382,7 +382,9 @@ class _QueueStub:
         return (self.blocking.pop(0), 0)
 
 
-def _make_replay_trainer(mini_size, requires_mini_batches, available=None, blocking=None):
+def _make_replay_trainer(
+    mini_size, requires_mini_batches, available=None, blocking=None, ess_auto_base=False, ess_use_clipped=False
+):
     t = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
     t.replay_buffer = ReplayBuffer(tau=4.0, staleness_threshold=100, seed=0)
     t.replay_updates_done = 0
@@ -392,6 +394,10 @@ def _make_replay_trainer(mini_size, requires_mini_batches, available=None, block
     t.rollout_done = False
     t.current_param_version = 0
     t.message_queue_client = _QueueStub(available=available, blocking=blocking)
+    # auto-calibrated ESS base state
+    t.replay_ess_auto_base = ess_auto_base
+    t.replay_ess_use_clipped = ess_use_clipped
+    t.replay_ess_base = None
     # virtual-clock state touched by _open_virtual_step
     t.virtual_free_time = None
     t._step_virtual_start = None
@@ -508,6 +514,26 @@ def test_add_replay_metrics_reports_buffer_and_minibatch_stats():
     assert metrics["replay/buffer_max_staleness"] == 4.0
     assert metrics["replay/minibatch_staleness_hist"] == [0, 0, 2, 4]
     assert metrics["replay/buffer_staleness_hist"] == [0, 0, 2, 4]
+    assert "replay/ess_scaled_lr" not in metrics  # standard update path: no staleness/ess entries
+
+
+def test_add_replay_metrics_surfaces_mean_ess_scaled_lr():
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
+    buf = trainer.replay_buffer
+    for v in (5, 5):
+        buf.add(_sample(group_version=v), current_version=5)
+    # per-traj actor output: structured staleness/ess entries carry the
+    # effective (possibly ESS-scaled) lr per mini-batch
+    metrics = {
+        "staleness/ess": [
+            {"minibatch_idx": 0, "ess_scaled_lr": 1e-6},
+            {"minibatch_idx": 1, "ess_scaled_lr": 2e-6},
+            {"minibatch_idx": 2, "ess_scaled_lr": None},  # ignored
+        ]
+    }
+    info = {"n_new": 2, "n_replayed": 0, "staleness": [0, 0]}
+    trainer._add_replay_metrics(metrics, info, new_version=5)
+    assert metrics["replay/ess_scaled_lr"] == pytest.approx(1.5e-6)
 
 
 # ---------------------------------------------------------------- batch building
@@ -629,6 +655,148 @@ def test_build_replay_batch_pins_dp_groups_for_opob():
     batch = trainer._build_replay_batch(entries)
     assert batch.meta_info["dp_group_key"] == "uid"
     assert batch.meta_info["dp_group_size"] == 2
+
+
+# ---------------------------------------------------------------- auto base_ess_ratio
+
+
+def test_resolve_ess_base_explicit_config_wins():
+    from verl.workers.actor.megatron_actor import resolve_ess_base
+
+    assert resolve_ess_base(0.8, 0.5) == 0.8
+    assert resolve_ess_base(None, 0.5) == 0.5
+    assert resolve_ess_base(None, None) is None
+    assert resolve_ess_base(0.0, 0.5) == 0.0  # explicit 0.0 is still explicit
+
+
+def test_capture_ess_base_means_unclipped_entries_once():
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1, ess_auto_base=True)
+    metrics = {
+        "staleness/ess": [
+            {"minibatch_ess_ratio": 0.8, "minibatch_ess_ratio_clipped": 0.9},
+            {"minibatch_ess_ratio": 0.6, "minibatch_ess_ratio_clipped": 0.7},
+            {"minibatch_ess_ratio": None},  # ignored
+            "not-a-dict",  # ignored
+        ]
+    }
+    trainer._capture_ess_base(metrics)
+    assert trainer.replay_ess_base == pytest.approx(0.7)  # mean of unclipped values
+    # capture is one-shot: later (different) entries must not overwrite it
+    trainer._capture_ess_base({"staleness/ess": [{"minibatch_ess_ratio": 0.1}]})
+    assert trainer.replay_ess_base == pytest.approx(0.7)
+
+
+def test_capture_ess_base_uses_clipped_field_when_configured():
+    trainer = _make_replay_trainer(
+        mini_size=2, requires_mini_batches=1, ess_auto_base=True, ess_use_clipped=True
+    )
+    metrics = {"staleness/ess": [{"minibatch_ess_ratio": 0.6, "minibatch_ess_ratio_clipped": 0.9}]}
+    trainer._capture_ess_base(metrics)
+    assert trainer.replay_ess_base == pytest.approx(0.9)
+
+
+def test_capture_ess_base_stays_none_without_entries():
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1, ess_auto_base=True)
+    trainer._capture_ess_base({})
+    trainer._capture_ess_base({"staleness/ess": []})
+    trainer._capture_ess_base({"staleness/ess": [{"other_key": 1.0}]})
+    assert trainer.replay_ess_base is None
+
+
+def test_build_replay_batch_stamps_ess_base_override_in_auto_mode():
+    def build(auto, base):
+        trainer = _make_replay_trainer(mini_size=1, requires_mini_batches=1, ess_auto_base=auto)
+        trainer.replay_ess_base = base
+        trainer.config = _minimal_trainer_config()
+        trainer.tokenizer = None
+        rs = _rollout_sample_with_batch(
+            "uid_a", rewards=[1.0, -1.0], advantages=[1.0, -1.0], response_mask_rows=[[1, 1, 0], [1, 1, 1]]
+        )
+        entries = [GroupEntry(sample=rs, group_version=3, is_new=True, score=1.0, insert_seq=0)]
+        return trainer._build_replay_batch(entries)
+
+    # auto mode, pre-capture: override present but None (actor skips scaling)
+    batch = build(auto=True, base=None)
+    assert "ess_base_override" in batch.meta_info and batch.meta_info["ess_base_override"] is None
+    # auto mode, post-capture: captured value stamped
+    batch = build(auto=True, base=0.73)
+    assert batch.meta_info["ess_base_override"] == pytest.approx(0.73)
+    # explicit-base (non-auto) runs never stamp the key
+    batch = build(auto=False, base=None)
+    assert "ess_base_override" not in batch.meta_info
+
+
+def test_replay_checkpoint_state_roundtrips_ess_base():
+    saver = _make_replay_trainer(mini_size=2, requires_mini_batches=1, ess_auto_base=True)
+    saver.replay_buffer.add(_sample(group_version=3), current_version=4)
+    saver.replay_updates_done = 7
+    saver.replay_ess_base = 0.66
+    state = ray.cloudpickle.loads(ray.cloudpickle.dumps(saver._replay_checkpoint_state()))
+
+    restored = _make_replay_trainer(mini_size=2, requires_mini_batches=1, ess_auto_base=True)
+    restored._load_replay_checkpoint_state(state)
+    assert restored.replay_ess_base == pytest.approx(0.66)
+    assert restored.replay_updates_done == 7
+    assert restored.replay_buffer.size() == 1
+
+
+def test_load_replay_checkpoint_state_tolerates_pre_feature_checkpoints():
+    # Old-format state: no ess_base / updates_done keys beyond the buffer.
+    saver = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
+    saver.replay_buffer.add(_sample(), current_version=0)
+    old_state = {"buffer": saver.replay_buffer.state_dict(), "updates_done": 3}
+
+    restored = _make_replay_trainer(mini_size=2, requires_mini_batches=1, ess_auto_base=True)
+    restored.replay_ess_base = 0.9  # must be overwritten by the (missing) stored value
+    restored._load_replay_checkpoint_state(old_state)
+    assert restored.replay_ess_base is None  # falls back to first-post-resume capture (with warning)
+    assert restored.replay_updates_done == 3
+
+
+def test_add_replay_metrics_reports_ess_base_when_captured():
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1, ess_auto_base=True)
+    trainer.replay_buffer.add(_sample(group_version=0), current_version=0)
+    trainer.replay_buffer.add(_sample(group_version=0), current_version=0)
+    trainer.replay_ess_base = 0.71
+    metrics = {}
+    trainer._add_replay_metrics(metrics, {"n_new": 2, "n_replayed": 0, "staleness": [0, 0]}, new_version=0)
+    assert metrics["replay/ess_base"] == pytest.approx(0.71)
+
+
+def test_add_replay_metrics_prefers_actor_reported_dynamic_base():
+    # When the actor reports the base it actually used (which may evolve during
+    # training), that value wins over the trainer's captured auto-base.
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1, ess_auto_base=True)
+    for _ in range(2):
+        trainer.replay_buffer.add(_sample(group_version=0), current_version=0)
+    trainer.replay_ess_base = 0.71  # stale trainer-side capture
+    metrics = {
+        "staleness/ess": [
+            {"base_ess_ratio": 0.60, "ess_scaled_lr": 1e-6},
+            {"base_ess_ratio": 0.64, "ess_scaled_lr": 1e-6},
+            {"base_ess_ratio": None},  # unresolved entry ignored
+        ]
+    }
+    trainer._add_replay_metrics(metrics, {"n_new": 2, "n_replayed": 0, "staleness": [0, 0]}, new_version=0)
+    assert metrics["replay/ess_base"] == pytest.approx(0.62)  # mean of actor-used values
+
+
+def test_process_structured_metrics_emits_base_ess_ratio_scalar():
+    from recipe.fully_async_policy.detach_utils import process_structured_metrics
+
+    payload = process_structured_metrics(
+        {
+            "staleness/ess": [
+                {"minibatch_ess_ratio": 0.5, "base_ess_ratio": 0.8, "ess_scaled_lr": 1e-6},
+                {"minibatch_ess_ratio": 0.7, "base_ess_ratio": 0.9, "ess_scaled_lr": 2e-6},
+                {"minibatch_ess_ratio": 0.6, "base_ess_ratio": None},
+            ]
+        },
+        allow_media=False,
+    )
+    assert payload["staleness/base_ess_ratio"] == pytest.approx(0.85)
+    assert payload["staleness/ess_ratio"] == pytest.approx(0.6)
+    assert payload["actor/ess_scaled_lr"] == pytest.approx(1.5e-6)
 
 
 # ---------------------------------------------------------------- tensorboard histograms
