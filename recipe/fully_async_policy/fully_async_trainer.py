@@ -173,6 +173,24 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
             self.replay_updates_done = 0
             self.rollout_done = False
+            actor_cfg = config.actor_rollout_ref.actor
+            self.replay_ess_auto_base = bool(
+                actor_cfg.get("update_policy_per_traj", False)
+                and actor_cfg.ess_scaling.get("enable", False)
+                and actor_cfg.ess_scaling.get("base_ess_ratio", None) is None
+            )
+            self.replay_ess_use_clipped = bool(actor_cfg.ess_scaling.get("use_clipped", False))
+            self.replay_ess_base = None
+        else:
+            actor_cfg = config.actor_rollout_ref.actor
+            assert not (
+                actor_cfg.get("update_policy_per_traj", False)
+                and actor_cfg.ess_scaling.get("enable", False)
+                and actor_cfg.ess_scaling.get("base_ess_ratio", None) is None
+            ), (
+                "ess_scaling.base_ess_ratio=null (auto-calibration from the first update) is only "
+                "supported in replay_buffer mode; set an explicit base_ess_ratio"
+            )
         self.serialize_validation = bool(config.async_training.get("serialize_validation", False))
         self.pause_generation_during_save = bool(config.async_training.get("pause_generation_during_save", False))
         self.compute_prox_log_prob = self.config.async_training.compute_prox_log_prob
@@ -545,7 +563,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         ):
             batch.meta_info["dp_group_key"] = "uid"
             batch.meta_info["dp_group_size"] = self.config.actor_rollout_ref.rollout.n
+        if self.replay_ess_auto_base:
+            batch.meta_info["ess_base_override"] = self.replay_ess_base
         return batch
+
+    def _capture_ess_base(self, metrics):
+        if self.replay_ess_base is not None:
+            return
+        key = "minibatch_ess_ratio_clipped" if self.replay_ess_use_clipped else "minibatch_ess_ratio"
+        entries = metrics.get("staleness/ess") or []
+        values = [float(e[key]) for e in entries if isinstance(e, dict) and e.get(key) is not None]
+        if values:
+            self.replay_ess_base = float(np.mean(values))
+            print(
+                f"[FullyAsyncTrainer][Replay] auto-calibrated ess_scaling.base_ess_ratio="
+                f"{self.replay_ess_base:.4f} from the first update ({key})"
+            )
 
     def _add_replay_metrics(self, metrics, info, new_version):
         minibatch_staleness = info["staleness"]
@@ -569,6 +602,23 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         )
         if buffer_staleness:
             metrics["replay/buffer_staleness_mean"] = float(np.mean(buffer_staleness))
+        ess_entries = metrics.get("staleness/ess") or []
+        scaled_lrs = [
+            float(e["ess_scaled_lr"])
+            for e in ess_entries
+            if isinstance(e, dict) and e.get("ess_scaled_lr") is not None
+        ]
+        if scaled_lrs:
+            metrics["replay/ess_scaled_lr"] = float(np.mean(scaled_lrs))
+        used_bases = [
+            float(e["base_ess_ratio"])
+            for e in ess_entries
+            if isinstance(e, dict) and e.get("base_ess_ratio") is not None
+        ]
+        if used_bases:
+            metrics["replay/ess_base"] = float(np.mean(used_bases))
+        elif getattr(self, "replay_ess_base", None) is not None:
+            metrics["replay/ess_base"] = self.replay_ess_base
 
     REPLAY_HIST_KEYS = ("replay/minibatch_staleness_hist", "replay/buffer_staleness_hist")
 
@@ -613,6 +663,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 with marked_timer("update_actor", timing_raw, color="red"):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                if self.replay_ess_auto_base:
+                    self._capture_ess_base(metrics)
                 self._log_rollout(batch, {}, timing_raw)
 
             new_version = self.current_param_version + 1
@@ -747,13 +799,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self._save_timing_state(local_global_step_folder, save_start)
         if self.replay_enable:
             replay_path = os.path.join(local_global_step_folder, "replay_buffer.pt")
-            torch.save(
-                {
-                    "buffer": self.replay_buffer.state_dict(),
-                    "updates_done": self.replay_updates_done,
-                },
-                replay_path,
-            )
+            torch.save(self._replay_checkpoint_state(), replay_path)
             print(
                 f"[FullyAsyncTrainer][Replay] Saved replay buffer "
                 f"({self.replay_buffer.size()} groups) to {replay_path}"
@@ -857,8 +903,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             replay_path = os.path.join(global_step_folder, "replay_buffer.pt")
             if os.path.exists(replay_path):
                 replay_state = torch.load(replay_path, weights_only=False)
-                self.replay_buffer.load_state_dict(replay_state["buffer"])
-                self.replay_updates_done = int(replay_state.get("updates_done", 0))
+                self._load_replay_checkpoint_state(replay_state)
                 print(
                     f"[FullyAsyncTrainer][Replay] Restored replay buffer "
                     f"({self.replay_buffer.size()} groups, {self.replay_updates_done} updates done) "
@@ -879,6 +924,25 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
         return self.current_param_version
+
+    def _replay_checkpoint_state(self) -> dict:
+        return {
+            "buffer": self.replay_buffer.state_dict(),
+            "updates_done": self.replay_updates_done,
+            "ess_base": self.replay_ess_base,
+        }
+
+    def _load_replay_checkpoint_state(self, state: dict) -> None:
+        self.replay_buffer.load_state_dict(state["buffer"])
+        self.replay_updates_done = int(state.get("updates_done", 0))
+        self.replay_ess_base = state.get("ess_base", None)
+        if self.replay_ess_auto_base and self.replay_ess_base is None:
+            print(
+                "[FullyAsyncTrainer][Replay] WARNING: ess_scaling.base_ess_ratio=null (auto) but the "
+                "checkpoint carries no stored value; it will be captured from the FIRST POST-RESUME "
+                "update, which is NOT on-policy (mature buffer) — prefer an explicit base_ess_ratio "
+                "when resuming from checkpoints predating this feature"
+            )
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """

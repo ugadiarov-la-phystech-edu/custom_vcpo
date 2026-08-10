@@ -71,7 +71,11 @@ from verl.workers.utils.vcpo import (
     zero_grad_accum_buffers,
 )
 
-__all__ = ["MegatronPPOActor"]
+__all__ = ["MegatronPPOActor", "resolve_ess_base"]
+
+
+def resolve_ess_base(config_base, override):
+    return config_base if config_base is not None else override
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -868,6 +872,7 @@ class MegatronPPOActor(BasePPOActor):
         rollout_is_threshold: float | None,
         minibatch_idx: int = 0,
         do_grad_sync: bool = True,
+        ess_base_override: float | None = None,
     ) -> tuple[bool, dict]:
         staleness_metrics = compute_ess_info(local_traj_records, rollout_is_threshold)
         minibatch_ess = staleness_metrics.get("ess")
@@ -904,8 +909,9 @@ class MegatronPPOActor(BasePPOActor):
                     chunk.finish_grad_sync()
 
         base_lrs = self.get_lr()
-        if self.config.ess_scaling.enable and base_lrs is not None:
-            base_ess_ratio = max(float(self.config.ess_scaling.base_ess_ratio), 1e-8)
+        ess_base = resolve_ess_base(self.config.ess_scaling.get("base_ess_ratio", None), ess_base_override)
+        if self.config.ess_scaling.enable and base_lrs is not None and ess_base is not None:
+            base_ess_ratio = max(float(ess_base), 1e-8)
             lr_scale = min(1.0, float(ess_ratio_for_scaling) / base_ess_ratio)
             scaling_rule = self.config.ess_scaling.scaling_rule
             for pg, base_lr in zip(self.actor_optimizer.param_groups, base_lrs, strict=True):
@@ -935,6 +941,7 @@ class MegatronPPOActor(BasePPOActor):
                     "minibatch_ess_ratio": ess_ratio,
                     "minibatch_ess_ratio_clipped": ess_ratio_clipped,
                     "ess_scaled_lr": lr,
+                    "base_ess_ratio": float(ess_base) if ess_base is not None else None,
                 }
             ],
         }
@@ -1098,6 +1105,7 @@ class MegatronPPOActor(BasePPOActor):
                 rollout_is_threshold,
                 minibatch_idx,
                 do_grad_sync=(dp_world_size > 1),
+                ess_base_override=minibatch.meta_info.get("ess_base_override", None),
             )
 
             if not update_successful:

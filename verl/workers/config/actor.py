@@ -62,7 +62,7 @@ class PolicyLossConfig(BaseConfig):
 class ESSScalingConfig(BaseConfig):
     enable: bool = False
     scaling_rule: str = "sqrt"  # "sqrt" | "linear"
-    base_ess_ratio: float = 1.0  # base ess_ratio for scaling
+    base_ess_ratio: Optional[float] = None
     use_clipped: bool = False  # use ess ratios derived from clipped is weights
 
 
