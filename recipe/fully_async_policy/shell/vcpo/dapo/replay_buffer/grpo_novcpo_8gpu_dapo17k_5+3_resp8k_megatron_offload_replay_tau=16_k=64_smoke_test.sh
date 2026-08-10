@@ -9,6 +9,7 @@ LOG=${SMOKE_LOG:-logs/smoke_replay_5+3.log}
 MEMLOG="${LOG%.log}.gpumem.csv"
 mkdir -p "$(dirname "${LOG}")"
 
+export PYTHONUNBUFFERED=1
 export MODEL_PATH=${SMOKE_MODEL:-"Qwen/Qwen3-1.7B"}
 export exp_name="SMOKE-replay-5+3"
 export val_before_train=False

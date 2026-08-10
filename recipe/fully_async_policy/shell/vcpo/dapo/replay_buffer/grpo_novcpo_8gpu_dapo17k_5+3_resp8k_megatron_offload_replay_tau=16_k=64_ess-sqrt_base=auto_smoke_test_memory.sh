@@ -11,6 +11,8 @@ WANT_UPDATES=${SMOKE_UPDATES:-2}
 DEADLINE=$(($(date +%s) + ${SMOKE_TIMEOUT:-3600}))
 mkdir -p "$(dirname "${LOG}")"
 
+export PYTHONUNBUFFERED=1
+
 export exp_name="SMOKE-replay-ess-memory-5+3"
 export val_before_train=False
 export test_freq=-1
