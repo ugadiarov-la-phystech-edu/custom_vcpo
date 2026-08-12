@@ -71,11 +71,18 @@ from verl.workers.utils.vcpo import (
     zero_grad_accum_buffers,
 )
 
-__all__ = ["MegatronPPOActor", "resolve_ess_base"]
+__all__ = ["MegatronPPOActor", "compute_ess_lr_scale", "resolve_ess_base"]
 
 
 def resolve_ess_base(config_base, override):
     return config_base if config_base is not None else override
+
+
+def compute_ess_lr_scale(ess_ratio: float, base_ess_ratio: float, trigger_ratio: float | None = None) -> float:
+    ratio = float(ess_ratio) / max(float(base_ess_ratio), 1e-8)
+    if trigger_ratio is not None and ratio >= float(trigger_ratio):
+        return 1.0
+    return min(1.0, ratio)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -911,8 +918,11 @@ class MegatronPPOActor(BasePPOActor):
         base_lrs = self.get_lr()
         ess_base = resolve_ess_base(self.config.ess_scaling.get("base_ess_ratio", None), ess_base_override)
         if self.config.ess_scaling.enable and base_lrs is not None and ess_base is not None:
-            base_ess_ratio = max(float(ess_base), 1e-8)
-            lr_scale = min(1.0, float(ess_ratio_for_scaling) / base_ess_ratio)
+            lr_scale = compute_ess_lr_scale(
+                float(ess_ratio_for_scaling),
+                float(ess_base),
+                self.config.ess_scaling.get("trigger_ratio", None),
+            )
             scaling_rule = self.config.ess_scaling.scaling_rule
             for pg, base_lr in zip(self.actor_optimizer.param_groups, base_lrs, strict=True):
                 if scaling_rule == "sqrt":

@@ -80,9 +80,9 @@ weight_decay=0.1
 update_policy_per_traj=True
 ess_enable=${ess_enable:-True}
 ess_rule=${ess_rule:-sqrt}
-ess_base=${ess_base:-0.016}
+ess_base=${ess_base:-null}
 ess_use_clipped=False
-ess_trigger=${ess_trigger:-null}
+ess_trigger=${ess_trigger:-0.33333}
 ess_base_tag=${ess_base}
 [ "${ess_base_tag}" = "null" ] && ess_base_tag="auto"
 [ "${ess_trigger}" != "null" ] && ess_base_tag="${ess_base_tag}-trig-${ess_trigger}"
@@ -123,10 +123,7 @@ test_freq=${test_freq:-20}
 save_freq=${save_freq:-20}
 max_actor_ckpt_to_keep=1
 
-is_tag="${rollout_is}"
-[ "${is_tag}" = "sequence" ] && is_tag="seq"
-[ "${is_tag}" = "token" ] && is_tag="tok"
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} ${is_tag}-is-${rollout_is_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"

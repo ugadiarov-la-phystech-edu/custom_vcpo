@@ -64,6 +64,7 @@ class ESSScalingConfig(BaseConfig):
     scaling_rule: str = "sqrt"  # "sqrt" | "linear"
     base_ess_ratio: Optional[float] = None
     use_clipped: bool = False  # use ess ratios derived from clipped is weights
+    trigger_ratio: Optional[float] = None
 
 
 @dataclass
