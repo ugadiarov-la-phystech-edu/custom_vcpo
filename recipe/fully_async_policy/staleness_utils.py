@@ -1,3 +1,5 @@
+import math
+
 import torch
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple, Literal
@@ -35,6 +37,11 @@ class TrajRecord:
     prompt_length: Optional[int]
     advantage_scalar: float
     reward_scalar: float
+
+    # Replay-mode cohort flag: True when the trainer consumes this trajectory
+    # for the first time (freshest available data — feeds the dynamic
+    # base_ess_ratio estimator); None outside replay mode.
+    is_new: Optional[bool] = None
 
     # --- filled in after loss / grad computation ---
     traj_loss: Optional[float] = None
@@ -167,6 +174,9 @@ def compute_staleness_statistics(
             "'param_version_start'/'param_version_end'."
         )
 
+    # Replay-mode cohort membership (absent outside replay mode).
+    replay_is_new_all = non_tensor_batch.get("replay_is_new")
+
     local_records = TrajRecordList()
 
     for idx, traj_uid in enumerate(traj_uids):
@@ -198,6 +208,7 @@ def compute_staleness_statistics(
             prompt_length=prompt_len,
             advantage_scalar=adv_scalar,
             reward_scalar=reward_scalar,
+            is_new=bool(replay_is_new_all[idx]) if replay_is_new_all is not None else None,
         )
 
         if use_old_log_probs:
@@ -335,8 +346,96 @@ def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold:
         "ess_clipped": ESS,
         "ess_ratio_clipped": ess_ratio,
     }
+    staleness_info.update(_compute_base_estimator_payloads(global_records))
 
     return staleness_info
+
+
+def _compute_base_estimator_payloads(global_records: list[dict], eps: float = 1e-8) -> dict[str, Any]:
+    """Payloads for the driver-side dynamic base_ess_ratio estimator, computed
+    from the already-gathered records (no extra communication):
+
+    - ``new_cohort``: pooled moments of the fresh trajectories' *unclipped*
+      seq-IS weights (matching ess_scaling.use_clipped=False), both raw and
+      with the single largest weight winsorized to the second largest (one
+      heavy-tail outlier must not crush the reference toward the 1/B floor).
+      None when the batch carries no replay_is_new stamps (non-replay modes).
+    - ``staleness_buckets``: per-staleness robust (MAD-based) variance of
+      log-weights with bucket size and mean response length — inputs of the
+      s->0 regression estimating the numerics-only rho_on (diagnostic).
+    - ``minibatch_mean_len``: mean response length over all records (quotes
+      the length-corrected reference at the length actually being braked).
+    """
+    new_weights: list[float] = []
+    new_len_sum = 0.0
+    total_len_sum = 0.0
+    total_len_n = 0
+    buckets_raw: dict[int, list] = {}
+
+    for rec in global_records:
+        seq_is = rec.get("rollout_seq_is")
+        if seq_is is None:
+            continue
+        w = float(seq_is)
+        resp_len = rec.get("response_length")
+        if resp_len is not None:
+            total_len_sum += float(resp_len)
+            total_len_n += 1
+        if rec.get("is_new"):
+            new_weights.append(w)
+            if resp_len is not None:
+                new_len_sum += float(resp_len)
+        trainer_version = rec.get("trainer_param_version")
+        version_start = rec.get("param_version_start")
+        if trainer_version is not None and version_start is not None and w > 0.0:
+            try:
+                staleness = int(trainer_version) - int(version_start)
+            except (TypeError, ValueError):
+                continue
+            buckets_raw.setdefault(staleness, []).append((math.log(w), float(resp_len or 0.0)))
+
+    new_cohort = None
+    if new_weights:
+        raw_sum = sum(new_weights)
+        raw_sq_sum = sum(w * w for w in new_weights)
+        winsorized = list(new_weights)
+        if len(winsorized) >= 2:
+            top_idx = max(range(len(winsorized)), key=winsorized.__getitem__)
+            second = max(w for i, w in enumerate(winsorized) if i != top_idx)
+            winsorized[top_idx] = min(winsorized[top_idx], second)
+        new_cohort = {
+            "n": len(new_weights),
+            "w_sum": sum(winsorized),
+            "w_sq_sum": sum(w * w for w in winsorized),
+            "w_sum_raw": raw_sum,
+            "w_sq_sum_raw": raw_sq_sum,
+            "len_sum": new_len_sum,
+        }
+
+    staleness_buckets = []
+    for staleness in sorted(buckets_raw):
+        values = buckets_raw[staleness]
+        if len(values) < 4:
+            # MAD on tiny buckets is degenerate; skip rather than pollute the fit.
+            continue
+        logs = sorted(v[0] for v in values)
+        median = logs[len(logs) // 2]
+        abs_dev = sorted(abs(x - median) for x in logs)
+        mad = abs_dev[len(abs_dev) // 2]
+        staleness_buckets.append(
+            {
+                "s": float(staleness),
+                "n": len(values),
+                "mean_len": sum(v[1] for v in values) / len(values),
+                "var_log_w": (1.4826 * mad) ** 2,
+            }
+        )
+
+    return {
+        "new_cohort": new_cohort,
+        "staleness_buckets": staleness_buckets,
+        "minibatch_mean_len": total_len_sum / total_len_n if total_len_n else 0.0,
+    }
 
 def rearrange_minibatch(batch: DataProto) -> DataProto:
     """

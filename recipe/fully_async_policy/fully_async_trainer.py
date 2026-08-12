@@ -33,6 +33,7 @@ from recipe.fully_async_policy.detach_utils import (
     assemble_batch_from_rollout_samples,
     process_structured_metrics
 )
+from recipe.fully_async_policy.ess_base_estimator import EssBaseEstimator
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.replay_buffer import ReplayBuffer
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer, make_opportunistic_minibatch_indices
@@ -215,6 +216,25 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
             self.replay_ess_use_clipped = bool(actor_cfg.ess_scaling.get("use_clipped", False))
             self.replay_ess_base = None
+            # Dynamic base estimator (mode=new_cohort): tracks the fresh
+            # cohort's ESS as the brake reference instead of freezing the
+            # first-update capture. The capture still runs and seeds the
+            # estimator (warm start + default clamp ceiling).
+            estimator_cfg = config.async_training.get("ess_base_estimator", None)
+            estimator_mode = (
+                str(estimator_cfg.get("mode", "first_update")) if estimator_cfg is not None else "first_update"
+            )
+            if estimator_mode == "new_cohort":
+                assert self.replay_ess_auto_base, (
+                    "ess_base_estimator.mode=new_cohort requires update_policy_per_traj=True, "
+                    "ess_scaling.enable=True and ess_scaling.base_ess_ratio=null"
+                )
+                self.ess_base_estimator = EssBaseEstimator.from_config(estimator_cfg)
+            else:
+                assert estimator_mode == "first_update", (
+                    f"unknown async_training.ess_base_estimator.mode: {estimator_mode}"
+                )
+                self.ess_base_estimator = None
         else:
             actor_cfg = config.actor_rollout_ref.actor
             assert not (
@@ -225,6 +245,11 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 "ess_scaling.base_ess_ratio=null (auto-calibration from the first update) is only "
                 "supported in replay_buffer mode; set an explicit base_ess_ratio"
             )
+            estimator_cfg = config.async_training.get("ess_base_estimator", None)
+            assert estimator_cfg is None or str(estimator_cfg.get("mode", "first_update")) == "first_update", (
+                "ess_base_estimator.mode=new_cohort is only supported in replay_buffer mode"
+            )
+            self.ess_base_estimator = None
         # Stop-the-world accounting modes: freeze the whole pipeline during
         # validation (trainer blocks instead of training ahead on backlog) and
         # generation during checkpoint saves, so both become pure time
@@ -612,6 +637,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         else:
             batch = assemble_batch_from_rollout_samples(rollout_samples, self.tokenizer, self.config, None)
         batch.meta_info["trainer_param_version"] = self.current_param_version
+        # Cohort membership for the dynamic ESS-base estimator: mark every row
+        # of a not-yet-trained-on group. Stamped via group-uid membership (not
+        # positional repeat) so balance_batch reordering cannot misalign it.
+        new_group_uids = set()
+        for entry in entries:
+            if entry.is_new:
+                entry_uids = entry.sample.full_batch.non_tensor_batch.get("uid")
+                if entry_uids is not None and len(entry_uids):
+                    new_group_uids.add(entry_uids[0])
+        batch.non_tensor_batch["replay_is_new"] = np.array(
+            [uid in new_group_uids for uid in batch.non_tensor_batch["uid"]], dtype=bool
+        )
         if "traj_uid" not in batch.non_tensor_batch and "uid" in batch.non_tensor_batch:
             uids = batch.non_tensor_batch.get("uid")
             batch.non_tensor_batch["traj_uid"] = np.array(
@@ -674,6 +711,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"[FullyAsyncTrainer][Replay] auto-calibrated ess_scaling.base_ess_ratio="
                 f"{self.replay_ess_base:.4f} from the first update ({key})"
             )
+
+    def _update_ess_base_estimator(self, metrics):
+        """Feed this update's measured payloads (fresh-cohort weight moments
+        and staleness buckets from the actor's structured staleness/ess
+        entries) into the dynamic base estimator, refresh replay_ess_base for
+        the next update's ess_base_override, and surface the estimator
+        diagnostics as replay/ess_base_* scalars. Runs after
+        _capture_ess_base so the first-update capture seeds the estimator
+        (warm start + default clamp ceiling)."""
+        estimator = self.ess_base_estimator
+        estimator.seed(self.replay_ess_base)
+        estimator.observe_entries(metrics.get("staleness/ess") or [])
+        base = estimator.current_base()
+        if base is not None:
+            self.replay_ess_base = float(base)
+        metrics.update(estimator.diagnostics())
 
     def _add_replay_metrics(self, metrics, info, new_version):
         """Item-17 metrics, computed after this update's eviction/rescoring at
@@ -780,6 +833,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
                 if self.replay_ess_auto_base:
                     self._capture_ess_base(metrics)
+                if self.ess_base_estimator is not None:
+                    self._update_ess_base_estimator(metrics)
                 self._log_rollout(batch, {}, timing_raw)
 
             # Post-update buffer maintenance at the version this update just
@@ -1064,12 +1119,20 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             "buffer": self.replay_buffer.state_dict(),
             "updates_done": self.replay_updates_done,
             "ess_base": self.replay_ess_base,
+            "ess_base_estimator": (
+                self.ess_base_estimator.state_dict()
+                if getattr(self, "ess_base_estimator", None) is not None
+                else None
+            ),
         }
 
     def _load_replay_checkpoint_state(self, state: dict) -> None:
         self.replay_buffer.load_state_dict(state["buffer"])
         self.replay_updates_done = int(state.get("updates_done", 0))
         self.replay_ess_base = state.get("ess_base", None)
+        estimator_state = state.get("ess_base_estimator", None)
+        if getattr(self, "ess_base_estimator", None) is not None and estimator_state:
+            self.ess_base_estimator.load_state_dict(estimator_state)
         if self.replay_ess_auto_base and self.replay_ess_base is None:
             print(
                 "[FullyAsyncTrainer][Replay] WARNING: ess_scaling.base_ess_ratio=null (auto) but the "

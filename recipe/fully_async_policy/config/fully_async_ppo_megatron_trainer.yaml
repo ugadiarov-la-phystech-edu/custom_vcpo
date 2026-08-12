@@ -115,6 +115,45 @@ async_training:
     # Seed for the weighted without-replacement sampling of replayed groups
     sampling_seed: 1234
 
+  # Dynamic estimation of the ESS-scaling reference (base_ess_ratio) in
+  # replay_buffer mode. Requires ess_scaling.enable=True with
+  # base_ess_ratio=null. See recipe/fully_async_policy/ess_base_estimator.py.
+  ess_base_estimator:
+
+    # first_update: freeze the first update's measured ESS ratio (legacy
+    # auto-calibration). new_cohort: EMA of the fresh (not-yet-trained-on)
+    # cohort's pooled ESS — the brake then measures replay excess relative to
+    # the freshest data the pipeline delivers.
+    mode: first_update
+
+    # EMA coefficient applied per fold (a fold = min_seqs pooled sequences)
+    beta: 0.05
+
+    # Fresh sequences pooled (sum w, sum w^2) before the EMA folds once;
+    # per-cohort ESS ratios never enter the EMA directly (small-sample bias)
+    min_seqs: 64
+
+    # Floor: keep the reference above the degenerate ESS floor 1/B so the
+    # brake can never become structurally unable to engage
+    clamp_min: 0.002
+
+    # Ceiling; null = the first-update capture ("never brake harder than the
+    # legacy auto-calibration would")
+    clamp_max: null
+
+    # Quote the reference at the current minibatch's mean response length via
+    # base = exp(-sigma^2 * L) with sigma^2 implied by the fresh cohort's ESS
+    # at its own mean length (lognormal weight model)
+    length_correction: False
+
+    # Winsorize the single largest fresh-cohort weight to the second largest
+    # before pooling (one heavy-tail outlier must not crush the reference)
+    winsor_top1: True
+
+    # Sliding window (in updates) of staleness-bucket points for the s->0
+    # regression diagnostic (rho_on estimate; never used for braking)
+    window: 100
+
   # Stop-the-world validation: after a sync that triggers validation, the
   # trainer blocks until the validation sweep completes instead of training
   # ahead on backlog. With generation already paused, the whole pipeline

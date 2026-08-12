@@ -957,6 +957,15 @@ class MegatronPPOActor(BasePPOActor):
                     # value or driver override) — the source of truth when the
                     # base evolves during training; None while unresolved.
                     "base_ess_ratio": float(ess_base) if ess_base is not None else None,
+                    # Payloads for the driver-side dynamic base estimator
+                    # (recipe.fully_async_policy.ess_base_estimator): fresh-
+                    # cohort weight moments, per-staleness robust log-weight
+                    # variances, and the minibatch mean response length.
+                    # new_cohort is None outside replay mode (no
+                    # replay_is_new stamps in the batch).
+                    "new_cohort": staleness_metrics.get("new_cohort"),
+                    "staleness_buckets": staleness_metrics.get("staleness_buckets"),
+                    "minibatch_mean_len": staleness_metrics.get("minibatch_mean_len"),
                 }
             ],
         }
