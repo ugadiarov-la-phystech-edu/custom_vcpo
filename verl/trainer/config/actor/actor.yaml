@@ -243,6 +243,12 @@ ess_scaling:
   # Whether to use clipped ESS ratio instead of unclipped ESS ratio
   use_clipped: false
 
+  # Intervention threshold on ess_ratio / base_ess_ratio: scaling engages only
+  # for mini-batches where the ratio falls BELOW this value; at or above it the
+  # update runs at full nominal lr. null = legacy behavior (engage whenever
+  # ratio < 1). The lr multiplier jumps from 1 to rule(ratio) at the threshold.
+  trigger_ratio: null
+
 # Gradient baseline settings for VCPO per-trajectory updates
 grad_baselining:
 

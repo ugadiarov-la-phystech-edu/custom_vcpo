@@ -69,6 +69,12 @@ class ESSScalingConfig(BaseConfig):
     # Auto mode is supported by the replay-buffer trainer only.
     base_ess_ratio: Optional[float] = None
     use_clipped: bool = False  # use ess ratios derived from clipped is weights
+    # Intervention threshold on ess_ratio / base_ess_ratio: scaling engages only
+    # for mini-batches where the ratio falls BELOW this value; at or above it the
+    # update runs at full nominal lr. None = legacy behavior (engage whenever
+    # ratio < 1). Values <= 1 widen the full-lr deadband; note the lr multiplier
+    # jumps discontinuously from 1 to rule(ratio) at the threshold.
+    trigger_ratio: Optional[float] = None
 
 
 @dataclass

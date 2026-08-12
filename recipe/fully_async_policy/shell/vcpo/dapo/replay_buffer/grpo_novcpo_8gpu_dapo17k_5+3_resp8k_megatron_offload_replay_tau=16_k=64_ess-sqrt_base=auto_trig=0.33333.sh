@@ -8,42 +8,49 @@
 #SBATCH --error=./slurm/%A_%x.err
 #SBATCH --job-name=grpo-novcpo-replay-ess
 
-# DEADBAND ESS-braked replay arm with the standard token-level IS correction.
-# Identical to grpo_novcpo_..._replay_tau=16_k=64_ess-sqrt_base=auto.sh
-# (trainer-side replay buffer, tau=16, eviction k=64, rmb=1, sync after every
-# update, DAPO insertion gate, frozen advantages / behavior log-probs,
-# per-traj ESS-scaled updates, token-level IS truncation at 2.0) except for
-# ONE deliberate change:
-#   * base_ess_ratio=0.016 (deadband) instead of auto-calibration. The
-#     base=auto run measured rho_on ~= 0.0329 and braked proportionally from
-#     update 1 (lr multipliers 0.24-0.93 on perfectly healthy steps), costing
-#     0.06-0.09 val accuracy vs the unbraked arm at equal training time. But
-#     the unbraked run's collapse analysis showed instability is a THRESHOLD
-#     phenomenon: composition-normal minibatches trained fine for 190 updates
-#     until KL(theta||behavior) crossed a tipping point and seq ratios
-#     detached (ESS craters toward 1/B there). So the brake only needs its
-#     bottom end: base = 0.5 * measured rho_on — steps with ESS above 0.016
-#     hit the min(1,.) cap and run at FULL lr, while a detaching step still
-#     gets cut to ~0.1-0.3x. Goal: unbraked early slope, braked collapse
-#     response. Override with ess_base=<v> (ess_base=null restores
-#     auto-calibration; the exp name tag follows).
-# This isolates the deadband against base=auto directly. The sibling
-# ..._base=0.016_seq-is=8.sh arm (deadband + original-VCPO seq-IS 8.0) was a
-# clear regression: with 6k-token responses and replay staleness p50~8, raw
-# seq ratios spread over orders of magnitude (74% of sequences near-zero
-# weight, mean clipped seq weight 0.42), so seq-level truncated IS effectively
-# discarded most of the data — 0.360 val @ update 120 vs base=auto's 0.480 at
-# equal ctt, while ESS itself sat at the ~1/B floor and kept the brake engaged
-# (~0.34-0.6x) on most steps. Token-2.0 truncation keeps every sequence
-# contributing ~full gradient; the deadband brake alone handles detachment.
-# ESS mechanics (unchanged): update_policy_per_traj=True DP-all-reduces
-# sequence-level IS ratios into ess_ratio=(sum w)^2/(B*sum w^2)
-# (staleness/ess_ratio, unclipped ratios per the paper), and the optimizer
-# step's LR is scaled by min(1, ess_ratio/base)^(1/2) for that step only.
-# Costs vs the unbraked arm: ~20% slower updates + one extra grad-sized GPU
-# buffer (~16 GB bf16 per trainer GPU, peak ~79 GB measured) — watch the
-# first updates. Effective LR logged as replay/ess_scaled_lr (and
-# actor/ess_scaled_lr + staleness/ess_ratio via structured metrics).
+# TRIGGERED ESS-braked replay arm: identical to
+# grpo_novcpo_..._replay_tau=16_k=64_ess-sqrt_base=auto.sh (auto-calibrated
+# base, trainer-side replay buffer, tau=16, eviction k=64, rmb=1, sync after
+# every update, DAPO insertion gate, frozen advantages / behavior log-probs)
+# except for ONE deliberate change:
+#   * ess_scaling.trigger_ratio=0.33333 — the brake engages only for
+#     mini-batches where ess_ratio / base falls BELOW 1/3; at or above it the
+#     update runs at FULL nominal lr (hard knee: the multiplier jumps from 1
+#     to sqrt(ratio) at the threshold). With the auto-calibrated base
+#     (rho_on ~= 0.033 measured on this setup) braking starts below ESS
+#     ~0.011. Motivation: base=auto braked proportionally on healthy steps
+#     from update 1 and lost 0.02-0.05 val vs the fixed 0.016 deadband at
+#     equal ctt, while the 0.016 arm showed braking is only needed at the
+#     detachment threshold. This arm keeps auto's self-calibrated reference
+#     but adds the deadband as a RATIO of the reference (base/3) instead of
+#     a hand-picked absolute value — if it matches the 0.016 arm's curve, the
+#     deadband generalizes across setups without re-measuring rho_on.
+# Inherited mechanics of the base=auto arm:
+#   * update_policy_per_traj=True: every mini-batch's sequence-level IS
+#     ratios against the cached behavior log-probs are DP-all-reduced into
+#     ess_ratio = (sum w)^2 / (B * sum w^2), logged as staleness/ess_ratio.
+#   * ess_scaling: the optimizer step's LR is scaled by
+#         min(1, ess_ratio / base_ess_ratio) ^ (1/2)   (sqrt rule, unclipped)
+#     for that step only. This is the brake the unbraked tau-16/k-64 run
+#     lacked: in its collapse precursors (token-IS mean 24-250, pearson<0.9)
+#     the ESS ratio plummets, so the LR shrinks exactly when the off-policy
+#     runaway starts, turning collapses into slowdowns.
+#   * base_ess_ratio=null (default): AUTO-CALIBRATED — the first update (the
+#     staleness-0 warm-up mini-batch, i.e. the empirical on-policy rho_on for
+#     this exact setup) runs unscaled, its measured ESS ratio becomes the
+#     base (logged as replay/ess_base, persisted in replay_buffer.pt), and
+#     braking starts from update 2. Override ess_base with an explicit value
+#     (e.g. 1.0 for the paper reference, or a measured operating point from
+#     ..._estimate_base_ess_ratio.sh) to skip auto-calibration. NOTE: auto
+#     mode is for fresh runs — resuming from a checkpoint without a stored
+#     base captures a mature-buffer (non-on-policy) reference instead.
+#   * Costs vs the unbraked arm: ~20% slower updates (per-traj grad
+#     accumulation + per-traj grad norms) and one extra grad-sized GPU
+#     buffer (~16 GB bf16 per trainer GPU on top of the ~58 GB HDO
+#     footprint) — watch peak memory on the first updates.
+#   * The effective LR is logged as replay/ess_scaled_lr (and
+#     actor/ess_scaled_lr + staleness/ess_ratio via structured metrics)
+#     every update.
 # Replay-arm notes that still apply:
 #   * Groups staler than replay_buffer.staleness_threshold=64 updates are
 #     evicted after each update; scores are recomputed each update. With
@@ -149,28 +156,27 @@ weight_decay=0.1
 update_policy_per_traj=True
 ess_enable=${ess_enable:-True}
 ess_rule=${ess_rule:-sqrt}  # sqrt | linear
-# Deadband base: 0.5 * rho_on, where rho_on ~= 0.0329 was measured by the
-# base=auto run's first (staleness-0) update on this exact setup. Healthy
-# steps run at full lr; braking engages only when measured ESS falls below
-# ~half the on-policy reference. null = auto-calibrate (fresh runs only).
-ess_base=${ess_base:-0.016}
+# rho_on reference; null = auto-calibrate from the first update's measured
+# ESS (fresh runs only), or set explicitly (1.0 = paper value for math)
+ess_base=${ess_base:-null}
 ess_use_clipped=False # ESS from unclipped ratios (paper): the brake must see what truncation hides
 # Intervention threshold on ess_ratio/base: scaling engages only for
 # mini-batches where the ratio falls BELOW this value; at or above it the
-# update runs at full nominal lr. null = legacy (engage whenever ratio < 1).
-ess_trigger=${ess_trigger:-null}
+# update runs at full nominal lr (the multiplier jumps from 1 to
+# sqrt(ratio) at the threshold). 0.33333 ~= a deadband at base/3: with the
+# auto-calibrated base (rho_on ~= 0.033 on this setup) braking engages only
+# below ESS ~0.011 — between the base=auto arm (brakes below 0.033,
+# over-braked healthy steps) and the fixed 0.016 deadband arm. null = legacy
+# (engage whenever ratio < 1).
+ess_trigger=${ess_trigger:-0.33333}
 ess_base_tag=${ess_base}
 [ "${ess_base_tag}" = "null" ] && ess_base_tag="auto"
 [ "${ess_trigger}" != "null" ] && ess_base_tag="${ess_base_tag}-trig-${ess_trigger}"
 
 # ================= IS / Rollout Correction =================
-# Token-level truncated IS against the *cached* behavior log-probs (frozen at
-# insertion): w_t = min(ratio_t, 2.0) per token — same as the base=auto and
-# unbraked replay arms, so this run differs from base=auto ONLY in ess_base.
-# (The seq-is=8 sibling showed sequence-level weights evaporate at this
-# response length / staleness: most sequences got near-zero weight.)
-# rollout_rs stays null (paper: seq-level masking is brittle).
-# use_policy_gradient=False is the equivalent of loss_type=ppo_clip.
+# Token-level truncated IS with PPO-clip loss against the *cached* behavior
+# log-probs (frozen at insertion). use_policy_gradient=False is the
+# equivalent of loss_type=ppo_clip.
 rollout_is="token"
 rollout_is_threshold="2.0"
 rollout_rs=null
@@ -225,10 +231,7 @@ save_freq=${save_freq:-20}
 max_actor_ckpt_to_keep=1 # keep only the most recent checkpoint
 
 # ================= Logging =================
-is_tag="${rollout_is}"
-[ "${is_tag}" = "sequence" ] && is_tag="seq"
-[ "${is_tag}" = "token" ] && is_tag="tok"
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} ${is_tag}-is-${rollout_is_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
