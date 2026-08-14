@@ -287,6 +287,22 @@ def finalize_model_grads_ignore_dp(model: Sequence[torch.nn.Module], num_tokens:
         #         model_chunk.scale_gradients(scaling)
 
 
+def _noop_finalize_model_grads(model: Sequence[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
+    pass
+
+
+def disable_grad_finalize(actor_modules: Sequence[torch.nn.Module]):
+    config = get_model_config(actor_modules[0])
+    orig_finalize = config.finalize_model_grads_func
+    config.finalize_model_grads_func = _noop_finalize_model_grads
+    return orig_finalize
+
+
+def restore_grad_finalize(actor_modules: Sequence[torch.nn.Module], orig_finalize) -> None:
+    config = get_model_config(actor_modules[0])
+    config.finalize_model_grads_func = orig_finalize
+
+
 def disable_dp_sync(actor_modules: Iterable[torch.nn.Module]) -> Tuple:
     config = get_model_config(actor_modules[0])
     orig_no_sync = config.no_sync_func

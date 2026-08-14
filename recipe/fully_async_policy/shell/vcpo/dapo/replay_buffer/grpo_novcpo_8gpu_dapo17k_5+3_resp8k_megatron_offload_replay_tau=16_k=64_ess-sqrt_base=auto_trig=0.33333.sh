@@ -78,6 +78,7 @@ lr_warmup_steps=0
 weight_decay=0.1
 
 update_policy_per_traj=True
+grad_baselining=False
 ess_enable=${ess_enable:-True}
 ess_rule=${ess_rule:-sqrt}
 ess_base=${ess_base:-null}
@@ -176,6 +177,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
     actor_rollout_ref.actor.update_policy_per_traj=${update_policy_per_traj} \
+    actor_rollout_ref.actor.grad_baselining.enable=${grad_baselining} \
     actor_rollout_ref.actor.ess_scaling.enable=${ess_enable} \
     actor_rollout_ref.actor.ess_scaling.scaling_rule=${ess_rule} \
     actor_rollout_ref.actor.ess_scaling.base_ess_ratio=${ess_base} \
