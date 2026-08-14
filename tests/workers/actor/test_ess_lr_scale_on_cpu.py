@@ -22,7 +22,7 @@ Run: pytest tests/workers/actor/test_ess_lr_scale_on_cpu.py
 
 import pytest
 
-from verl.workers.actor.megatron_actor import compute_ess_lr_scale
+from verl.workers.actor.megatron_actor import _resolve_loss_multiplier, compute_ess_lr_scale, resolve_ess_base
 
 
 class TestLegacyBehavior:
@@ -71,3 +71,45 @@ class TestTriggerRatio:
         # multiplier applies -> identical to legacy for any input
         for ess in (0.1, 0.5, 0.9, 1.5):
             assert compute_ess_lr_scale(ess, 0.5, 2.0) == compute_ess_lr_scale(ess, 0.5)
+
+
+class TestResolveLossMultiplier:
+    """The buffer-free per-traj path folds the advantage into loss_multiplier,
+    so an exact 0.0 (zero-advantage trajectory) must be honored — a `x or 1.0`
+    parse would silently promote it to a full-weight score gradient."""
+
+    def test_missing_defaults_to_one(self):
+        assert _resolve_loss_multiplier({}) == 1.0
+
+    def test_none_defaults_to_one(self):
+        assert _resolve_loss_multiplier({"loss_multiplier": None}) == 1.0
+
+    def test_explicit_zero_is_honored(self):
+        assert _resolve_loss_multiplier({"loss_multiplier": 0.0}) == 0.0
+
+    def test_value_passthrough(self):
+        assert _resolve_loss_multiplier({"loss_multiplier": 0.25}) == 0.25
+
+
+class TestResolveEssBase:
+    def test_config_value_wins_over_override(self):
+        assert resolve_ess_base(0.016, 0.033) == 0.016
+
+    def test_none_config_falls_back_to_override(self):
+        assert resolve_ess_base(None, 0.033) == 0.033
+
+    def test_unresolved_returns_none(self):
+        assert resolve_ess_base(None, None) is None
+
+    def test_explicit_zero_config_wins(self):
+        # 0.0 is an explicit (if degenerate) config value, not "unset".
+        assert resolve_ess_base(0.0, 0.033) == 0.0
+
+
+class TestZeroBaseGuard:
+    def test_zero_base_never_divides_by_zero(self):
+        # base clamped to 1e-8 -> huge ratio, capped at full lr
+        assert compute_ess_lr_scale(0.5, 0.0) == 1.0
+
+    def test_zero_ess_and_zero_base_gives_zero(self):
+        assert compute_ess_lr_scale(0.0, 0.0) == 0.0

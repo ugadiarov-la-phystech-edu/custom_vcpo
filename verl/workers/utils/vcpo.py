@@ -287,6 +287,30 @@ def finalize_model_grads_ignore_dp(model: Sequence[torch.nn.Module], num_tokens:
         #         model_chunk.scale_gradients(scaling)
 
 
+def _noop_finalize_model_grads(model: Sequence[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
+    """Schedule-level finalize replacement for the buffer-free per-traj path.
+
+    When gradients accumulate directly in Megatron's main grad buffer across
+    forward_backward_batch calls, the TP/CP/PP partial-grad all-reduces in the
+    finalize step must not run per call — re-reducing an already-reduced
+    accumulated buffer double-counts earlier trajectories' contributions.
+    The real finalize runs once, on the fully accumulated gradient, via
+    `finalize_model_grads_ignore_dp` at optimizer-step time."""
+    pass
+
+
+def disable_grad_finalize(actor_modules: Sequence[torch.nn.Module]):
+    config = get_model_config(actor_modules[0])
+    orig_finalize = config.finalize_model_grads_func
+    config.finalize_model_grads_func = _noop_finalize_model_grads
+    return orig_finalize
+
+
+def restore_grad_finalize(actor_modules: Sequence[torch.nn.Module], orig_finalize) -> None:
+    config = get_model_config(actor_modules[0])
+    config.finalize_model_grads_func = orig_finalize
+
+
 def disable_dp_sync(actor_modules: Iterable[torch.nn.Module]) -> Tuple:
     config = get_model_config(actor_modules[0])
     orig_no_sync = config.no_sync_func

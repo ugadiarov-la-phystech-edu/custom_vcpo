@@ -44,10 +44,13 @@
 #     ..._estimate_base_ess_ratio.sh) to skip auto-calibration. NOTE: auto
 #     mode is for fresh runs — resuming from a checkpoint without a stored
 #     base captures a mature-buffer (non-on-policy) reference instead.
-#   * Costs vs the unbraked arm: ~20% slower updates (per-traj grad
-#     accumulation + per-traj grad norms) and one extra grad-sized GPU
-#     buffer (~16 GB bf16 per trainer GPU on top of the ~58 GB HDO
-#     footprint) — watch peak memory on the first updates.
+#   * Costs vs the unbraked arm: slower updates from the per-traj path's
+#     micro-batch-size-1 scheduling (the earlier ~20% figure included
+#     per-traj buffer accumulation + grad norms, both gone now). With
+#     grad_baselining.enable=False (set below) the per-traj path is
+#     BUFFER-FREE since 2026-08-15: no extra grad-sized GPU buffer — the
+#     former ~15.3 GB bf16 per trainer GPU on top of the ~58 GB HDO
+#     footprint is reclaimed.
 #   * The effective LR is logged as replay/ess_scaled_lr (and
 #     actor/ess_scaled_lr + staleness/ess_ratio via structured metrics)
 #     every update.
@@ -154,6 +157,13 @@ weight_decay=0.1
 
 # ================= ESS-guided LR scaling (VCPO) =================
 update_policy_per_traj=True
+# OPOB off -> the per-traj path runs BUFFER-FREE: no grad accum buffers are
+# allocated (the advantage is folded into the per-microbatch loss scale and
+# gradients accumulate in Megatron's main buffer), saving 15.26 GiB bf16 of
+# peak memory per trainer GPU. Set explicitly so a future default flip
+# cannot silently re-enable the buffers. Per-traj grad-norm diagnostics
+# (traj_record.grad_norm) are OPOB-only and stay empty in this mode.
+grad_baselining=False
 ess_enable=${ess_enable:-True}
 ess_rule=${ess_rule:-sqrt}  # sqrt | linear
 # rho_on reference; null = auto-calibrate from the first update's measured
@@ -286,6 +296,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
     actor_rollout_ref.actor.update_policy_per_traj=${update_policy_per_traj} \
+    actor_rollout_ref.actor.grad_baselining.enable=${grad_baselining} \
     actor_rollout_ref.actor.ess_scaling.enable=${ess_enable} \
     actor_rollout_ref.actor.ess_scaling.scaling_rule=${ess_rule} \
     actor_rollout_ref.actor.ess_scaling.base_ess_ratio=${ess_base} \

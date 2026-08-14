@@ -66,8 +66,11 @@ from verl.workers.utils.vcpo import (
     allocate_grad_accum_buffers,
     copy_accum_buffers_to_grad_buffers,
     disable_dp_sync,
+    disable_grad_finalize,
+    finalize_model_grads_ignore_dp,
     move_grad_buffers,
     restore_dp_sync,
+    restore_grad_finalize,
     zero_grad_accum_buffers,
 )
 
@@ -96,6 +99,14 @@ def compute_ess_lr_scale(ess_ratio: float, base_ess_ratio: float, trigger_ratio:
     if trigger_ratio is not None and ratio >= float(trigger_ratio):
         return 1.0
     return min(1.0, ratio)
+
+
+def _resolve_loss_multiplier(meta_info) -> float:
+    """None/missing → 1.0; an explicit 0.0 is honored (a `x or 1.0` parse would
+    silently turn zero-advantage trajectories into full-weight score gradients)."""
+    value = meta_info.get("loss_multiplier", None)
+    return 1.0 if value is None else float(value)
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -637,7 +648,7 @@ class MegatronPPOActor(BasePPOActor):
             append_to_dict(metrics, stats)
             if forward_only:
                 return policy_loss, [metrics, ret_entropy, None, None]
-            loss_multiplier = float(meta_info.get("loss_multiplier", 1.0) or 1.0)
+            loss_multiplier = _resolve_loss_multiplier(meta_info)
             if loss_multiplier != 1.0:
                 policy_loss = policy_loss * loss_multiplier
             return policy_loss, [metrics, ret_entropy, rollout_log_prob, old_log_prob]
@@ -749,7 +760,7 @@ class MegatronPPOActor(BasePPOActor):
                 meta_info = {
                     "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
                     "rollout_corr_config": rollout_corr_cfg,
-                    "loss_multiplier": float(data.meta_info.get("loss_multiplier", 1.0) or 1.0),
+                    "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
                 }
             else:
                 clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
@@ -759,7 +770,7 @@ class MegatronPPOActor(BasePPOActor):
                     "clip_ratio_c": clip_ratio_c,
                     "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
                     "rollout_corr_config": rollout_corr_cfg,
-                    "loss_multiplier": float(data.meta_info.get("loss_multiplier", 1.0) or 1.0),
+                    "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
                 }
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
@@ -913,7 +924,14 @@ class MegatronPPOActor(BasePPOActor):
         lr = lrs_now[0] if lrs_now else None
 
         # ================ Optimizer Step ================
-        copy_accum_buffers_to_grad_buffers(self.actor_module, accum_buffers)
+        if accum_buffers is not None:
+            copy_accum_buffers_to_grad_buffers(self.actor_module, accum_buffers)
+        else:
+            # Buffer-free path (no OPOB): gradients accumulated directly in the
+            # main grad buffer with the schedule-level finalize suppressed; run
+            # the TP/CP/PP partial-grad reductions exactly once here, on the
+            # fully accumulated gradient. DP sync follows below as usual.
+            finalize_model_grads_ignore_dp(self.actor_module)
 
         # ===== Optional finalize with DDP sync of gradients =====
         #
@@ -997,7 +1015,13 @@ class MegatronPPOActor(BasePPOActor):
         """
         metrics = {}
 
-        accum_buffers = allocate_grad_accum_buffers(self.actor_module)
+        # Gradient buffers are only needed for OPOB (grad_baselining): each
+        # trajectory's gradient must be isolated in the main buffer to measure
+        # ||g_i|| and re-weighted against the score accumulator. Without OPOB
+        # the advantage is folded into the per-microbatch loss scale and
+        # gradients accumulate directly in Megatron's main grad buffer,
+        # saving a full grad-buffer copy of peak memory.
+        accum_buffers = None
         score_gradient_buffers = None
         if grad_baselining:
             assert self.config.loss_agg_mode in [
@@ -1005,6 +1029,7 @@ class MegatronPPOActor(BasePPOActor):
                 "seq-mean-token-sum",
                 "seq-mean-token-sum-norm",
             ]
+            accum_buffers = allocate_grad_accum_buffers(self.actor_module)
             score_gradient_buffers = allocate_grad_accum_buffers(self.actor_module)
 
         # [NOTE]: Megatron's DDP grad sync is over the DP×CP domain if using distributed optimizer.
@@ -1012,6 +1037,14 @@ class MegatronPPOActor(BasePPOActor):
         dp_world_size = mpu.get_data_parallel_group(with_context_parallel=with_context_parallel).size()
         if dp_world_size > 1:
             orig_no_sync, orig_grad_sync, orig_finalize = disable_dp_sync(self.actor_module)
+
+        orig_finalize_func = None
+        if not grad_baselining:
+            # Buffer-free path: suppress the finalize that forward_backward_batch
+            # triggers per trajectory — its TP/CP/PP partial-grad all-reduces must
+            # not re-run on an accumulating buffer. It runs once per mini-batch in
+            # _optimizer_step_with_buffer instead.
+            orig_finalize_func = disable_grad_finalize(self.actor_module)
 
         local_traj_records = []
         for minibatch_idx, minibatch in enumerate(dataloader):
@@ -1037,7 +1070,6 @@ class MegatronPPOActor(BasePPOActor):
             if rollout_corr_cfg is None:
                 rollout_corr_cfg = self.config.policy_loss.get("rollout_correction", {})
             rollout_is_threshold = rollout_corr_cfg.get("rollout_is_threshold", None)
-            minibatch_size = len(minibatch)
             microbatch_loss_scale = 1 / len(minibatch)
 
             # minibatch_idx counts across epochs; epoch_idx is stamped by make_minibatch_iterator.
@@ -1050,8 +1082,8 @@ class MegatronPPOActor(BasePPOActor):
             if grad_baselining:
                 minibatch = compute_grad_info(minibatch, scope=self.config.grad_baselining.scope)
 
-            zero_grad_accum_buffers(accum_buffers)
             if grad_baselining:
+                zero_grad_accum_buffers(accum_buffers)
                 zero_grad_accum_buffers(score_gradient_buffers)
 
             # Emulate Megatron schedule's loss scaling by num_microbatches=len(minibatch)
@@ -1069,9 +1101,15 @@ class MegatronPPOActor(BasePPOActor):
                 adv_scalar = traj_record.advantage_scalar
                 # Use raw score gradients g_i <- w_i * grad(log pi) for per-traj accumulation.
                 microbatch.batch["advantages"] = torch.ones_like(microbatch.batch["advantages"])
+                if not grad_baselining:
+                    # Buffer-free path: fold the advantage into the loss scale —
+                    # backward is linear in it, so the accumulated main-buffer
+                    # gradient equals the former `accum += adv_i * g_i` exactly,
+                    # regardless of the loss shape.
+                    microbatch.meta_info["loss_multiplier"] = microbatch_loss_scale * adv_scalar
 
                 with ExitStack() as stack:
-                    if dp_world_size > 1:
+                    if dp_world_size > 1 or not grad_baselining:
                         for model_chunk in self.actor_module:
                             stack.enter_context(model_chunk.no_sync())
                     metric_micro_batch = self.forward_backward_batch(
@@ -1098,38 +1136,37 @@ class MegatronPPOActor(BasePPOActor):
                             rollout_is_threshold,
                         )
 
-                # Compute gradient norm statistics.
-                unscaled_grad_norm, grad_norm = self._compute_grad_norms(
-                    response_len, self.config.loss_agg_mode, adv_scalar, microbatch_loss_scale=microbatch_loss_scale
-                )
-
-                traj_record = local_traj_records[traj_uid]
-                traj_record.grad_norm = grad_norm
-                traj_record.grad_norm_unscaled = unscaled_grad_norm
-
-                last_traj_in_scope = microbatch_idx == minibatch_size - 1
-                reward_std = 0.0
                 if grad_baselining:
+                    # Compute gradient norm statistics (requires the trajectory's
+                    # gradient isolated in the main buffer).
+                    unscaled_grad_norm, grad_norm = self._compute_grad_norms(
+                        response_len, self.config.loss_agg_mode, adv_scalar, microbatch_loss_scale=microbatch_loss_scale
+                    )
+
+                    traj_record = local_traj_records[traj_uid]
+                    traj_record.grad_norm = grad_norm
+                    traj_record.grad_norm_unscaled = unscaled_grad_norm
+
                     last_traj_in_scope = minibatch.meta_info["is_last_traj_in_scope"][traj_uid]
                     reward_std = minibatch.meta_info["reward_std_by_traj_uid"][traj_uid]
 
-                self._update_grad_buffers(
-                    accum_buffers=accum_buffers,
-                    score_gradient_buffers=score_gradient_buffers,
-                    local_traj_records=local_traj_records,
-                    reward_scalar=reward_scalar,
-                    reward_std=reward_std,
-                    adv_scalar=adv_scalar,
-                    group_uid=group_uid,
-                    microbatch_loss_scale=microbatch_loss_scale,
-                    norm_by_std=self.config.grad_baselining.norm_by_std,
-                    is_last_traj_in_scope=last_traj_in_scope,
-                    grad_baselining=grad_baselining,
-                )
+                    self._update_grad_buffers(
+                        accum_buffers=accum_buffers,
+                        score_gradient_buffers=score_gradient_buffers,
+                        local_traj_records=local_traj_records,
+                        reward_scalar=reward_scalar,
+                        reward_std=reward_std,
+                        adv_scalar=adv_scalar,
+                        group_uid=group_uid,
+                        microbatch_loss_scale=microbatch_loss_scale,
+                        norm_by_std=self.config.grad_baselining.norm_by_std,
+                        is_last_traj_in_scope=last_traj_in_scope,
+                        grad_baselining=grad_baselining,
+                    )
 
-                self.actor_optimizer.zero_grad()
-                for chunk in self.actor_module:
-                    chunk.zero_grad_buffer()
+                    self.actor_optimizer.zero_grad()
+                    for chunk in self.actor_module:
+                        chunk.zero_grad_buffer()
 
             # Minibatch updates with accumulation buffers.
             update_successful, minibatch_metrics = self._optimizer_step_with_buffer(
@@ -1158,6 +1195,8 @@ class MegatronPPOActor(BasePPOActor):
 
         metrics["actor/local_traj_records"] = [asdict(rec) for rec in local_traj_records]
 
+        if not grad_baselining:
+            restore_grad_finalize(self.actor_module, orig_finalize_func)
         if dp_world_size > 1:
             restore_dp_sync(self.actor_module, orig_no_sync, orig_grad_sync, orig_finalize)
 
