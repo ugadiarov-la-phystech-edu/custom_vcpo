@@ -22,8 +22,6 @@ Note that our model doesn't have to be `MegatronModule` because we don't share e
 import itertools
 import logging
 import os
-from contextlib import ExitStack
-from dataclasses import asdict
 from functools import partial
 from typing import Iterable
 
@@ -34,19 +32,10 @@ from megatron.core.distributed import finalize_model_grads
 
 # from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer import DistributedOptimizer
-from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from omegaconf import OmegaConf
 from torch import nn
 
-from recipe.fully_async_policy.staleness_utils import (
-    TrajRecord,
-    compute_ess_info,
-    compute_grad_info,
-    compute_is_info,
-    compute_opob_baseline,
-    compute_staleness_statistics,
-)
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
@@ -60,53 +49,8 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
 from verl.workers.actor.entropy_utils import log_entropy_and_apply_to_loss, should_calculate_entropy
-from verl.workers.utils.vcpo import (
-    _get_local_model_grads_for_norm,
-    accumulate_grad_buffers,
-    allocate_grad_accum_buffers,
-    copy_accum_buffers_to_grad_buffers,
-    disable_dp_sync,
-    disable_grad_finalize,
-    finalize_model_grads_ignore_dp,
-    move_grad_buffers,
-    restore_dp_sync,
-    restore_grad_finalize,
-    zero_grad_accum_buffers,
-)
 
-__all__ = ["MegatronPPOActor", "compute_ess_lr_scale", "resolve_ess_base"]
-
-
-def resolve_ess_base(config_base, override):
-    """Resolve the ESS-scaling reference ratio.
-
-    An explicit config value wins; base_ess_ratio=None (auto-calibration)
-    resolves to the driver-provided override — the first update's measured
-    on-policy ESS ratio, passed back via meta_info["ess_base_override"].
-    Returns None while neither is available (scaling is then a no-op)."""
-    return config_base if config_base is not None else override
-
-
-def compute_ess_lr_scale(ess_ratio: float, base_ess_ratio: float, trigger_ratio: float | None = None) -> float:
-    """LR multiplier of the ESS brake (before the sqrt/linear rule).
-
-    Legacy (trigger_ratio=None): min(1, ess_ratio / base) — attenuate whenever
-    the measured ESS falls below the reference. With ess_scaling.trigger_ratio
-    set, scaling engages only when ess_ratio / base < trigger_ratio; at or
-    above the threshold the mini-batch runs at full nominal lr (multiplier 1),
-    so the multiplier jumps discontinuously at the threshold."""
-    ratio = float(ess_ratio) / max(float(base_ess_ratio), 1e-8)
-    if trigger_ratio is not None and ratio >= float(trigger_ratio):
-        return 1.0
-    return min(1.0, ratio)
-
-
-def _resolve_loss_multiplier(meta_info) -> float:
-    """None/missing → 1.0; an explicit 0.0 is honored (a `x or 1.0` parse would
-    silently turn zero-advantage trajectories into full-weight score gradients)."""
-    value = meta_info.get("loss_multiplier", None)
-    return 1.0 if value is None else float(value)
-
+__all__ = ["MegatronPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -648,9 +592,6 @@ class MegatronPPOActor(BasePPOActor):
             append_to_dict(metrics, stats)
             if forward_only:
                 return policy_loss, [metrics, ret_entropy, None, None]
-            loss_multiplier = _resolve_loss_multiplier(meta_info)
-            if loss_multiplier != 1.0:
-                policy_loss = policy_loss * loss_multiplier
             return policy_loss, [metrics, ret_entropy, rollout_log_prob, old_log_prob]
 
         def forward_step(batch_iter, model, return_schedule_plan: bool = False):
@@ -760,7 +701,6 @@ class MegatronPPOActor(BasePPOActor):
                 meta_info = {
                     "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
                     "rollout_corr_config": rollout_corr_cfg,
-                    "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
                 }
             else:
                 clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
@@ -770,7 +710,6 @@ class MegatronPPOActor(BasePPOActor):
                     "clip_ratio_c": clip_ratio_c,
                     "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
                     "rollout_corr_config": rollout_corr_cfg,
-                    "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
                 }
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
@@ -810,399 +749,6 @@ class MegatronPPOActor(BasePPOActor):
         if use_dynamic_bsz:
             losses_reduced["indices"] = indices
         return losses_reduced
-
-    def get_lr(self) -> list[float] | None:
-        """Return current actor optimizer lrs (one per param group), or None if no optimizer is attached."""
-        param_groups = getattr(self.actor_optimizer, "param_groups", None)
-        if not param_groups:
-            return None
-        return [float(pg.get("lr", 0.0)) for pg in param_groups]
-
-    def _compute_grad_norms(
-        self,
-        response_len: int,
-        loss_agg_mode: str,
-        adv_scalar: float,
-        *,
-        microbatch_loss_scale: float = 1.0,
-    ) -> tuple[float, float]:
-        """
-        Returns unscaled_grad_norm (not normalized by length), grad_norm.
-        """
-        loss_scale = 1.0
-        if hasattr(self.actor_optimizer, "get_loss_scale"):
-            loss_scale = float(self.actor_optimizer.get_loss_scale().item())
-        found_inf_flag = self.actor_optimizer.prepare_grads()
-
-        if found_inf_flag:
-            unscaled_grad_norm = grad_norm = float("inf")
-        else:
-            # Use full local grads before any DP sharding to keep per-replica norms.
-            grads = _get_local_model_grads_for_norm(self.actor_module)
-            unscaled_grad_norm = get_grad_norm_fp32(
-                grads, grad_stats_parallel_group=mpu.get_tensor_model_parallel_group()
-            )
-            if loss_agg_mode in ["seq-mean-token-mean"]:
-                unscaled_grad_norm *= response_len
-
-            if loss_scale not in (0.0, 1.0):
-                unscaled_grad_norm = unscaled_grad_norm / loss_scale
-
-            # [NOTE] Loss in backward pass already scaled by 1 / minibatch_size
-            unscaled_grad_norm = unscaled_grad_norm / microbatch_loss_scale
-            grad_norm = unscaled_grad_norm * abs(adv_scalar)
-
-        return unscaled_grad_norm, grad_norm
-
-    def _update_grad_buffers(
-        self,
-        accum_buffers: list[torch.Tensor],
-        score_gradient_buffers: list[torch.Tensor] | None,
-        local_traj_records: list[TrajRecord],
-        reward_scalar: float,
-        reward_std: float,
-        adv_scalar: float,
-        group_uid: int,
-        microbatch_loss_scale: float,
-        norm_by_std: bool = False,
-        is_last_traj_in_scope: bool = False,
-        grad_baselining: bool = False,
-    ):
-        """Gradient buffer update."""
-        if grad_baselining:
-            assert score_gradient_buffers is not None
-            scale_reward = reward_scalar
-            scale_baseline = 1
-            if self.config.grad_baselining.scope == "group":
-                if norm_by_std and reward_std is not None and reward_std > 1e-8:
-                    scale_reward = reward_scalar / reward_std
-                    scale_baseline = 1.0 / reward_std
-            else:
-                scale_reward = adv_scalar
-                scale_baseline = 1
-
-            accumulate_grad_buffers(self.actor_module, accum_buffers, scale=scale_reward)
-            accumulate_grad_buffers(self.actor_module, score_gradient_buffers, scale=scale_baseline)
-        else:
-            accumulate_grad_buffers(self.actor_module, accum_buffers, scale=adv_scalar)
-
-        if grad_baselining and is_last_traj_in_scope:
-            assert score_gradient_buffers is not None
-            # Compute grad-norm-weighted reward baseline (group/minibatch scope).
-            opob_baseline = compute_opob_baseline(
-                local_traj_records,
-                group_uid,
-                use_is_weights=self.config.grad_baselining.use_is_weights,
-                use_clipped_is_ratios=self.config.grad_baselining.use_clipped_is_ratios,
-                normalize_by_length=self.config.grad_baselining.normalize_by_length,
-                agg_mode=self.config.grad_baselining.agg_mode,
-                scope=self.config.grad_baselining.scope,
-            )
-
-            move_grad_buffers(src=score_gradient_buffers, dest=accum_buffers, scale=-opob_baseline)
-            zero_grad_accum_buffers(score_gradient_buffers)
-
-    def _optimizer_step_with_buffer(
-        self,
-        accum_buffers,
-        local_traj_records: list[TrajRecord],
-        rollout_is_threshold: float | None,
-        minibatch_idx: int = 0,
-        do_grad_sync: bool = True,
-        ess_base_override: float | None = None,
-    ) -> tuple[bool, dict]:
-        staleness_metrics = compute_ess_info(local_traj_records, rollout_is_threshold)
-        minibatch_ess = staleness_metrics.get("ess")
-        ess_ratio = staleness_metrics.get("ess_ratio")
-        minibatch_ess_clipped = staleness_metrics["ess_clipped"]
-        ess_ratio_clipped = staleness_metrics["ess_ratio_clipped"]
-
-        ess_ratio_for_scaling = ess_ratio_clipped if self.config.ess_scaling.use_clipped else ess_ratio
-        if ess_ratio_for_scaling is None:
-            ess_ratio_for_scaling = 0.0
-        lrs_now = self.get_lr()
-        lr = lrs_now[0] if lrs_now else None
-
-        # ================ Optimizer Step ================
-        if accum_buffers is not None:
-            copy_accum_buffers_to_grad_buffers(self.actor_module, accum_buffers)
-        else:
-            # Buffer-free path (no OPOB): gradients accumulated directly in the
-            # main grad buffer with the schedule-level finalize suppressed; run
-            # the TP/CP/PP partial-grad reductions exactly once here, on the
-            # fully accumulated gradient. DP sync follows below as usual.
-            finalize_model_grads_ignore_dp(self.actor_module)
-
-        # ===== Optional finalize with DDP sync of gradients =====
-        #
-        # `forward_backward_batch()` already calls `config.finalize_model_grads_func`, which
-        # performs DP×CP gradient synchronization via `finish_grad_sync()`. If we did NOT
-        # disable that finalize path, then calling `finish_grad_sync()` again here is redundant.
-        #
-        # Only run this sync when we intentionally disabled Megatron's DP×CP sync during
-        # backward (DP>1 in the per-traj path).
-        if do_grad_sync:
-            for chunk in self.actor_module:
-                if chunk.ddp_config.overlap_grad_reduce:
-                    chunk.start_grad_sync()
-            for chunk in self.actor_module:
-                if chunk.ddp_config.overlap_grad_reduce:
-                    chunk.finish_grad_sync()
-                else:
-                    # finish_grad_sync will call start_grad_sync internally for non-overlap
-                    chunk.finish_grad_sync()
-
-        base_lrs = self.get_lr()
-        ess_base = resolve_ess_base(self.config.ess_scaling.get("base_ess_ratio", None), ess_base_override)
-        if self.config.ess_scaling.enable and base_lrs is not None and ess_base is not None:
-            lr_scale = compute_ess_lr_scale(
-                float(ess_ratio_for_scaling),
-                float(ess_base),
-                self.config.ess_scaling.get("trigger_ratio", None),
-            )
-            scaling_rule = self.config.ess_scaling.scaling_rule
-            for pg, base_lr in zip(self.actor_optimizer.param_groups, base_lrs, strict=True):
-                if scaling_rule == "sqrt":
-                    pg["lr"] = float(base_lr) * (lr_scale**0.5)
-                elif scaling_rule == "linear":
-                    pg["lr"] = float(base_lr) * lr_scale
-                else:
-                    raise NotImplementedError(f"{scaling_rule} not implemented for ESS scaling")
-
-            lrs_now = self.get_lr()
-            lr = lrs_now[0] if lrs_now else None
-
-        update_successful, minibatch_grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
-
-        if self.config.ess_scaling.enable and base_lrs is not None:
-            for pg, base_lr in zip(self.actor_optimizer.param_groups, base_lrs, strict=True):
-                pg["lr"] = base_lr
-
-        minibatch_metrics = {
-            "actor/grad_norm": minibatch_grad_norm,
-            "staleness/ess": [
-                {
-                    "minibatch_idx": minibatch_idx,
-                    "minibatch_ess": minibatch_ess,
-                    "minibatch_ess_clipped": minibatch_ess_clipped,
-                    "minibatch_ess_ratio": ess_ratio,
-                    "minibatch_ess_ratio_clipped": ess_ratio_clipped,
-                    "ess_scaled_lr": lr,
-                    # The reference actually used for scaling this step (config
-                    # value or driver override) — the source of truth when the
-                    # base evolves during training; None while unresolved.
-                    "base_ess_ratio": float(ess_base) if ess_base is not None else None,
-                }
-            ],
-        }
-
-        return update_successful, minibatch_metrics
-
-    @GPUMemoryLogger(role="megatron actor", logger=logger)
-    def update_policy_per_traj(self, dataloader: Iterable[DataProto], grad_baselining: bool = False) -> dict:
-        """Update the policy with per-trajectory gradient norm capture.
-
-        Args:
-            dataloader (Iterable[DataProto]): an iterator over the DataProto that returns by ``make_minibatch_iterator``
-                The keys of each data batch is described in the make_minibatch_iterator.
-
-        Returns:
-            Dict: a dictionary containing the statistics. Note that the statistics are only valid in the last pp stage
-            and users have to combine the output in each dp rank manually.
-
-            "actor/local_traj_records": list[dict]
-            "staleness/ess": list[dict]
-        """
-        metrics = {}
-
-        # Gradient buffers are only needed for OPOB (grad_baselining): each
-        # trajectory's gradient must be isolated in the main buffer to measure
-        # ||g_i|| and re-weighted against the score accumulator. Without OPOB
-        # the advantage is folded into the per-microbatch loss scale and
-        # gradients accumulate directly in Megatron's main grad buffer,
-        # saving a full grad-buffer copy of peak memory.
-        accum_buffers = None
-        score_gradient_buffers = None
-        if grad_baselining:
-            assert self.config.loss_agg_mode in [
-                "seq-mean-token-mean",
-                "seq-mean-token-sum",
-                "seq-mean-token-sum-norm",
-            ]
-            accum_buffers = allocate_grad_accum_buffers(self.actor_module)
-            score_gradient_buffers = allocate_grad_accum_buffers(self.actor_module)
-
-        # [NOTE]: Megatron's DDP grad sync is over the DP×CP domain if using distributed optimizer.
-        with_context_parallel = self.use_distributed_opt
-        dp_world_size = mpu.get_data_parallel_group(with_context_parallel=with_context_parallel).size()
-        if dp_world_size > 1:
-            orig_no_sync, orig_grad_sync, orig_finalize = disable_dp_sync(self.actor_module)
-
-        orig_finalize_func = None
-        if not grad_baselining:
-            # Buffer-free path: suppress the finalize that forward_backward_batch
-            # triggers per trajectory — its TP/CP/PP partial-grad all-reduces must
-            # not re-run on an accumulating buffer. It runs once per mini-batch in
-            # _optimizer_step_with_buffer instead.
-            orig_finalize_func = disable_grad_finalize(self.actor_module)
-
-        local_traj_records = []
-        for minibatch_idx, minibatch in enumerate(dataloader):
-            self.actor_optimizer.zero_grad()
-            for chunk in self.actor_module:
-                chunk.zero_grad_buffer()
-
-            calculate_entropy = should_calculate_entropy(self.config)
-            if minibatch.meta_info.get("micro_batch_size", None) is not None:
-                micro_batch_size = minibatch.meta_info["micro_batch_size"]
-            else:
-                micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
-            skip_recompute_old_log_prob = bool(minibatch.meta_info.get("skip_recompute_old_log_prob", False))
-            skip_recompute_old_log_prob = skip_recompute_old_log_prob or bool(
-                minibatch.meta_info.get("calculate_rollout_policy_is", False)
-            )
-
-            assert (self.config.use_dynamic_bsz is False) and micro_batch_size == 1, (
-                "Must use micro batch size 1 for accurate gradient norm statistics per trajectory"
-            )
-
-            rollout_corr_cfg = minibatch.meta_info.get("rollout_corr_config", None)
-            if rollout_corr_cfg is None:
-                rollout_corr_cfg = self.config.policy_loss.get("rollout_correction", {})
-            rollout_is_threshold = rollout_corr_cfg.get("rollout_is_threshold", None)
-            microbatch_loss_scale = 1 / len(minibatch)
-
-            # minibatch_idx counts across epochs; epoch_idx is stamped by make_minibatch_iterator.
-            epoch_idx = int(minibatch.meta_info.get("epoch_idx", 0))
-            local_traj_records, _ = compute_staleness_statistics(
-                minibatch, minibatch_idx, rollout_is_threshold, not skip_recompute_old_log_prob,
-                epoch_idx=epoch_idx,
-            )
-
-            if grad_baselining:
-                minibatch = compute_grad_info(minibatch, scope=self.config.grad_baselining.scope)
-
-            if grad_baselining:
-                zero_grad_accum_buffers(accum_buffers)
-                zero_grad_accum_buffers(score_gradient_buffers)
-
-            # Emulate Megatron schedule's loss scaling by num_microbatches=len(minibatch)
-            # Scaling loss instead of gradients avoids extra numeric/rounding differences
-            minibatch.meta_info["loss_multiplier"] = microbatch_loss_scale
-
-            # Per-trajectory updates and gradient statistics.
-            for microbatch_idx, microbatch in enumerate(minibatch.split(1)):
-                response_mask = microbatch.batch["response_mask"]
-                response_len = int(response_mask.sum().item())
-                group_uid = microbatch.non_tensor_batch["uid"][0]
-                traj_uid = microbatch.non_tensor_batch["traj_uid"][0]
-                traj_record = local_traj_records[traj_uid]
-                reward_scalar = traj_record.reward_scalar
-                adv_scalar = traj_record.advantage_scalar
-                # Use raw score gradients g_i <- w_i * grad(log pi) for per-traj accumulation.
-                microbatch.batch["advantages"] = torch.ones_like(microbatch.batch["advantages"])
-                if not grad_baselining:
-                    # Buffer-free path: fold the advantage into the loss scale —
-                    # backward is linear in it, so the accumulated main-buffer
-                    # gradient equals the former `accum += adv_i * g_i` exactly,
-                    # regardless of the loss shape.
-                    microbatch.meta_info["loss_multiplier"] = microbatch_loss_scale * adv_scalar
-
-                with ExitStack() as stack:
-                    if dp_world_size > 1 or not grad_baselining:
-                        for model_chunk in self.actor_module:
-                            stack.enter_context(model_chunk.no_sync())
-                    metric_micro_batch = self.forward_backward_batch(
-                        microbatch,
-                        calculate_entropy=calculate_entropy,
-                        use_dynamic_bsz=False,
-                        micro_batch_size=1,
-                        max_token_len=None,
-                        mini_batch_size=self.config.ppo_mini_batch_size,
-                    )
-
-                metric_micro_batch = metric_micro_batch["output"]
-                for metric in metric_micro_batch:
-                    # o[0] metrics, o[1] entropy, o[2] rollout_log_probs, o[3] old_log_probs/policy_log_probs
-                    append_to_dict(metrics, metric[0])
-                    if skip_recompute_old_log_prob:
-                        rollout_log_probs = metric[2]
-                        policy_log_probs = metric[3]
-                        traj_record = compute_is_info(
-                            traj_record,
-                            rollout_log_probs,
-                            policy_log_probs,
-                            response_mask,
-                            rollout_is_threshold,
-                        )
-
-                if grad_baselining:
-                    # Compute gradient norm statistics (requires the trajectory's
-                    # gradient isolated in the main buffer).
-                    unscaled_grad_norm, grad_norm = self._compute_grad_norms(
-                        response_len, self.config.loss_agg_mode, adv_scalar, microbatch_loss_scale=microbatch_loss_scale
-                    )
-
-                    traj_record = local_traj_records[traj_uid]
-                    traj_record.grad_norm = grad_norm
-                    traj_record.grad_norm_unscaled = unscaled_grad_norm
-
-                    last_traj_in_scope = minibatch.meta_info["is_last_traj_in_scope"][traj_uid]
-                    reward_std = minibatch.meta_info["reward_std_by_traj_uid"][traj_uid]
-
-                    self._update_grad_buffers(
-                        accum_buffers=accum_buffers,
-                        score_gradient_buffers=score_gradient_buffers,
-                        local_traj_records=local_traj_records,
-                        reward_scalar=reward_scalar,
-                        reward_std=reward_std,
-                        adv_scalar=adv_scalar,
-                        group_uid=group_uid,
-                        microbatch_loss_scale=microbatch_loss_scale,
-                        norm_by_std=self.config.grad_baselining.norm_by_std,
-                        is_last_traj_in_scope=last_traj_in_scope,
-                        grad_baselining=grad_baselining,
-                    )
-
-                    self.actor_optimizer.zero_grad()
-                    for chunk in self.actor_module:
-                        chunk.zero_grad_buffer()
-
-            # Minibatch updates with accumulation buffers.
-            update_successful, minibatch_metrics = self._optimizer_step_with_buffer(
-                accum_buffers,
-                local_traj_records,
-                rollout_is_threshold,
-                minibatch_idx,
-                do_grad_sync=(dp_world_size > 1),
-                ess_base_override=minibatch.meta_info.get("ess_base_override", None),
-            )
-
-            if not update_successful:
-                raise NotImplementedError
-
-            minibatch_metrics["actor/minibatch_grad_info"] = [
-                {
-                    "epoch_idx": epoch_idx,
-                    "minibatch_idx": minibatch_idx,
-                    "grad_norm": minibatch_metrics["actor/grad_norm"],
-                    "trainer_global_step": minibatch.meta_info.get("trainer_global_step", -1),
-                    "trainer_local_step": minibatch.meta_info.get("trainer_local_step", -1),
-                }
-            ]
-
-            append_to_dict(metrics, minibatch_metrics)
-
-        metrics["actor/local_traj_records"] = [asdict(rec) for rec in local_traj_records]
-
-        if not grad_baselining:
-            restore_grad_finalize(self.actor_module, orig_finalize_func)
-        if dp_world_size > 1:
-            restore_dp_sync(self.actor_module, orig_no_sync, orig_grad_sync, orig_finalize)
-
-        self.actor_optimizer.zero_grad()
-        get_torch_device().empty_cache()
-        return metrics
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def update_policy(self, dataloader: Iterable[DataProto]) -> dict:

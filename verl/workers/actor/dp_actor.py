@@ -39,6 +39,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from verl.workers.utils.ess import compute_ess_lr_scale, resolve_ess_base
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -306,6 +307,128 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.step()
         return grad_norm
 
+    def _seq_adv_post_scale_loss(
+        self,
+        policy_loss_fn,
+        old_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+        orig_response_mask: torch.Tensor,
+        loss_agg_mode: str,
+        rollout_is_weights: torch.Tensor | None,
+    ):
+        """Sequence-level score-loss parity with the Megatron per-traj path.
+
+        The clipped policy loss is computed per sequence with UNIT advantages
+        (clip/IS branch selection as if the advantage were positive), then each
+        sequence's loss is scaled by its constant advantage — exactly the
+        `accum += adv_i * g_i` semantics of the VCPO per-trajectory path. The
+        micro-batch loss is the sequence mean of the scaled per-sequence
+        losses, matching the per-traj 1/len(minibatch) weighting under the
+        standard loss_scale_factor.
+
+        The advantage scalar is recovered as the masked mean over the ORIGINAL
+        response mask (the trainer broadcasts a per-sequence constant), while
+        the loss itself uses the possibly veto-modified mask like the standard
+        path."""
+        mask_f = orig_response_mask.to(advantages.dtype)
+        adv_scalars = (advantages * mask_f).sum(-1) / mask_f.sum(-1).clamp_min(1.0)  # (bsz,)
+
+        unit_advantages = torch.ones_like(advantages)
+        seq_losses = []
+        seq_metrics: list[dict] = []
+        for i in range(advantages.shape[0]):
+            pg_loss_i, pg_metrics_i = policy_loss_fn(
+                old_log_prob=old_log_prob[i : i + 1],
+                log_prob=log_prob[i : i + 1],
+                advantages=unit_advantages[i : i + 1],
+                response_mask=response_mask[i : i + 1],
+                loss_agg_mode=loss_agg_mode,
+                config=self.config,
+                rollout_is_weights=None if rollout_is_weights is None else rollout_is_weights[i : i + 1],
+            )
+            seq_losses.append(adv_scalars[i] * pg_loss_i)
+            seq_metrics.append(pg_metrics_i)
+
+        pg_loss = torch.stack(seq_losses).mean()
+
+        pg_metrics: dict = {}
+        for key in seq_metrics[0].keys() if seq_metrics else []:
+            values = []
+            for m in seq_metrics:
+                v = m.get(key)
+                if v is None:
+                    continue
+                values.append(float(v.item() if torch.is_tensor(v) else v))
+            if values:
+                pg_metrics[key] = sum(values) / len(values)
+        return pg_loss, pg_metrics
+
+    def _ess_scaled_optimizer_step(
+        self,
+        minibatch_idx: int,
+        seq_is: list[float],
+        seq_is_clipped: list[float],
+        ess_base_override: float | None,
+    ):
+        """ESS-braked optimizer step (VCPO), mirroring the Megatron
+        _optimizer_step_with_buffer contract: compute the mini-batch ESS ratio
+        globally over the DP group from the collected per-sequence IS ratios,
+        scale the LR by the sqrt/linear rule when the trigger engages, step,
+        restore the nominal LR, and return the structured staleness/ess entry
+        the fully-async trainer consumes (_capture_ess_base, replay metrics)."""
+        from recipe.fully_async_policy.staleness_utils import compute_global_ess_ratio
+
+        ess_cfg = self.config.ess_scaling
+        ess, ess_ratio, *_ = compute_global_ess_ratio(
+            sum(seq_is), sum(w * w for w in seq_is), len(seq_is)
+        )
+        ess_clipped, ess_ratio_clipped, *_ = compute_global_ess_ratio(
+            sum(seq_is_clipped), sum(w * w for w in seq_is_clipped), len(seq_is_clipped)
+        )
+        ess_ratio_for_scaling = ess_ratio_clipped if ess_cfg.use_clipped else ess_ratio
+
+        ess_base = resolve_ess_base(ess_cfg.get("base_ess_ratio", None), ess_base_override)
+        param_groups = self.actor_optimizer.param_groups
+        base_lrs = [float(pg["lr"]) for pg in param_groups]
+        scaled = False
+        if ess_base is not None and param_groups:
+            lr_scale = compute_ess_lr_scale(
+                float(ess_ratio_for_scaling), float(ess_base), ess_cfg.get("trigger_ratio", None)
+            )
+            scaling_rule = ess_cfg.scaling_rule
+            if scaling_rule == "sqrt":
+                lr_mult = lr_scale**0.5
+            elif scaling_rule == "linear":
+                lr_mult = lr_scale
+            else:
+                raise NotImplementedError(f"{scaling_rule} not implemented for ESS scaling")
+            for pg, base_lr in zip(param_groups, base_lrs, strict=True):
+                pg["lr"] = base_lr * lr_mult
+            scaled = True
+        lr = float(param_groups[0]["lr"]) if param_groups else None
+
+        try:
+            grad_norm = self._optimizer_step()
+        finally:
+            if scaled:
+                for pg, base_lr in zip(param_groups, base_lrs, strict=True):
+                    pg["lr"] = base_lr
+
+        entry = {
+            "minibatch_idx": minibatch_idx,
+            "minibatch_ess": ess,
+            "minibatch_ess_clipped": ess_clipped,
+            "minibatch_ess_ratio": ess_ratio,
+            "minibatch_ess_ratio_clipped": ess_ratio_clipped,
+            "ess_scaled_lr": lr,
+            # The reference actually used for scaling this step (config value or
+            # driver override); None while unresolved (scaling is a no-op then).
+            "base_ess_ratio": float(ess_base) if ess_base is not None else None,
+        }
+        return grad_norm, entry
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -393,6 +516,30 @@ class DataParallelPPOActor(BasePPOActor):
             if "rollout_log_probs" not in data.batch.keys():
                 raise ValueError("skip_recompute_old_log_prob=True requires rollout_log_probs in batch")
 
+        # ESS-guided LR scaling (VCPO), ported from megatron_actor's per-traj
+        # path: per-sequence IS ratios vs the behavior (rollout) policy are
+        # collected across the mini-batch and the optimizer step's LR is scaled
+        # by the sqrt/linear rule when the ESS ratio falls below the reference.
+        ess_enabled = getattr(self.config, "ess_scaling", None) is not None and self.config.ess_scaling.enable
+        ess_base_override = data.meta_info.get("ess_base_override", None)
+        rollout_is_threshold = None
+        if ess_enabled:
+            if "rollout_log_probs" not in data.batch.keys():
+                raise ValueError("ess_scaling.enable=True requires rollout_log_probs in batch")
+            corr_cfg = rollout_corr_config
+            if corr_cfg is None:
+                corr_cfg = self.config.policy_loss.get("rollout_correction", None)
+            if corr_cfg is not None:
+                rollout_is_threshold = corr_cfg.get("rollout_is_threshold", None)
+
+        seq_adv_post_scale = bool(getattr(self.config, "seq_adv_post_scale", False))
+        if seq_adv_post_scale and (self.config.entropy_coeff != 0 or self.config.use_kl_loss):
+            raise NotImplementedError(
+                "seq_adv_post_scale supports pure policy-gradient losses only "
+                "(entropy_coeff=0, use_kl_loss=False): the per-traj semantics scale the whole "
+                "per-sequence loss by the advantage, which would also scale these terms."
+            )
+
         select_keys = [
             "responses",
             "response_mask",
@@ -426,6 +573,7 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        minibatch_counter = 0  # counts across epochs, like the per-traj minibatch_idx
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -438,6 +586,9 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+
+                minibatch_seq_is: list[float] = []
+                minibatch_seq_is_clipped: list[float] = []
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -507,6 +658,25 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
+                    if ess_enabled:
+                        # Per-sequence IS ratios vs the behavior policy, anchored on
+                        # this update's own forward (same anchor compute_is_info uses
+                        # on the Megatron path). Computed on the ORIGINAL response
+                        # mask — the veto-modified mask applies to the loss only.
+                        with torch.no_grad():
+                            # fp32 throughout: a bf16 running sum over thousands of
+                            # tokens loses the per-token increments entirely once the
+                            # partial sum grows, distorting exactly what the brake sees.
+                            is_mask = model_inputs["response_mask"].to(torch.float32)
+                            log_ratio = log_prob.detach().float() - model_inputs["rollout_log_probs"].float()
+                            seq_log_ratio = (log_ratio * is_mask).sum(-1)
+                            for seq_is in torch.exp(seq_log_ratio).tolist():
+                                minibatch_seq_is.append(float(seq_is))
+                                if rollout_is_threshold is not None and float(rollout_is_threshold) > 0:
+                                    minibatch_seq_is_clipped.append(min(float(seq_is), float(rollout_is_threshold)))
+                                else:
+                                    minibatch_seq_is_clipped.append(float(seq_is))
+
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
@@ -519,15 +689,27 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    if seq_adv_post_scale:
+                        pg_loss, pg_metrics = self._seq_adv_post_scale_loss(
+                            policy_loss_fn,
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            orig_response_mask=model_inputs["response_mask"],
+                            loss_agg_mode=loss_agg_mode,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                    else:
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
@@ -581,8 +763,18 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                if ess_enabled:
+                    grad_norm, ess_entry = self._ess_scaled_optimizer_step(
+                        minibatch_counter, minibatch_seq_is, minibatch_seq_is_clipped, ess_base_override
+                    )
+                    mini_batch_metrics = {
+                        "actor/grad_norm": grad_norm.detach().item(),
+                        "staleness/ess": [ess_entry],
+                    }
+                else:
+                    grad_norm = self._optimizer_step()
+                    mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                minibatch_counter += 1
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

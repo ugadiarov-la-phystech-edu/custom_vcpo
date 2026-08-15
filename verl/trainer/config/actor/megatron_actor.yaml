@@ -18,6 +18,3 @@ strategy: megatron
 data_loader_seed: 42
 
 load_weight: True
-
-# Enable per-trajectory Megatron actor update path
-update_policy_per_traj: false

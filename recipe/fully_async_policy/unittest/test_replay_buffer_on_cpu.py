@@ -585,7 +585,6 @@ def _minimal_trainer_config():
             "algorithm": {"rollout_correction": {"rollout_is": "token", "rollout_is_threshold": 2.0}},
             "actor_rollout_ref": {
                 "rollout": {"n": 2, "temperature": 1.0, "multi_turn": {"enable": False}},
-                "actor": {"grad_baselining": {"enable": False}, "update_policy_per_traj": False},
             },
         }
     )
@@ -641,27 +640,11 @@ def test_build_replay_batch_uses_frozen_statistics():
     assert len(meta["global_token_num"]) == 4
 
 
-def test_build_replay_batch_pins_dp_groups_for_opob():
-    trainer = _make_replay_trainer(mini_size=1, requires_mini_batches=1)
-    config = _minimal_trainer_config()
-    config.actor_rollout_ref.actor.grad_baselining.enable = True
-    config.actor_rollout_ref.actor.update_policy_per_traj = True
-    trainer.config = config
-    trainer.tokenizer = None
-    rs = _rollout_sample_with_batch(
-        "uid_a", rewards=[1.0, -1.0], advantages=[1.0, -1.0], response_mask_rows=[[1, 1, 0], [1, 1, 1]]
-    )
-    entries = [GroupEntry(sample=rs, group_version=3, is_new=True, score=1.0, insert_seq=0)]
-    batch = trainer._build_replay_batch(entries)
-    assert batch.meta_info["dp_group_key"] == "uid"
-    assert batch.meta_info["dp_group_size"] == 2
-
-
 # ---------------------------------------------------------------- auto base_ess_ratio
 
 
 def test_resolve_ess_base_explicit_config_wins():
-    from verl.workers.actor.megatron_actor import resolve_ess_base
+    from verl.workers.utils.ess import resolve_ess_base
 
     assert resolve_ess_base(0.8, 0.5) == 0.8
     assert resolve_ess_base(None, 0.5) == 0.5

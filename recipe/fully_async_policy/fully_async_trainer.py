@@ -209,8 +209,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             # and persisted in replay_buffer.pt across restarts.
             actor_cfg = config.actor_rollout_ref.actor
             self.replay_ess_auto_base = bool(
-                actor_cfg.get("update_policy_per_traj", False)
-                and actor_cfg.ess_scaling.get("enable", False)
+                actor_cfg.ess_scaling.get("enable", False)
                 and actor_cfg.ess_scaling.get("base_ess_ratio", None) is None
             )
             self.replay_ess_use_clipped = bool(actor_cfg.ess_scaling.get("use_clipped", False))
@@ -218,8 +217,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         else:
             actor_cfg = config.actor_rollout_ref.actor
             assert not (
-                actor_cfg.get("update_policy_per_traj", False)
-                and actor_cfg.ess_scaling.get("enable", False)
+                actor_cfg.ess_scaling.get("enable", False)
                 and actor_cfg.ess_scaling.get("base_ess_ratio", None) is None
             ), (
                 "ess_scaling.base_ess_ratio=null (auto-calibration from the first update) is only "
@@ -476,13 +474,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     self._collect_metrics_from_samples(batch, metrics)
                 batch.meta_info["rollout_corr_config"] = self.config.algorithm.get("rollout_correction", None)
                 batch.meta_info["n_resp_per_rollout"] = self.config.actor_rollout_ref.rollout.n
-                if (
-                    self.config.actor_rollout_ref.actor.grad_baselining.enable
-                    and self.config.actor_rollout_ref.actor.update_policy_per_traj
-                ):
-                    # Keep same rollout group on same DP rank when OPOB baselining is enabled.
-                    batch.meta_info["dp_group_key"] = "uid"
-                    batch.meta_info["dp_group_size"] = self.config.actor_rollout_ref.rollout.n
                 batch, reward_extra_infos_dict = self._process_batch_common(
                     batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None
                 )
@@ -643,13 +634,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         batch.meta_info["n_resp_per_rollout"] = self.config.actor_rollout_ref.rollout.n
         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-        if (
-            self.config.actor_rollout_ref.actor.grad_baselining.enable
-            and self.config.actor_rollout_ref.actor.update_policy_per_traj
-        ):
-            # Keep same rollout group on same DP rank when OPOB baselining is enabled.
-            batch.meta_info["dp_group_key"] = "uid"
-            batch.meta_info["dp_group_size"] = self.config.actor_rollout_ref.rollout.n
         if self.replay_ess_auto_base:
             # None until the first update's measurement is captured; the actor
             # skips LR scaling while the override is unresolved.

@@ -122,7 +122,7 @@ actor_rollout_ref:
           _target_: verl.utils.profiler.config.TorchMemoryToolConfig
           trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
           stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
-    update_policy_per_traj: false
+    seq_adv_post_scale: false
     ess_scaling:
       _target_: verl.workers.config.ESSScalingConfig
       enable: false
@@ -130,15 +130,6 @@ actor_rollout_ref:
       base_ess_ratio: null
       use_clipped: false
       trigger_ratio: null
-    grad_baselining:
-      _target_: verl.workers.config.GradBaselineConfig
-      enable: false
-      scope: group
-      agg_mode: mean
-      use_is_weights: true
-      use_clipped_is_ratios: false
-      normalize_by_length: false
-      norm_by_std: false
     data_loader_seed: 42
     load_weight: true
   ref:

@@ -240,17 +240,11 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
     Returns only scalar-safe payload unless current backends are console+wandb.
 
     Scalar Metrics
-        staleness/ess: 
-        staleness/ess_ratio:
-        staleness/seq_is_mean: Mean of seq is ratio
-        staleness/KL(rollout||policy): Number averaged across 
-        actor/ess_scaled_lr
-    
-    Images
-        staleness/rollout_vs_policy_probs: Histogram of the rollout log probs vs policy log probs 
-        staleness/staleness_histogram: Difference between rollout param versions and current param versions
-        actor/grad_norm_histogram: Histogram of unscaled grad norms:
-        actor/grad_norm_vs_response_len
+        staleness/base_ess_ratio, staleness/ess_ratio(_clipped), actor/ess_scaled_lr
+        replay/*_staleness_p50 (from the replay staleness histograms)
+
+    Images (wandb only)
+        replay/minibatch_staleness_hist, replay/buffer_staleness_hist
     """
     payload: dict[str, Any] = {}
     if not structured_metrics:
@@ -261,16 +255,6 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
     if "staleness/ess" in structured_metrics:
         ess_entries = [entry for entry in structured_metrics["staleness/ess"] if isinstance(entry, dict)]
 
-        minibatch_ess = [
-            float(info["minibatch_ess"])
-            for info in ess_entries
-            if "minibatch_ess" in info and info["minibatch_ess"] is not None
-        ]
-        minibatch_ess_clipped = [
-            float(info["minibatch_ess_clipped"])
-            for info in ess_entries
-            if "minibatch_ess_clipped" in info and info["minibatch_ess_clipped"] is not None
-        ]
         ess_ratio = [
             float(info["minibatch_ess_ratio"])
             for info in ess_entries
@@ -326,135 +310,6 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
             ax.set_ylabel("groups")
             payload[key] = wandb.Image(fig)
             plt.close(fig)
-
-    # 2) actor/minibatch_grad_info: list[dict]
-    # grad_info_entries = []
-    # if "actor/minibatch_grad_info" in self.structured_metrics:
-    #     grad_info_entries = [
-    #         entry for entry in self.structured_metrics["actor/minibatch_grad_info"] if isinstance(entry, dict)
-    #     ]
-    # if grad_info_entries:
-    #     grad_norms = [
-    #         float(info["grad_norm"])
-    #         for info in grad_info_entries
-    #         if "grad_norm" in info and info["grad_norm"] is not None
-    #     ]
-    #     if grad_norms:
-    #         payload["actor/minibatch_grad_norm/mean"] = float(np.mean(grad_norms))
-
-    # 3) actor/local_traj_records: list[TrajRecord]
-    traj_records = []
-    if "actor/local_traj_records" in structured_metrics:
-        traj_records = structured_metrics["actor/local_traj_records"]
-
-        response_lengths = []
-        grad_norm = []
-        grad_norm_unscaled = []
-        rollout_seq_is = []
-        rollout_seq_is_clipped = []
-        kl_rollout_old = []
-        staleness_gaps = []
-        scatter_response_lengths = []
-        scatter_grad_norm_unscaled = []
-
-        for rec in traj_records:
-            response_length_v = rec["response_length"] if "response_length" in rec else None
-            grad_norm_v = rec["grad_norm"] if "grad_norm" in rec else None
-            grad_norm_unscaled_v = rec["grad_norm_unscaled"] if "grad_norm_unscaled" in rec else None
-            rollout_seq_is_v = rec["rollout_seq_is"] if "rollout_seq_is" in rec else None
-            rollout_seq_is_clipped_v = rec["rollout_seq_is_clipped"] if "rollout_seq_is_clipped" in rec else None
-            kl_rollout_old_v = rec["kl_rollout_old"] if "kl_rollout_old" in rec else None
-            trainer_param_version_v = rec["trainer_param_version"] if "trainer_param_version" in rec else None
-            param_version_end_v = rec["param_version_end"] if "param_version_end" in rec else None
-
-            if response_length_v is not None:
-                response_lengths.append(float(response_length_v))
-            if grad_norm_v is not None:
-                grad_norm.append(float(grad_norm_v))
-            if grad_norm_unscaled_v is not None:
-                grad_norm_unscaled.append(float(grad_norm_unscaled_v))
-            if rollout_seq_is_v is not None:
-                rollout_seq_is.append(float(rollout_seq_is_v))
-            if rollout_seq_is_clipped_v is not None:
-                rollout_seq_is_clipped.append(float(rollout_seq_is_clipped_v))
-            if kl_rollout_old_v is not None:
-                kl_rollout_old.append(float(kl_rollout_old_v))
-
-            if trainer_param_version_v is not None and param_version_end_v is not None:
-                staleness_gaps.append(float(trainer_param_version_v) - float(param_version_end_v))
-
-            if response_length_v is not None and grad_norm_unscaled_v is not None:
-                scatter_response_lengths.append(float(response_length_v))
-                scatter_grad_norm_unscaled.append(float(grad_norm_unscaled_v))
-
-            if grad_norm_unscaled:
-                payload["actor/grad_norm_unscaled/mean"] = float(np.mean(grad_norm_unscaled))
-            if rollout_seq_is:
-                payload["staleness/rollout_seq_is/mean"] = float(np.mean(rollout_seq_is))
-            if rollout_seq_is_clipped:
-                payload["staleness/rollout_seq_is_clipped/mean"] = float(np.mean(rollout_seq_is_clipped))
-            if kl_rollout_old:
-                payload["staleness/kl_rollout_old"] = float(np.mean(kl_rollout_old))
-
-        if allow_media:
-            import matplotlib.pyplot as plt
-            import wandb
-
-            # Histogram of Gradient Norms
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.hist(grad_norm_unscaled, bins=80, alpha=0.8)
-            ax.set_title("Unscaled grad norm")
-            ax.set_xlabel("grad_norm_unscaled")
-            ax.set_ylabel("count")
-            payload["actor/grad_norm/hist"] = wandb.Image(fig)
-            plt.close(fig)
-
-            # Histogram of Staleness Levels
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.hist(staleness_gaps, bins=80, alpha=0.8)
-            ax.set_title("Staleness Levels")
-            ax.set_xlabel("Trainer Version - Rollout Version")
-            ax.set_ylabel("count")
-            payload["staleness/gap/hist"] = wandb.Image(fig)
-            plt.close(fig)
-
-            # [NOTE] Add Histogram of Reponse Lengths?
-
-            # Token-level scatter: x=old/policy probs, y=rollout probs.
-            old_probs = []
-            rollout_probs = []
-            for rec in traj_records:
-                if isinstance(rec, dict):
-                    rlp = rec["rollout_log_probs"] if "rollout_log_probs" in rec else None
-                    olp = rec["old_log_probs"] if "old_log_probs" in rec else None
-                else:
-                    rlp = getattr(rec, "rollout_log_probs", None)
-                    olp = getattr(rec, "old_log_probs", None)
-
-                if isinstance(rlp, list) and isinstance(olp, list):
-                    for old_lp, rollout_lp in zip(olp, rlp):
-                        if old_lp is not None and rollout_lp is not None:
-                            old_probs.append(float(np.exp(float(old_lp))))
-                            rollout_probs.append(float(np.exp(float(rollout_lp))))
-
-            if old_probs and rollout_probs:
-                fig, ax = plt.subplots(figsize=(4, 4))
-                ax.scatter(old_probs, rollout_probs, s=8, alpha=0.4)
-                ax.set_xlabel("old/policy probs")
-                ax.set_ylabel("rollout probs")
-                ax.set_title("Rollout vs old/policy probs")
-                payload["staleness/rollout_vs_policy_probs"] = wandb.Image(fig)
-                plt.close(fig)
-
-            # Scatter: response length vs unscaled grad norm
-            if scatter_response_lengths and scatter_grad_norm_unscaled:
-                fig, ax = plt.subplots(figsize=(6, 4))
-                ax.scatter(scatter_response_lengths, scatter_grad_norm_unscaled, s=8, alpha=0.5)
-                ax.set_xlabel("response_length")
-                ax.set_ylabel("grad_norm_unscaled")
-                ax.set_title("Grad norm vs response length")
-                payload["actor/grad_norm_vs_response_len"] = wandb.Image(fig)
-                plt.close(fig)
 
     return payload
 

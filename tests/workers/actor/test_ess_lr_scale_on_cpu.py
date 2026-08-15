@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the ESS-brake LR multiplier (compute_ess_lr_scale),
+"""Unit tests for the ESS-brake LR multiplier (verl/workers/utils/ess.py),
 including the ess_scaling.trigger_ratio intervention threshold:
 - legacy behavior (trigger_ratio=None): min(1, ess/base)
 - with a threshold: full lr at or above it, legacy attenuation below it,
@@ -22,7 +22,7 @@ Run: pytest tests/workers/actor/test_ess_lr_scale_on_cpu.py
 
 import pytest
 
-from verl.workers.actor.megatron_actor import _resolve_loss_multiplier, compute_ess_lr_scale, resolve_ess_base
+from verl.workers.utils.ess import compute_ess_lr_scale, resolve_ess_base
 
 
 class TestLegacyBehavior:
@@ -71,24 +71,6 @@ class TestTriggerRatio:
         # multiplier applies -> identical to legacy for any input
         for ess in (0.1, 0.5, 0.9, 1.5):
             assert compute_ess_lr_scale(ess, 0.5, 2.0) == compute_ess_lr_scale(ess, 0.5)
-
-
-class TestResolveLossMultiplier:
-    """The buffer-free per-traj path folds the advantage into loss_multiplier,
-    so an exact 0.0 (zero-advantage trajectory) must be honored — a `x or 1.0`
-    parse would silently promote it to a full-weight score gradient."""
-
-    def test_missing_defaults_to_one(self):
-        assert _resolve_loss_multiplier({}) == 1.0
-
-    def test_none_defaults_to_one(self):
-        assert _resolve_loss_multiplier({"loss_multiplier": None}) == 1.0
-
-    def test_explicit_zero_is_honored(self):
-        assert _resolve_loss_multiplier({"loss_multiplier": 0.0}) == 0.0
-
-    def test_value_passthrough(self):
-        assert _resolve_loss_multiplier({"loss_multiplier": 0.25}) == 0.25
 
 
 class TestResolveEssBase:

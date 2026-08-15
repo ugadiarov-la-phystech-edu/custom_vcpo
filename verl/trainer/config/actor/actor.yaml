@@ -221,8 +221,10 @@ profiler:
       # Stack trace depth for memory allocations
       stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
 
-# Whether to use per-trajectory actor updates (Megatron VCPO path)
-update_policy_per_traj: false
+# FSDP path only: compute the clipped policy loss with unit advantages and
+# apply each sequence's (constant) advantage as a post-clip scale — the
+# sequence-level score-loss semantics of the Megatron per-traj path.
+seq_adv_post_scale: false
 
 # Effective Sample Size based learning-rate scaling
 ess_scaling:
@@ -248,30 +250,3 @@ ess_scaling:
   # update runs at full nominal lr. null = legacy behavior (engage whenever
   # ratio < 1). The lr multiplier jumps from 1 to rule(ratio) at the threshold.
   trigger_ratio: null
-
-# Gradient baseline settings for VCPO per-trajectory updates
-grad_baselining:
-
-  # Target dataclass for this configuration
-  _target_: verl.workers.config.GradBaselineConfig
-
-  # Whether to enable gradient baseline correction
-  enable: false
-
-  # Baseline scope: "group" or "minibatch"
-  scope: group
-
-  # Baseline aggregation mode: "mean", "median", "winsorized_mean"
-  agg_mode: mean
-
-  # Whether to use importance-sampling weights in baseline computation
-  use_is_weights: true
-
-  # Whether to use clipped IS ratios in baseline computation
-  use_clipped_is_ratios: false
-
-  # Whether to normalize by sequence length when computing baseline
-  normalize_by_length: false
-
-  # Whether to normalize reward signal by reward std
-  norm_by_std: false

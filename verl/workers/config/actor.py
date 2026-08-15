@@ -28,7 +28,6 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "ESSScalingConfig",
-    "GradBaselineConfig",
     "ActorConfig",
     "FSDPActorConfig",
     "McoreActorConfig",
@@ -78,17 +77,6 @@ class ESSScalingConfig(BaseConfig):
 
 
 @dataclass
-class GradBaselineConfig(BaseConfig):
-    enable: bool = False
-    scope: str = "group"  # "group" | "minibatch"
-    agg_mode: str = "mean"  # "mean" | "median" | "winsorized_mean"
-    use_is_weights: bool = True
-    use_clipped_is_ratios: bool = False
-    normalize_by_length: bool = False
-    norm_by_std: bool = False
-
-
-@dataclass
 class ActorConfig(BaseConfig):
     """Configuration for actor model training.
 
@@ -121,9 +109,10 @@ class ActorConfig(BaseConfig):
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
         data_loader_seed (int): Seed for data loader. If None, uses global seed.
-        update_policy_per_traj (bool): Enable per-trajectory actor updates with exact grad stats.
         ess_scaling (ESSScalingConfig): Configuration for ESS-based LR scaling.
-        grad_baselining (GradBaselineConfig): Configuration for VCPO gradient baselining.
+        seq_adv_post_scale (bool): FSDP path only — compute the clipped policy loss with unit
+            advantages and apply each sequence's (constant) advantage as a post-clip scale,
+            reproducing the sequence-level score-loss semantics of the Megatron per-traj path.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -167,9 +156,8 @@ class ActorConfig(BaseConfig):
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
-    update_policy_per_traj: bool = False
     ess_scaling: ESSScalingConfig = field(default_factory=ESSScalingConfig)
-    grad_baselining: GradBaselineConfig = field(default_factory=GradBaselineConfig)
+    seq_adv_post_scale: bool = False
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
