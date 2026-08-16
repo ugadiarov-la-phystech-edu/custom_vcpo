@@ -9,26 +9,31 @@
 #SBATCH --job-name=grpo-novcpo
 
 # grpo_novcpo_k=2_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1.sh
-# 4+4-layout B-32x1 variant of the k=2 ppo-epochs=2 arm
-# (grpo_novcpo_k=2_..._ppo-epochs=2.sh): require_batches=1, test_freq=20,
-# save_freq=20, 4 rollout + 4 trainer GPUs, ppo_mini_batch_size=32
-# (32*16=512 divides trainer DP=4). (Megatron backend, HDO full CPU offload,
-# fixed micro-batching) with the elastic mechanisms turned OFF and a
-# fractional scheduled update instead:
-#   * ppo_epochs=2 (async_training.ppo_epochs): per trainer step the pull is
-#     ONE 32-group mini-batch and the trainer runs round(2*1)=2 AdamW
-#     updates: two shuffled passes over the same 32 groups (every group
-#     trained on twice). Versions tick per 32-group step, so syncs are 4x
-#     more frequent than the B-33x4 arm at the same generation throughput;
-#     the second epoch's IS ratios are recomputed against the current policy
-#     per update (skip_recompute path).
+# Same as the k=10 arm (grpo_novcpo_k=10_..._ppo-epochs=2.sh) with TWO changes:
+#   * async_training.require_batches=1 (num_minibatches_per_update): the pull
+#     is ONE 33-group mini-batch per trainer step (B-33x1, not B-33x4) and
+#     with ppo_epochs=2 the trainer runs round(2*1)=2 AdamW updates per step —
+#     two shuffled passes over the same 33 groups. Model versions tick per
+#     33-group step, i.e. 4x more frequent syncs than the B-33x4 arms at the
+#     same generation throughput.
+#   * async_training.staleness_threshold=2 (back to the k=2 gating of the
+#     VCPO baseline; the k=10 arm's loose gate is reverted).
+# Adjusted for the ×4 -> ×1 step size:
+#   * total_rollout_steps=66000 explicit (the base arms' 500-step formula
+#     would shrink to 16500 at B-33x1): same generation budget as the B-33x4
+#     arms, up to ~2000 trainer steps of 33 groups.
+#   * test_freq=10 / save_freq=10 (param-version units; versions tick per
+#     33-group step): validation/checkpointing every 330 groups — 2x the
+#     B-33x4 arms' 660-group cadence.
+# Inherited from the k=10/k=2 base unchanged:
+#   * ppo_epochs=2 second-epoch IS ratios are recomputed against the current
+#     policy per update (skip_recompute path).
 #   * OPPORTUNISTIC PPO EPOCHS OFF, DAPO FILTERING OFF.
 #   * serialize_validation=True / pause_generation_during_save=True kept:
 #     stop-the-world validation and checkpoint saves — pure time translations
-#     excluded from cumulative_training_time, so the trajectory and clock stay
-#     exactly comparable to a no-validation-no-save run.
-# Base-script notes that still apply: trainer tp=1/dp=4 (sequence_parallel
-# needs TP>1), 32*16=512 seqs divide by DP=4, HDO full CPU offload with bf16
+#     excluded from cumulative_training_time.
+# Base-script notes that still apply: trainer tp=1/dp=3 (sequence_parallel
+# needs TP>1), 33*16=528 seqs divide by DP=3, HDO full CPU offload with bf16
 # master weights (do NOT swap for use_precision_aware_optimizer without
 # optimizer_cpu_offload: silent stall, probe 2026-07-30). VCPO mechanisms
 # stay off.
@@ -59,7 +64,7 @@ project_name='vcpo'
 # ================= GPU Layout =================
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-n_gpus_rollout=${n_gpus_rollout:-4}
+n_gpus_rollout=${n_gpus_rollout:-5}
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 # ================= Rollout =================
@@ -78,7 +83,7 @@ max_response_length=8192
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 # ================= Megatron Parallelism =================
-train_tp=1 # pure-DP trainer group (no TP comm); sequence_parallel needs TP>1
+train_tp=1 # only valid TP for 3 trainer GPUs (pure DP, no TP comm)
 train_pp=1
 train_cp=1
 sequence_parallel=False # requires TP>1
@@ -88,12 +93,12 @@ precision_dtype="bfloat16"
 # ================= Batch Sizes =================
 train_prompt_bsz=0
 gen_prompt_bsz=1
-train_prompt_mini_bsz=32 # 32*16=512 seqs; must divide by trainer DP=4 (512/4=128)
+train_prompt_mini_bsz=33 # 33*16=528 seqs; must divide by trainer DP=3 (528/3=176)
 micro_bsz_per_gpu=1
 use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
 
-bsz_per_dp_rank=32 # Rollout Bsz: in-flight prompt-groups per rollout replica (32*4 replicas = 128 concurrent)
+bsz_per_dp_rank=33 # Rollout Bsz
 
 # ================= Algorithm =================
 adv_estimator=grpo
@@ -133,17 +138,18 @@ skip_recompute_old_log_prob=True
 compute_prox_log_prob=False
 
 # ================= Async Training =================
-# k=2 matches the VCPO baseline's staleness gating (timing-neutral in this
-# layout: concurrency saturates at 128 prompt-groups for any k >= 0).
+# k=2 matches the VCPO baseline's staleness gating (the k=10 arm's loose
+# gate is reverted): the rollouter is licensed to generate up to (2+1)
+# trainer batches ahead — at B-33x1 that is 99 in-flight/queued groups.
 staleness_threshold=${staleness_threshold:-2.0}
 updates_per_param_sync=1
-num_minibatches_per_update=1 # ONE 32-group mini-batch per trainer step (B-32x1); with ppo_epochs=2 that is round(2*1)=2 AdamW updates per step
+num_minibatches_per_update=1 # require_batches=1: ONE 33-group mini-batch per trainer step (B-33x1); with ppo_epochs=2 that is round(2*1)=2 AdamW updates per step
 partial_rollout=True
 use_rollout_log_probs=True
 
 # ================= Fractional scheduled PPO epochs =================
 # round(ppo_epochs * require_batches) = 2 driver-side AdamW updates per trainer
-# step: two shuffled passes over the single 32-group mini-batch of the pull.
+# step: two shuffled passes over the single 33-group mini-batch of the pull.
 ppo_epochs=${ppo_epochs:-2}
 ppo_epochs_shuffle_seed=${ppo_epochs_shuffle_seed:-1234}
 
@@ -160,16 +166,20 @@ serialize_validation=${serialize_validation:-True}
 pause_generation_during_save=${pause_generation_during_save:-True}
 
 # ================= Training/Rollout Steps =================
-# Same 66000-prompt generation budget as the B-33 arms; at 32 groups/step
-# this licenses up to ~2062 trainer steps
+# Explicit 66000 (NOT the base arms' 500-step formula, which at B-33x1 would
+# shrink to 500*1*1*33 = 16500): same generation budget as the B-33x4 arms,
+# licensing up to ~2000 trainer steps of 33 groups.
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
-test_freq=${test_freq:-20} # validate every 20 param versions (= 40 AdamW updates at 2 updates/step)
-save_freq=20               # checkpoint every 20 param versions (= every 20 steps at trigger_parameter_sync_step=1)
+# test/save freq are in param-version units; versions tick per 33-group step
+# here, so 10 = every 330 groups — 2x the B-33x4 arms' 660-group cadence
+# (their test_freq=5 at 132 groups/version).
+test_freq=${test_freq:-10}
+save_freq=${save_freq:-10}
 max_actor_ckpt_to_keep=1 # keep only the most recent checkpoint
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO k-${staleness_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp4 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO k-${staleness_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
