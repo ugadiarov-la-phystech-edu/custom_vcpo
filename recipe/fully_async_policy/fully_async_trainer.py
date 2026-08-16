@@ -517,6 +517,11 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self._open_virtual_step(consumer_end, [e.sample for e in entries if e.is_new])
         return entries, info
 
+    def _replay_post_update_maintenance(self, entries, new_version: int) -> None:
+        self.replay_buffer.mark_used(entries)
+        self.replay_buffer.evict(new_version)
+        self.replay_buffer.recompute_scores(new_version)
+
     def _build_replay_batch(self, entries):
         rollout_samples = [e.sample for e in entries]
         if self.config.trainer.balance_batch:
@@ -668,9 +673,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 self._log_rollout(batch, {}, timing_raw)
 
             new_version = self.current_param_version + 1
-            self.replay_buffer.evict(new_version)
-            self.replay_buffer.recompute_scores(new_version)
-            self.replay_buffer.mark_used(entries)
+            self._replay_post_update_maintenance(entries, new_version)
             self.replay_updates_done += 1
             self._add_replay_metrics(metrics, info, new_version)
 

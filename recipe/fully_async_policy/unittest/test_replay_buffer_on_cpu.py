@@ -473,6 +473,30 @@ def test_fractional_requires_mini_batches():
     assert trainer.replay_buffer.size() == 3
 
 
+def test_post_update_maintenance_marks_used_before_eviction():
+    # Regression: _fit_replay used to evict BEFORE mark_used, so a group
+    # trained on the very update that pushed it past the staleness threshold
+    # was counted as evicted_unseen ("never trained on" waste). The trainer's
+    # maintenance method must retire is_new first: the just-trained group
+    # counts as evicted-seen, only the genuinely untrained one as unseen.
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
+    trainer.replay_buffer = ReplayBuffer(tau=4.0, staleness_threshold=8, seed=0)
+    just_trained = trainer.replay_buffer.add(_sample(group_version=0), current_version=8)
+    never_trained = trainer.replay_buffer.add(_sample(group_version=0), current_version=8)
+    survivor = trainer.replay_buffer.add(_sample(group_version=5), current_version=8)
+
+    # The update at version 8 trained on just_trained (staleness 8 <= 8);
+    # at the post-update version 9 both version-0 groups cross the threshold.
+    trainer._replay_post_update_maintenance([just_trained], new_version=9)
+
+    assert not just_trained.is_new
+    assert trainer.replay_buffer.entries == [survivor]
+    assert trainer.replay_buffer.evicted_total == 2
+    assert trainer.replay_buffer.evicted_unseen_total == 1  # never_trained only
+    # survivor rescored at the post-update version: staleness 4, tau 4 -> 0.5
+    assert survivor.score == pytest.approx(0.5)
+
+
 def test_acquire_terminates_on_sentinel_when_buffer_insufficient():
     # warm-up: sentinel in the drain, nothing else -> stop
     trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=2, available=[None])
