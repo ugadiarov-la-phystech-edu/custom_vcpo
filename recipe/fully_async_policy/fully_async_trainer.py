@@ -623,6 +623,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self._open_virtual_step(consumer_end, [e.sample for e in entries if e.is_new])
         return entries, info
 
+    def _replay_post_update_maintenance(self, entries, new_version: int) -> None:
+        """Buffer maintenance after one replay update, at the model version the
+        update just produced: retire the used groups' is_new flag BEFORE
+        evicting — a just-trained group crossing the staleness threshold must
+        count as evicted-seen, not evicted_unseen (that counter means
+        generated-but-never-trained-on waste) — then evict too-stale groups
+        and decay the survivors' scores."""
+        self.replay_buffer.mark_used(entries)
+        self.replay_buffer.evict(new_version)
+        self.replay_buffer.recompute_scores(new_version)
+
     def _build_replay_batch(self, entries):
         """Assemble a training DataProto from buffered groups using the frozen
         insertion-time statistics: advantages broadcast from advantage_scalar,
@@ -838,12 +849,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 self._log_rollout(batch, {}, timing_raw)
 
             # Post-update buffer maintenance at the version this update just
-            # produced (stamped by the sync below): evict too-stale groups,
-            # decay scores, and retire the used groups' is_new flag.
+            # produced (stamped by the sync below).
             new_version = self.current_param_version + 1
-            self.replay_buffer.evict(new_version)
-            self.replay_buffer.recompute_scores(new_version)
-            self.replay_buffer.mark_used(entries)
+            self._replay_post_update_maintenance(entries, new_version)
             self.replay_updates_done += 1
             self._add_replay_metrics(metrics, info, new_version)
 
