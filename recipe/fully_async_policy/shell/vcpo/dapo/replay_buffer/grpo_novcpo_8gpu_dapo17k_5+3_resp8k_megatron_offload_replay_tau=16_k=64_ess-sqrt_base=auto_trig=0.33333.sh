@@ -21,7 +21,7 @@ export PYTHONUNBUFFERED=1
 
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet"}
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/math500.parquet']"}
 
 project_name='vcpo'
 
