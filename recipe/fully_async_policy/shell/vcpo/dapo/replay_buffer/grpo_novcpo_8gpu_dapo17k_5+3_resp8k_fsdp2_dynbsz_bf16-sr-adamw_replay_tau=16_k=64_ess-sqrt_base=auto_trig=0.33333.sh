@@ -15,9 +15,10 @@
 #   * fsdp_config.model_dtype=bf16 + torchao _AdamW with bf16 stochastic
 #     rounding, fully GPU-resident (no CPU offload, no fp32 master). Sharded
 #     over dp=3: ~5.5 (bf16 params) + 5.5 (grads) + 10.9 (bf16 moments)
-#     ~= 22 GB static per trainer GPU — HALF the fp32 arm's ~44 GB, so the
-#     20480-token dynbsz budget drops from ~65-70 GiB estimated peak to
-#     ~45-50 GiB: the fp32 dynbsz arm's OOM caveat does not apply here.
+#     ~= 22 GB static per trainer GPU — HALF the fp32 arm's ~44 GB. The
+#     headroom funds a raised 30720-token dynbsz budget (estimated peak
+#     ~52-60 GiB vs the fp32 arm's ~65-70 at 20480): the fp32 dynbsz arm's
+#     OOM caveat does not apply here.
 #   * model_dtype=bf16 is REQUIRED for this: verl builds the FSDP actor in
 #     fp32 by default, which doubles static memory AND makes
 #     bf16_stochastic_round silently inert (SR only acts on bf16 params).
@@ -33,13 +34,14 @@
 #   * The ESS brake composes unchanged: _ess_scaled_optimizer_step scales the
 #     optimizer param-group LRs, which torchao _AdamW honors like any torch
 #     optimizer. Requires torchao in the environment.
-# Everything else is identical to the fp32 dynbsz base: trainer-side replay
-# buffer (tau=16, eviction k=64, rmb=1, sync after every update, DAPO
-# insertion gate, frozen advantages / behavior log-probs), token-IS 2.0
-# against cached behavior log-probs, ESS brake sqrt/base=auto/trigger=1/3
-# attached to the ordinary mini-batch update (dp_actor port),
-# seq_adv_post_scale=True for Megatron per-traj loss parity,
-# use_dynamic_bsz=True at the 20480-token budget (parity weighting exact,
+# Everything else is identical to the fp32 dynbsz base EXCEPT the token
+# budget (30720 vs its 20480 — override ppo_max_token_len=20480 to isolate
+# the precision delta alone): trainer-side replay buffer (tau=16, eviction
+# k=64, rmb=1, sync after every update, DAPO insertion gate, frozen
+# advantages / behavior log-probs), token-IS 2.0 against cached behavior
+# log-probs, ESS brake sqrt/base=auto/trigger=1/3 attached to the ordinary
+# mini-batch update (dp_actor port), seq_adv_post_scale=True for Megatron
+# per-traj loss parity, use_dynamic_bsz=True (parity weighting exact,
 # per-sequence ESS sums packing-independent), B=33 prompts x 16 responses,
 # lr 1e-6 constant, 8K responses, two validation sets, stop-the-world
 # validation/saves.
@@ -106,10 +108,15 @@ gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3 (528/3=176)
 micro_bsz_per_gpu=1 # ignored under use_dynamic_bsz=True
 use_dynamic_bsz=True
-# token budget per micro-batch: 2x max_model_len. At the bf16 recipe's ~22 GB
-# static the estimated peak is ~45-50 GiB — comfortable; kept at 2x (not
-# raised) so the only change vs the fp32 dynbsz arm is the precision recipe.
-ppo_max_token_len=${ppo_max_token_len:-$((2 * (max_prompt_length + max_response_length)))} # 20480
+# token budget per micro-batch: 3x max_model_len (30720), exploiting the bf16
+# recipe's memory headroom: ~22 GB static + ~30-37 GiB transient at 3x =>
+# estimated peak ~52-60 GiB on 80 GB — same default as the bf16-sr-adamw
+# B33x1 arm. NOTE: this diverges from the fp32 dynbsz replay arm's 20480, so
+# this arm differs from it in BOTH precision and packing throughput; override
+# ppo_max_token_len=20480 to isolate the precision delta alone. Micro-batching
+# does not affect the algorithmics (ESS entries and parity gradients are
+# packing-invariant), only trainer wall-clock.
+ppo_max_token_len=${ppo_max_token_len:-$((3 * (max_prompt_length + max_response_length)))} # 30720
 log_prob_micro_bsz_per_gpu=1
 
 bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}} # Rollout Bsz
