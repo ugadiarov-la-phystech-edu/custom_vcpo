@@ -481,6 +481,53 @@ class TestGuards:
             pytest.approx(0.05),
         ]
 
+    def test_tensor_lr_param_group_scaled_in_place(self):
+        """torchao optimizers (_AdamW) store lr as a 0-dim Tensor and RAISE on
+        plain-float reassignment ("lr was changed to a non-Tensor object") —
+        the brake must mutate via fill_ and keep the object identity.
+        Regression: smoke run 2026-08-17, update 2 crash on the bf16-sr arm."""
+        config = _ess_config(base_ess_ratio=1.0, trigger_ratio=0.5)
+        module = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            module.weight.zero_()
+        optimizer = torch.optim.SGD([{"params": [module.weight], "lr": 0.1}])
+        lr_tensor = torch.tensor(0.1)
+        optimizer.param_groups[0]["lr"] = lr_tensor
+
+        class _TensorLrGuard:
+            """Mimic torchao's guard: reject non-Tensor lr at step time."""
+
+            def __init__(self, opt):
+                self._opt = opt
+                self.param_groups = opt.param_groups
+                self.stepped_lrs = []
+
+            def step(self):
+                for pg in self.param_groups:
+                    if not torch.is_tensor(pg["lr"]):
+                        raise RuntimeError("lr was changed to a non-Tensor object.")
+                    self.stepped_lrs.append(float(pg["lr"]))
+                return self._opt.step()
+
+            def zero_grad(self, *a, **k):
+                return self._opt.zero_grad(*a, **k)
+
+        guard = _TensorLrGuard(optimizer)
+        actor = DataParallelPPOActor(config=config, actor_module=module, actor_optimizer=guard)
+
+        def fake_forward(model_inputs, temperature, calculate_entropy=False):
+            responses = model_inputs["responses"]
+            x = torch.ones(*responses.shape, 1, dtype=torch.float32)
+            return None, actor.actor_module(x).squeeze(-1)
+
+        actor._forward_micro_batch = fake_forward
+
+        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ratio 0.25 < trigger 0.5
+        assert guard.stepped_lrs == [pytest.approx(0.1 * 0.5)]
+        pg_lr = actor.actor_optimizer.param_groups[0]["lr"]
+        assert pg_lr is lr_tensor  # identity preserved: mutated in place, never replaced
+        assert float(pg_lr) == pytest.approx(0.1)  # restored after the step
+
     def test_parity_slices_rollout_is_weights_per_sequence(self):
         actor = _make_actor(_make_config(seq_adv_post_scale=True))
         seen_weights, seen_advantages = [], []

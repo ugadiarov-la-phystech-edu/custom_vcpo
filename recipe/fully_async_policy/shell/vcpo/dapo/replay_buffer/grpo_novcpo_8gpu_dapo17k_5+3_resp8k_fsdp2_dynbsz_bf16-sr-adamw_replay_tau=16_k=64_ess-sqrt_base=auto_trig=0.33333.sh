@@ -16,9 +16,9 @@
 #     rounding, fully GPU-resident (no CPU offload, no fp32 master). Sharded
 #     over dp=3: ~5.5 (bf16 params) + 5.5 (grads) + 10.9 (bf16 moments)
 #     ~= 22 GB static per trainer GPU — HALF the fp32 arm's ~44 GB. The
-#     headroom funds a raised 30720-token dynbsz budget (estimated peak
-#     ~52-60 GiB vs the fp32 arm's ~65-70 at 20480): the fp32 dynbsz arm's
-#     OOM caveat does not apply here.
+#     headroom funds a raised 25600-token dynbsz budget (smoke-measured peak
+#     ~81 GB at 30720 — pinned; ~70-72 GiB estimated at 25600): the fp32
+#     dynbsz arm's OOM caveat does not apply here.
 #   * model_dtype=bf16 is REQUIRED for this: verl builds the FSDP actor in
 #     fp32 by default, which doubles static memory AND makes
 #     bf16_stochastic_round silently inert (SR only acts on bf16 params).
@@ -35,7 +35,7 @@
 #     optimizer param-group LRs, which torchao _AdamW honors like any torch
 #     optimizer. Requires torchao in the environment.
 # Everything else is identical to the fp32 dynbsz base EXCEPT the token
-# budget (30720 vs its 20480 — override ppo_max_token_len=20480 to isolate
+# budget (25600 vs its 20480 — override ppo_max_token_len=20480 to isolate
 # the precision delta alone): trainer-side replay buffer (tau=16, eviction
 # k=64, rmb=1, sync after every update, DAPO insertion gate, frozen
 # advantages / behavior log-probs), token-IS 2.0 against cached behavior
@@ -88,7 +88,12 @@ rollout_name="vllm"
 return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-gpu_memory_utilization=0.9
+# 0.8, NOT 0.9: on the FSDP2 path the rollout workers also host the FSDP
+# sync-side model (~11 GB resident before vLLM starts), so 0.9 of 80 GB is
+# not satisfiable at engine init (smoke run 2026-08-17); 0.8 + max_num_seqs
+# =512 is the validated recipe of the B33x1 fsdp2 arms.
+gpu_memory_utilization=0.8
+max_num_seqs=512
 enable_chunked_prefill=True
 calculate_log_probs=True
 
@@ -98,7 +103,13 @@ max_response_length=${max_response_length:-8192}
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 # ================= FSDP2 Trainer =================
-fsdp_size=${fsdp_size:-${n_gpus_training}} # full sharding over the trainer GPUs
+# -1 = shard over the whole worker group (trainer: all 3 GPUs — full
+# sharding, same as fsdp_size=3 there). Do NOT set a positive value here: the
+# actor fsdp_config also reaches the 5-GPU ROLLOUT worker group, where
+# world_size=5 is not divisible by 3 — create_device_mesh then builds a 2D
+# mesh covering only 3 of 5 ranks and get_init_weight_context_manager crashes
+# on mesh.get_coordinate()=None (smoke run 2026-08-17).
+fsdp_size=${fsdp_size:--1}
 sp_size=1                                  # no ulysses sequence parallel
 use_remove_padding=True
 precision_dtype="bfloat16"
@@ -109,15 +120,16 @@ gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3 (528/3=176)
 micro_bsz_per_gpu=1 # ignored under use_dynamic_bsz=True
 use_dynamic_bsz=True
-# token budget per micro-batch: 3x max_model_len (30720), exploiting the bf16
-# recipe's memory headroom: ~22 GB static + ~30-37 GiB transient at 3x =>
-# estimated peak ~52-60 GiB on 80 GB — same default as the bf16-sr-adamw
-# B33x1 arm. NOTE: this diverges from the fp32 dynbsz replay arm's 20480, so
-# this arm differs from it in BOTH precision and packing throughput; override
-# ppo_max_token_len=20480 to isolate the precision delta alone. Micro-batching
-# does not affect the algorithmics (ESS entries and parity gradients are
-# packing-invariant), only trainer wall-clock.
-ppo_max_token_len=${ppo_max_token_len:-$((3 * (max_prompt_length + max_response_length)))} # 30720
+# token budget per micro-batch: 25600 = 2.5x max_model_len. 30720 (3x) PINNED
+# the trainer GPUs at ~81 GB in two smoke runs (2026-08-17, threshold check
+# FAILED both times) — no headroom under packing variance. At 2.5x the
+# transient shrinks ~1/6 => estimated peak ~70-72 GiB: workable margin while
+# keeping ~2 full-length (10240-token) sequences per micro-batch. Override
+# ppo_max_token_len=20480 for the conservative budget / to match the fp32
+# dynbsz replay arm's packing. Micro-batching does not affect the
+# algorithmics (ESS entries and parity gradients are packing-invariant),
+# only trainer wall-clock.
+ppo_max_token_len=${ppo_max_token_len:-25600}
 log_prob_micro_bsz_per_gpu=1
 
 bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}} # Rollout Bsz
@@ -291,6 +303,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
+    actor_rollout_ref.rollout.max_num_seqs=${max_num_seqs} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.dtype=${precision_dtype} \
     actor_rollout_ref.rollout.enable_chunked_prefill=${enable_chunked_prefill} \

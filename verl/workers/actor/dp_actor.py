@@ -365,6 +365,17 @@ class DataParallelPPOActor(BasePPOActor):
                 pg_metrics[key] = sum(values) / len(values)
         return pg_loss, pg_metrics
 
+    @staticmethod
+    def _set_param_group_lr(pg, new_lr: float):
+        """Write a param-group lr in place. torchao optimizers (e.g. _AdamW)
+        store lr as a 0-dim Tensor and raise on plain-float reassignment
+        ("lr was changed to a non-Tensor object"), so mutate via fill_ there;
+        stock torch optimizers keep the float path."""
+        if torch.is_tensor(pg["lr"]):
+            pg["lr"].fill_(new_lr)
+        else:
+            pg["lr"] = new_lr
+
     def _ess_scaled_optimizer_step(
         self,
         minibatch_idx: int,
@@ -405,7 +416,7 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 raise NotImplementedError(f"{scaling_rule} not implemented for ESS scaling")
             for pg, base_lr in zip(param_groups, base_lrs, strict=True):
-                pg["lr"] = base_lr * lr_mult
+                self._set_param_group_lr(pg, base_lr * lr_mult)
             scaled = True
         lr = float(param_groups[0]["lr"]) if param_groups else None
 
@@ -414,7 +425,7 @@ class DataParallelPPOActor(BasePPOActor):
         finally:
             if scaled:
                 for pg, base_lr in zip(param_groups, base_lrs, strict=True):
-                    pg["lr"] = base_lr
+                    self._set_param_group_lr(pg, base_lr)
 
         entry = {
             "minibatch_idx": minibatch_idx,

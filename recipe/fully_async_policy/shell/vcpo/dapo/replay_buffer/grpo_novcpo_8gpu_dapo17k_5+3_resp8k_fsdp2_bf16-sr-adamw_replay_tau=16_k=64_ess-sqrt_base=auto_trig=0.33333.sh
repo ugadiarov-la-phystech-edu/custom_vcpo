@@ -86,7 +86,12 @@ rollout_name="vllm"
 return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-gpu_memory_utilization=0.9
+# 0.8, NOT 0.9: on the FSDP2 path the rollout workers also host the FSDP
+# sync-side model (~11 GB resident before vLLM starts), so 0.9 of 80 GB is
+# not satisfiable at engine init (smoke run 2026-08-17); 0.8 + max_num_seqs
+# =512 is the validated recipe of the B33x1 fsdp2 arms.
+gpu_memory_utilization=0.8
+max_num_seqs=512
 enable_chunked_prefill=True
 calculate_log_probs=True
 
@@ -96,7 +101,13 @@ max_response_length=${max_response_length:-8192}
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 # ================= FSDP2 Trainer =================
-fsdp_size=${fsdp_size:-${n_gpus_training}} # full sharding over the trainer GPUs
+# -1 = shard over the whole worker group (trainer: all 3 GPUs — full
+# sharding, same as fsdp_size=3 there). Do NOT set a positive value here: the
+# actor fsdp_config also reaches the 5-GPU ROLLOUT worker group, where
+# world_size=5 is not divisible by 3 — create_device_mesh then builds a 2D
+# mesh covering only 3 of 5 ranks and get_init_weight_context_manager crashes
+# on mesh.get_coordinate()=None (smoke run 2026-08-17).
+fsdp_size=${fsdp_size:--1}
 sp_size=1                                  # no ulysses sequence parallel
 use_remove_padding=True
 precision_dtype="bfloat16"
@@ -278,6 +289,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
+    actor_rollout_ref.rollout.max_num_seqs=${max_num_seqs} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.dtype=${precision_dtype} \
     actor_rollout_ref.rollout.enable_chunked_prefill=${enable_chunked_prefill} \
