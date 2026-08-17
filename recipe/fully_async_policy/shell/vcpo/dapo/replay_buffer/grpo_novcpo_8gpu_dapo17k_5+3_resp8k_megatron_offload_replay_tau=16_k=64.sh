@@ -64,7 +64,14 @@ export PYTHONUNBUFFERED=1
 # ================= Paths =================
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet"}
+# Two validation sets, reported separately by data_source:
+#   aime-2024.parquet (data_source=math_dapo) -> val-core/math_dapo/acc/mean@1
+#   aime-2025.parquet (data_source=aime2025_dapo) -> val-core/aime2025_dapo/acc/mean@1
+# aime-2025 is built from MathArena/aime_2025 in the exact aime-2024 format
+# (30 problems x 32 copies, same DAPO prompt template and "Answer:"-line
+# scorer via the aime* dispatch), so both metrics measure the same objective;
+# the distinct data_source stamp keeps the 2025 curve separate.
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
 
 project_name='vcpo'
 
