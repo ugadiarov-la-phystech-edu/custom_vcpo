@@ -60,6 +60,11 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
 from verl.workers.actor.entropy_utils import log_entropy_and_apply_to_loss, should_calculate_entropy
+from verl.workers.utils.ess import (
+    compute_ess_lr_scale,
+    compute_global_ess_from_log_weights,
+    resolve_ess_base,
+)
 from verl.workers.utils.vcpo import (
     _get_local_model_grads_for_norm,
     accumulate_grad_buffers,
@@ -74,31 +79,9 @@ from verl.workers.utils.vcpo import (
     zero_grad_accum_buffers,
 )
 
+# compute_ess_lr_scale / resolve_ess_base moved to verl.workers.utils.ess
+# (backend-neutral); re-exported here for existing importers.
 __all__ = ["MegatronPPOActor", "compute_ess_lr_scale", "resolve_ess_base"]
-
-
-def resolve_ess_base(config_base, override):
-    """Resolve the ESS-scaling reference ratio.
-
-    An explicit config value wins; base_ess_ratio=None (auto-calibration)
-    resolves to the driver-provided override — the first update's measured
-    on-policy ESS ratio, passed back via meta_info["ess_base_override"].
-    Returns None while neither is available (scaling is then a no-op)."""
-    return config_base if config_base is not None else override
-
-
-def compute_ess_lr_scale(ess_ratio: float, base_ess_ratio: float, trigger_ratio: float | None = None) -> float:
-    """LR multiplier of the ESS brake (before the sqrt/linear rule).
-
-    Legacy (trigger_ratio=None): min(1, ess_ratio / base) — attenuate whenever
-    the measured ESS falls below the reference. With ess_scaling.trigger_ratio
-    set, scaling engages only when ess_ratio / base < trigger_ratio; at or
-    above the threshold the mini-batch runs at full nominal lr (multiplier 1),
-    so the multiplier jumps discontinuously at the threshold."""
-    ratio = float(ess_ratio) / max(float(base_ess_ratio), 1e-8)
-    if trigger_ratio is not None and ratio >= float(trigger_ratio):
-        return 1.0
-    return min(1.0, ratio)
 
 
 def _resolve_loss_multiplier(meta_info) -> float:
@@ -553,6 +536,16 @@ class MegatronPPOActor(BasePPOActor):
                         )
                     old_log_prob = log_prob.detach().clone()
                     rollout_log_prob = data["rollout_log_probs"]
+                    if meta_info.get("collect_seq_log_is"):
+                        # Per-sequence log-IS sums for the packed per-traj ESS
+                        # path. fp32 masked sum, no exp — range handling lives
+                        # in compute_global_ess_from_log_weights (max-shifted).
+                        # Uses the ORIGINAL response mask, matching the
+                        # mbs=1 path's compute_is_info.
+                        with torch.no_grad():
+                            mask_f = data["response_mask"].to(device=log_prob.device, dtype=torch.float32)
+                            delta = (old_log_prob.float() - rollout_log_prob.float()) * mask_f
+                            stats["_ess/seq_log_is"] = delta.sum(dim=-1).cpu().tolist()
                     rollout_is_weights_proto, modified_response_mask, rollout_corr_metrics = (
                         compute_rollout_correction_and_rejection_mask(
                             old_log_prob=old_log_prob,
@@ -651,6 +644,15 @@ class MegatronPPOActor(BasePPOActor):
             loss_multiplier = _resolve_loss_multiplier(meta_info)
             if loss_multiplier != 1.0:
                 policy_loss = policy_loss * loss_multiplier
+            global_seq_count = meta_info.get("global_seq_mean_count")
+            if global_seq_count:
+                # Packed per-traj parity (dynamic bsz): the Megatron schedule
+                # divides each micro-batch loss by num_microbatches, so plain
+                # "seq-mean-token-mean" over UNEQUAL packed micro-batches is a
+                # mean-of-means. Rescaling by n_rows * M / N makes the summed
+                # gradient exactly the global per-sequence mean over the
+                # mini-batch — invariant to how sequences were packed.
+                policy_loss = policy_loss * (responses.size(0) * n_micro_batch / float(global_seq_count))
             return policy_loss, [metrics, ret_entropy, rollout_log_prob, old_log_prob]
 
         def forward_step(batch_iter, model, return_schedule_plan: bool = False):
@@ -771,6 +773,8 @@ class MegatronPPOActor(BasePPOActor):
                     "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
                     "rollout_corr_config": rollout_corr_cfg,
                     "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
+                    "global_seq_mean_count": data.meta_info.get("global_seq_mean_count"),
+                    "collect_seq_log_is": bool(data.meta_info.get("collect_seq_log_is", False)),
                 }
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
@@ -917,12 +921,6 @@ class MegatronPPOActor(BasePPOActor):
         minibatch_ess_clipped = staleness_metrics["ess_clipped"]
         ess_ratio_clipped = staleness_metrics["ess_ratio_clipped"]
 
-        ess_ratio_for_scaling = ess_ratio_clipped if self.config.ess_scaling.use_clipped else ess_ratio
-        if ess_ratio_for_scaling is None:
-            ess_ratio_for_scaling = 0.0
-        lrs_now = self.get_lr()
-        lr = lrs_now[0] if lrs_now else None
-
         # ================ Optimizer Step ================
         if accum_buffers is not None:
             copy_accum_buffers_to_grad_buffers(self.actor_module, accum_buffers)
@@ -951,6 +949,29 @@ class MegatronPPOActor(BasePPOActor):
                 else:
                     # finish_grad_sync will call start_grad_sync internally for non-overlap
                     chunk.finish_grad_sync()
+
+        return self._apply_ess_scale_and_step(
+            minibatch_ess, minibatch_ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, ess_base_override
+        )
+
+    def _apply_ess_scale_and_step(
+        self,
+        minibatch_ess,
+        minibatch_ess_clipped,
+        ess_ratio,
+        ess_ratio_clipped,
+        minibatch_idx: int,
+        ess_base_override: float | None,
+    ) -> tuple[bool, dict]:
+        """Shared tail of the per-traj step paths: resolve the ESS reference,
+        scale the optimizer LRs by the sqrt/linear rule for this step only,
+        step, restore the nominal LRs, and emit the staleness/ess entry.
+        Gradients must already be finalized/synced when this is called."""
+        ess_ratio_for_scaling = ess_ratio_clipped if self.config.ess_scaling.use_clipped else ess_ratio
+        if ess_ratio_for_scaling is None:
+            ess_ratio_for_scaling = 0.0
+        lrs_now = self.get_lr()
+        lr = lrs_now[0] if lrs_now else None
 
         base_lrs = self.get_lr()
         ess_base = resolve_ess_base(self.config.ess_scaling.get("base_ess_ratio", None), ess_base_override)
@@ -998,6 +1019,157 @@ class MegatronPPOActor(BasePPOActor):
 
         return update_successful, minibatch_metrics
 
+    def _ess_scaled_optimizer_step_packed(
+        self,
+        seq_log_is: list[float],
+        rollout_is_threshold: float | None,
+        minibatch_idx: int,
+        ess_base_override: float | None,
+    ) -> tuple[bool, dict]:
+        """ESS-braked optimizer step for the packed (dynamic-bsz) path.
+
+        Global ESS comes from per-sequence log-IS sums via the max-shifted
+        computation (exact at any fp range; the ratio bottoms out at 1/B under
+        total single-sequence domination — never a silent lr=0), DP-all-reduced.
+        With pipeline parallelism only the last stage holds the loss metrics,
+        so it computes the values and broadcasts them over the PP group; every
+        rank then steps with the same LR."""
+        values = [0.0, 0.0, 0.0, 0.0, 0.0]
+        dist_initialized = torch.distributed.is_initialized()
+        on_last_stage = (not dist_initialized) or mpu.is_pipeline_last_stage(ignore_virtual=True)
+        if on_last_stage:
+            group = mpu.get_data_parallel_group(with_context_parallel=True) if dist_initialized else None
+            ess, ess_ratio, ess_clipped, ess_ratio_clipped, count = compute_global_ess_from_log_weights(
+                seq_log_is, rollout_is_threshold, group=group
+            )
+            values = [ess, ess_ratio, ess_clipped, ess_ratio_clipped, float(count)]
+        if dist_initialized and mpu.get_pipeline_model_parallel_world_size() > 1:
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            tensor = torch.tensor(values, device=device, dtype=torch.float64)
+            torch.distributed.broadcast(
+                tensor,
+                src=mpu.get_pipeline_model_parallel_last_rank(),
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+            values = tensor.tolist()
+        ess, ess_ratio, ess_clipped, ess_ratio_clipped, _ = values
+        return self._apply_ess_scale_and_step(
+            ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, ess_base_override
+        )
+
+    @GPUMemoryLogger(role="megatron actor", logger=logger)
+    def _update_policy_per_traj_packed(self, dataloader: Iterable[DataProto]) -> dict:
+        """Dynamic-batch-size variant of the buffer-free per-traj update.
+
+        Packs the mini-batch's sequences into token-budget micro-batches
+        (rearrange_micro_batches) and runs ONE ordinary forward_backward_batch
+        per mini-batch — Megatron's normal schedule handles grad sync and
+        finalize, so none of the disable_dp_sync / disable_grad_finalize
+        machinery of the mbs=1 path is needed.
+
+        Loss parity with the mbs=1 path is exact, not approximate, because
+        this path requires skip_recompute_old_log_prob=True: the PPO ratio is
+        exp(log_prob - log_prob.detach()) == 1, so the clip branches collapse
+        and the vanilla loss with row-constant advantages equals the per-traj
+        A=+1 post-scale loss token-for-token. The only remaining difference —
+        Megatron's mean-of-means over unequal micro-batches vs the per-traj
+        global 1/N — is removed by the n_rows*M/N rescale in loss_func
+        (meta_info["global_seq_mean_count"]), making gradients invariant to
+        the packing.
+
+        The ESS brake consumes per-sequence log-IS sums collected in loss_func
+        (meta_info["collect_seq_log_is"]) — same quantity as the mbs=1 path's
+        compute_is_info, but summed in log space and evaluated with the
+        max-shifted ESS, so no fp32-exp censoring at |log w| ~ 88.
+
+        Not supported here: OPOB (needs per-trajectory gradient isolation),
+        context parallelism (per-row masked sums would be partial per CP
+        rank), and the per-token TrajRecord diagnostics (records carry core
+        fields only; grad norms and IS scatter plots are mbs=1/OPOB-only).
+        """
+        assert self.config.megatron.context_parallel_size == 1, (
+            "packed per-traj path does not support context parallelism: per-sequence "
+            "log-IS sums would be partial per CP rank"
+        )
+        assert self.config.loss_agg_mode == "seq-mean-token-mean", (
+            f"packed per-traj path requires loss_agg_mode=seq-mean-token-mean "
+            f"(got {self.config.loss_agg_mode}): the global-norm rescale assumes it"
+        )
+        metrics = {}
+        for minibatch_idx, minibatch in enumerate(dataloader):
+            self.actor_optimizer.zero_grad()
+            for chunk in self.actor_module:
+                chunk.zero_grad_buffer()
+
+            calculate_entropy = should_calculate_entropy(self.config)
+            skip_recompute_old_log_prob = bool(minibatch.meta_info.get("skip_recompute_old_log_prob", False)) or bool(
+                minibatch.meta_info.get("calculate_rollout_policy_is", False)
+            )
+            assert skip_recompute_old_log_prob, (
+                "packed per-traj path requires skip_recompute_old_log_prob=True: with the ratio "
+                "anchored at 1 the vanilla loss equals the per-traj post-scale loss exactly; with "
+                "recomputed old log-probs the clip-branch semantics would diverge"
+            )
+
+            rollout_corr_cfg = minibatch.meta_info.get("rollout_corr_config", None)
+            if rollout_corr_cfg is None:
+                rollout_corr_cfg = self.config.policy_loss.get("rollout_correction", {})
+            rollout_is_threshold = rollout_corr_cfg.get("rollout_is_threshold", None)
+
+            epoch_idx = int(minibatch.meta_info.get("epoch_idx", 0))
+            # Core per-traj records (identity/advantage/reward) for the
+            # trainer's bookkeeping; IS fields and token lists stay empty on
+            # this path (their consumers all guard None).
+            local_traj_records, _ = compute_staleness_statistics(
+                minibatch, minibatch_idx, rollout_is_threshold, False, epoch_idx=epoch_idx
+            )
+
+            minibatch.meta_info["global_seq_mean_count"] = len(minibatch)
+            minibatch.meta_info["collect_seq_log_is"] = True
+
+            max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
+            output = self.forward_backward_batch(
+                minibatch,
+                calculate_entropy=calculate_entropy,
+                use_dynamic_bsz=True,
+                micro_batch_size=None,
+                max_token_len=max_token_len,
+                mini_batch_size=self.config.ppo_mini_batch_size,
+            )
+
+            seq_log_is: list[float] = []
+            for metric in output["output"]:
+                metric_dict = metric[0]
+                for row_sums in metric_dict.pop("_ess/seq_log_is", []):
+                    seq_log_is.extend(float(v) for v in row_sums)
+                append_to_dict(metrics, metric_dict)
+
+            update_successful, minibatch_metrics = self._ess_scaled_optimizer_step_packed(
+                seq_log_is,
+                rollout_is_threshold,
+                minibatch_idx,
+                minibatch.meta_info.get("ess_base_override", None),
+            )
+            if not update_successful:
+                raise NotImplementedError
+
+            minibatch_metrics["actor/minibatch_grad_info"] = [
+                {
+                    "epoch_idx": epoch_idx,
+                    "minibatch_idx": minibatch_idx,
+                    "grad_norm": minibatch_metrics["actor/grad_norm"],
+                    "trainer_global_step": minibatch.meta_info.get("trainer_global_step", -1),
+                    "trainer_local_step": minibatch.meta_info.get("trainer_local_step", -1),
+                }
+            ]
+            append_to_dict(metrics, minibatch_metrics)
+
+            metrics["actor/local_traj_records"] = [asdict(rec) for rec in local_traj_records]
+
+        self.actor_optimizer.zero_grad()
+        get_torch_device().empty_cache()
+        return metrics
+
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def update_policy_per_traj(self, dataloader: Iterable[DataProto], grad_baselining: bool = False) -> dict:
         """Update the policy with per-trajectory gradient norm capture.
@@ -1013,6 +1185,13 @@ class MegatronPPOActor(BasePPOActor):
             "actor/local_traj_records": list[dict]
             "staleness/ess": list[dict]
         """
+        if self.config.use_dynamic_bsz:
+            assert not grad_baselining, (
+                "OPOB (grad_baselining) needs each trajectory's gradient isolated in the grad "
+                "buffer and is incompatible with dynamic batch size; set actor.use_dynamic_bsz=False"
+            )
+            return self._update_policy_per_traj_packed(dataloader)
+
         metrics = {}
 
         # Gradient buffers are only needed for OPOB (grad_baselining): each
