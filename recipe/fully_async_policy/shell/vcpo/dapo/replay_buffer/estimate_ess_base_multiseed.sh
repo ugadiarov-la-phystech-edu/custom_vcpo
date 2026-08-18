@@ -21,7 +21,7 @@
 
 set -uo pipefail
 
-N_RUNS=${1:-${N_RUNS:-5}}
+N_RUNS=${1:-${N_RUNS:-7}}
 SEED_BASE=${SEED_BASE:-1000}
 RESULTS_FILE=${RESULTS_FILE:-"logs/ess_base_estimates.csv"}
 COOLDOWN_S=${COOLDOWN_S:-30}
