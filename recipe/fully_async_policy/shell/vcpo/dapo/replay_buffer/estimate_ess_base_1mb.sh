@@ -14,13 +14,18 @@
 # disabled; nothing is trained beyond the single update. Requires 'console'
 # in trainer.logger (the production script hardcodes it).
 #
-# Seeds set: data.seed (dataloader prompt shuffle), rollout.seed (vLLM
-# sampling), replay_buffer.sampling_seed (inert at update 1, set for hygiene).
-# fsdp_config.seed stays at its fixed default (42). NOTE: even a fixed seed
-# does not make the first mini-batch reproducible — its membership is the
-# first 33 non-degenerate groups to COMPLETE, which depends on wall-clock
-# scheduling. Different seeds simply guarantee different prompts/samples, so
-# repeated runs sample the distribution of the auto-captured base.
+# Seeds set: data.seed (dataloader prompt shuffle — the knob that actually
+# varies the sampled mini-batch across runs) and
+# replay_buffer.sampling_seed (inert at update 1, set for hygiene).
+# fsdp_config.seed stays at its fixed default (42). The vLLM sampling seed is
+# NOT settable in this fork: RolloutConfig is a strict dataclass without a
+# 'seed' field, so a +actor_rollout_ref.rollout.seed override crashes worker
+# init (verified 2026-08-18); the engine runs at its default seed, and
+# continuous-batching nondeterminism varies generations anyway. NOTE: even a
+# fixed seed does not make the first mini-batch reproducible — its membership
+# is the first 33 non-degenerate groups to COMPLETE, which depends on
+# wall-clock scheduling. Different seeds simply guarantee different prompts,
+# so repeated runs sample the distribution of the auto-captured base.
 #
 # The rollouter's prompt budget (total_rollout_steps) counts prompts BEFORE
 # the degenerate-group filter, so a budget of exactly 33 can starve the first
@@ -97,7 +102,6 @@ setsid env \
     replay_sampling_seed="${SEED}" \
     bash "${base_script}" \
     data.seed="${SEED}" \
-    +actor_rollout_ref.rollout.seed="${SEED}" \
     > "${run_log}" 2>&1 &
 run_pid=$!
 
