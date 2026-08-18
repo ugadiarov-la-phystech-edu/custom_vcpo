@@ -31,6 +31,8 @@ harness style as test_skip_recompute_old_log_prob_on_cpu.py):
 Run: pytest tests/workers/actor/test_dp_actor_ess_on_cpu.py
 """
 
+import math
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -124,7 +126,9 @@ def _make_batch(
     assert len(seq_is_targets) == BATCH_SIZE
     rollout_log_probs = torch.zeros(BATCH_SIZE, resp_len)
     for i, w in enumerate(seq_is_targets):
-        rollout_log_probs[i, :] = -torch.log(torch.tensor(float(w))) / resp_len
+        # float64 log so extreme targets (e^±hundreds) stay expressible; the
+        # per-token value itself is small and fits fp32 comfortably
+        rollout_log_probs[i, :] = -torch.log(torch.tensor(float(w), dtype=torch.float64)).float() / resp_len
 
     adv = torch.ones(BATCH_SIZE, resp_len)
     if advantages is not None:
@@ -435,6 +439,38 @@ class TestBf16Ess:
         # dominant-weight batch: ESS ~ 1, ratio ~ 1/B = 0.25; only input
         # quantization (~0.4% per token value) may perturb it
         assert entry["minibatch_ess_ratio"] == pytest.approx(0.25, rel=0.05)
+
+
+class TestLogspaceEssRegressions:
+    """End-to-end regressions for the log-space ESS fix, reproducing what the
+    2026-08 fsdp2 replay run hit through the REAL update_policy path."""
+
+    def test_overflow_dominant_weight_no_longer_zeroes_lr(self):
+        """One sequence with log-weight +60 (w ~ e^60): the raw-space pipeline
+        overflowed the fp32 squared sum, read ESS ratio = 0.0, and stepped at
+        lr = 0 — a silently skipped update. The true ratio is ~1/B: maximum
+        brake, but a real step."""
+        actor = _make_actor(_ess_config(base_ess_ratio=1.0))
+        stepped = _record_stepped_lrs(actor)
+        metrics = actor.update_policy(_make_batch([math.exp(60.0), 1.0, 1.0, 1.0]))
+        (entry,) = metrics["staleness/ess"]
+        assert entry["minibatch_ess_ratio"] == pytest.approx(0.25, rel=1e-6)
+        # clipped weights are [2, 1, 1, 1] -> ESS = 25/7, exact on the clipped path too
+        assert entry["minibatch_ess_ratio_clipped"] == pytest.approx(25.0 / 28.0, rel=1e-6)
+        # legacy rule: min(1, 0.25/1.0) = 0.25, sqrt -> half the nominal LR, not zero
+        assert stepped == [pytest.approx(NOMINAL_LR * 0.25**0.5, rel=1e-4)]
+
+    def test_deep_underflow_equal_weights_run_unbraked(self):
+        """All weights e^-138 (raw-space fp32: every weight flushed to 0.0,
+        ESS ratio read 0 -> lr 0). Identical weights mean ESS ratio = 1:
+        the brake must not engage at all."""
+        actor = _make_actor(_ess_config(base_ess_ratio=1.0))
+        stepped = _record_stepped_lrs(actor)
+        metrics = actor.update_policy(_make_batch([1e-60] * BATCH_SIZE))
+        (entry,) = metrics["staleness/ess"]
+        assert entry["minibatch_ess_ratio"] == pytest.approx(1.0, rel=1e-6)
+        assert entry["minibatch_ess_ratio_clipped"] == pytest.approx(1.0, rel=1e-6)
+        assert stepped == [pytest.approx(NOMINAL_LR)]
 
 
 class TestGuards:

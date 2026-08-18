@@ -39,7 +39,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-from verl.workers.utils.ess import compute_ess_lr_scale, resolve_ess_base
+from verl.workers.utils.ess import compute_ess_lr_scale, compute_global_ess_from_log_weights, resolve_ess_base
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -379,24 +379,20 @@ class DataParallelPPOActor(BasePPOActor):
     def _ess_scaled_optimizer_step(
         self,
         minibatch_idx: int,
-        seq_is: list[float],
-        seq_is_clipped: list[float],
+        seq_log_is: list[float],
+        rollout_is_threshold: float | None,
         ess_base_override: float | None,
     ):
         """ESS-braked optimizer step (VCPO), mirroring the Megatron
         _optimizer_step_with_buffer contract: compute the mini-batch ESS ratio
-        globally over the DP group from the collected per-sequence IS ratios,
+        globally over the DP group from the collected per-sequence LOG IS
+        ratios (max-shifted exp — exact for weights anywhere on the fp range),
         scale the LR by the sqrt/linear rule when the trigger engages, step,
         restore the nominal LR, and return the structured staleness/ess entry
         the fully-async trainer consumes (_capture_ess_base, replay metrics)."""
-        from recipe.fully_async_policy.staleness_utils import compute_global_ess_ratio
-
         ess_cfg = self.config.ess_scaling
-        ess, ess_ratio, *_ = compute_global_ess_ratio(
-            sum(seq_is), sum(w * w for w in seq_is), len(seq_is)
-        )
-        ess_clipped, ess_ratio_clipped, *_ = compute_global_ess_ratio(
-            sum(seq_is_clipped), sum(w * w for w in seq_is_clipped), len(seq_is_clipped)
+        ess, ess_ratio, ess_clipped, ess_ratio_clipped, _ = compute_global_ess_from_log_weights(
+            seq_log_is, rollout_is_threshold
         )
         ess_ratio_for_scaling = ess_ratio_clipped if ess_cfg.use_clipped else ess_ratio
 
@@ -598,8 +594,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                minibatch_seq_is: list[float] = []
-                minibatch_seq_is_clipped: list[float] = []
+                minibatch_seq_log_is: list[float] = []
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -670,10 +665,13 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob = model_inputs["old_log_probs"]
 
                     if ess_enabled:
-                        # Per-sequence IS ratios vs the behavior policy, anchored on
-                        # this update's own forward (same anchor compute_is_info uses
-                        # on the Megatron path). Computed on the ORIGINAL response
-                        # mask — the veto-modified mask applies to the loss only.
+                        # Per-sequence LOG IS ratios vs the behavior policy, anchored
+                        # on this update's own forward (same anchor compute_is_info
+                        # uses on the Megatron path). Computed on the ORIGINAL
+                        # response mask — the veto-modified mask applies to the loss
+                        # only. Kept in log space: exp and clip happen max-shifted
+                        # inside compute_global_ess_from_log_weights, so weights of
+                        # e^±hundreds no longer over/underflow the ESS sums.
                         with torch.no_grad():
                             # fp32 throughout: a bf16 running sum over thousands of
                             # tokens loses the per-token increments entirely once the
@@ -681,12 +679,7 @@ class DataParallelPPOActor(BasePPOActor):
                             is_mask = model_inputs["response_mask"].to(torch.float32)
                             log_ratio = log_prob.detach().float() - model_inputs["rollout_log_probs"].float()
                             seq_log_ratio = (log_ratio * is_mask).sum(-1)
-                            for seq_is in torch.exp(seq_log_ratio).tolist():
-                                minibatch_seq_is.append(float(seq_is))
-                                if rollout_is_threshold is not None and float(rollout_is_threshold) > 0:
-                                    minibatch_seq_is_clipped.append(min(float(seq_is), float(rollout_is_threshold)))
-                                else:
-                                    minibatch_seq_is_clipped.append(float(seq_is))
+                            minibatch_seq_log_is.extend(float(v) for v in seq_log_ratio.tolist())
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
@@ -776,7 +769,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if ess_enabled:
                     grad_norm, ess_entry = self._ess_scaled_optimizer_step(
-                        minibatch_counter, minibatch_seq_is, minibatch_seq_is_clipped, ess_base_override
+                        minibatch_counter, minibatch_seq_log_is, rollout_is_threshold, ess_base_override
                     )
                     mini_batch_metrics = {
                         "actor/grad_norm": grad_norm.detach().item(),
