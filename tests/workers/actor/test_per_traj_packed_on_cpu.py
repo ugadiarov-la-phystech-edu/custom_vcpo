@@ -151,8 +151,9 @@ def _make_actor(ess_scaling=None, seq_log_is_per_microbatch=None) -> tuple[Megat
         calls["fbb_meta"].append(dict(data.meta_info))
         outputs = []
         for rows in seq_log_is_per_microbatch:
-            # loss_func stores the row list in stats; append_to_dict wraps it
-            outputs.append([{"_ess/seq_log_is": [list(rows)], "actor/pg_loss": [0.0]}, None, None, None])
+            # loss_func stores the row list in stats; append_to_dict EXTENDS
+            # list values, so the per-micro-batch metrics carry flat floats
+            outputs.append([{"_ess/seq_log_is": list(rows), "actor/pg_loss": [0.0]}, None, None, None])
         return {"output": outputs, "indices": [[0, 1], [2]]}
 
     actor.forward_backward_batch = fake_forward_backward_batch

@@ -1140,8 +1140,9 @@ class MegatronPPOActor(BasePPOActor):
             seq_log_is: list[float] = []
             for metric in output["output"]:
                 metric_dict = metric[0]
-                for row_sums in metric_dict.pop("_ess/seq_log_is", []):
-                    seq_log_is.extend(float(v) for v in row_sums)
+                # append_to_dict EXTENDS list values, so each micro-batch's
+                # metrics dict carries its rows' log-IS sums as flat floats.
+                seq_log_is.extend(float(v) for v in metric_dict.pop("_ess/seq_log_is", []))
                 append_to_dict(metrics, metric_dict)
 
             update_successful, minibatch_metrics = self._ess_scaled_optimizer_step_packed(
