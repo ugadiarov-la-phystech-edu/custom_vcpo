@@ -19,11 +19,10 @@ These drive the REAL dp_actor.update_policy on a stub linear model (same
 harness style as test_skip_recompute_old_log_prob_on_cpu.py):
 
 - staleness/ess structured metrics are emitted per mini-batch with the same
-  keys the fully-async trainer consumes (_capture_ess_base, replay metrics);
-- the brake scales the stepped LR by sqrt(ess_ratio/base) below the trigger,
-  leaves it nominal at/above it, and always restores the nominal LR;
-- base_ess_ratio=None resolves to meta_info["ess_base_override"] (auto-base),
-  and stays a no-op while the override is unresolved;
+  keys the fully-async trainer consumes (replay metrics);
+- the min-ESS brake steps at lr * lr_scale when the global ESS is <= min_ess
+  effective samples (inclusive), leaves the lr nominal above it, and always
+  restores the nominal LR — no measured reference, no base capture;
 - seq_adv_post_scale computes the clipped loss with UNIT advantages and
   post-scales per sequence — asserted to differ from in-loss advantages
   exactly where the clip branch would flip (negative advantages).
@@ -156,12 +155,12 @@ def _make_batch(
 
 
 def _ess_config(**ess_overrides) -> FSDPActorConfig:
-    return _make_config(ess_scaling=ESSScalingConfig(enable=True, scaling_rule="sqrt", **ess_overrides))
+    return _make_config(ess_scaling=ESSScalingConfig(enable=True, **ess_overrides))
 
 
 class TestEssMetrics:
     def test_entry_emitted_with_trainer_contract_keys(self):
-        actor = _make_actor(_ess_config(base_ess_ratio=1.0))
+        actor = _make_actor(_ess_config())
         metrics = actor.update_policy(_make_batch([1.0, 1.0, 1.0, 1.0]))
         (entry,) = metrics["staleness/ess"]
         assert set(entry.keys()) >= {
@@ -171,17 +170,17 @@ class TestEssMetrics:
             "minibatch_ess_ratio",
             "minibatch_ess_ratio_clipped",
             "ess_scaled_lr",
-            "base_ess_ratio",
         }
         # equal weights -> ESS = B, ratio = 1 (clipped and unclipped)
         assert entry["minibatch_ess"] == pytest.approx(BATCH_SIZE, rel=1e-4)
         assert entry["minibatch_ess_ratio"] == pytest.approx(1.0, rel=1e-4)
         assert entry["minibatch_ess_ratio_clipped"] == pytest.approx(1.0, rel=1e-4)
-        assert entry["base_ess_ratio"] == 1.0
+        # the removed auto-base reference must not reappear in the contract
+        assert "base_ess_ratio" not in entry
 
     def test_degenerate_weights_give_low_ess_ratio(self):
         # one dominant weight -> ESS ~ 1, ratio ~ 1/B
-        actor = _make_actor(_ess_config(base_ess_ratio=1.0))
+        actor = _make_actor(_ess_config())
         metrics = actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))
         (entry,) = metrics["staleness/ess"]
         assert entry["minibatch_ess"] == pytest.approx(1.0, rel=1e-4)
@@ -194,41 +193,42 @@ class TestEssMetrics:
 
 
 class TestEssBrake:
-    def test_brake_scales_stepped_lr_below_trigger(self):
-        actor = _make_actor(_ess_config(base_ess_ratio=1.0, trigger_ratio=0.5))
+    def test_degenerate_batch_brakes_at_lr_scale(self):
+        # one dominant weight -> ESS ~ 1 <= min_ess 1.1 -> lr * 0.5, restored after
+        actor = _make_actor(_ess_config())
         stepped = _record_stepped_lrs(actor)
-        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ratio 0.25 < 0.5
-        assert stepped == [pytest.approx(NOMINAL_LR * 0.25**0.5, rel=1e-4)]
+        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))
+        assert stepped == [pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)]
         assert actor.actor_optimizer.param_groups[0]["lr"] == pytest.approx(NOMINAL_LR)
 
-    def test_full_lr_at_or_above_trigger(self):
-        actor = _make_actor(_ess_config(base_ess_ratio=0.25, trigger_ratio=0.5))
+    def test_healthy_batch_runs_full_lr(self):
+        # equal weights -> ESS = 4 > min_ess 1.1 -> nominal lr
+        actor = _make_actor(_ess_config())
         stepped = _record_stepped_lrs(actor)
-        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ratio 0.25/0.25 = 1 >= 0.5
+        actor.update_policy(_make_batch([1.0, 1.0, 1.0, 1.0]))
         assert stepped == [pytest.approx(NOMINAL_LR)]
 
-    def test_legacy_rule_without_trigger(self):
-        actor = _make_actor(_ess_config(base_ess_ratio=0.5))
+    def test_boundary_is_inclusive(self):
+        # equal weights give ESS exactly 4.0 (all shifted exponents are 1.0);
+        # min_ess = 4.0 -> ESS <= min_ess brakes
+        actor = _make_actor(_ess_config(min_ess=4.0))
         stepped = _record_stepped_lrs(actor)
-        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ratio 0.25/0.5 = 0.5
-        assert stepped == [pytest.approx(NOMINAL_LR * 0.5**0.5, rel=1e-4)]
+        actor.update_policy(_make_batch([1.0, 1.0, 1.0, 1.0]))
+        assert stepped == [pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)]
 
-    def test_auto_base_uses_meta_override(self):
-        actor = _make_actor(_ess_config(base_ess_ratio=None, trigger_ratio=0.5))
+    def test_lr_scale_value_applies(self):
+        actor = _make_actor(_ess_config(lr_scale=0.25))
         stepped = _record_stepped_lrs(actor)
-        batch = _make_batch([8.0, 1e-8, 1e-8, 1e-8])
-        batch.meta_info["ess_base_override"] = 1.0
-        metrics = actor.update_policy(batch)
-        (entry,) = metrics["staleness/ess"]
-        assert entry["base_ess_ratio"] == 1.0
-        assert stepped == [pytest.approx(NOMINAL_LR * 0.5, rel=1e-4)]
+        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))
+        assert stepped == [pytest.approx(NOMINAL_LR * 0.25, rel=1e-6)]
 
-    def test_unresolved_auto_base_is_a_noop(self):
-        actor = _make_actor(_ess_config(base_ess_ratio=None))
+    def test_use_clipped_selects_the_clipped_ess(self):
+        """Dominant weight e^60: unclipped ESS = 1 (would brake), clipped ESS
+        = 25/7 > 1.1 (clipping at 2.0 amputates the dominance). With
+        use_clipped=True the brake must judge by the clipped value."""
+        actor = _make_actor(_ess_config(use_clipped=True))
         stepped = _record_stepped_lrs(actor)
-        metrics = actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))
-        (entry,) = metrics["staleness/ess"]
-        assert entry["base_ess_ratio"] is None
+        actor.update_policy(_make_batch([math.exp(60.0), 1.0, 1.0, 1.0]))
         assert stepped == [pytest.approx(NOMINAL_LR)]
 
 
@@ -329,7 +329,7 @@ class TestSeqAdvPostScale:
         # the full script configuration: parity loss + ESS brake together
         config = _make_config(
             seq_adv_post_scale=True,
-            ess_scaling=ESSScalingConfig(enable=True, scaling_rule="sqrt", base_ess_ratio=1.0, trigger_ratio=0.33333),
+            ess_scaling=ESSScalingConfig(enable=True, min_ess=1.1, lr_scale=0.5),
         )
         actor = _make_actor(config)
         metrics = actor.update_policy(_make_batch([1.0] * BATCH_SIZE, advantages=[1.0, -1.0, 0.5, 0.0]))
@@ -349,7 +349,7 @@ class TestMicroBatchInvariance:
             actor = _make_actor(
                 _make_config(
                     ppo_micro_batch_size_per_gpu=micro,
-                    ess_scaling=ESSScalingConfig(enable=True, base_ess_ratio=1.0),
+                    ess_scaling=ESSScalingConfig(enable=True),
                 )
             )
             (entry,) = actor.update_policy(_make_batch(weights))["staleness/ess"]
@@ -371,25 +371,46 @@ class TestMicroBatchInvariance:
 
 
 class TestTrainerContract:
-    def test_entries_survive_reduce_metrics_and_auto_base_capture(self):
+    def test_entries_survive_reduce_metrics(self):
         """Pin the exact consumption path of the fully-async trainer:
-        worker metrics -> reduce_metrics -> _capture_ess_base-style read."""
+        worker metrics -> reduce_metrics -> structured staleness/ess entries
+        (replay metrics read ess_scaled_lr; process_structured_metrics reads
+        the ratio keys)."""
         from verl.utils.metric import reduce_metrics
 
-        actor = _make_actor(_ess_config(base_ess_ratio=None))
+        actor = _make_actor(_ess_config())
         metrics = actor.update_policy(_make_batch([1.0] * BATCH_SIZE))
         reduced = reduce_metrics(metrics)
 
         entries = reduced["staleness/ess"]
         assert isinstance(entries, list) and all(isinstance(e, dict) for e in entries)
-        # _capture_ess_base (fully_async_trainer): mean of minibatch_ess_ratio
-        key = "minibatch_ess_ratio"
-        values = [float(e[key]) for e in entries if isinstance(e, dict) and e.get(key) is not None]
-        assert values
-        captured_base = float(sum(values) / len(values))
-        assert captured_base == pytest.approx(1.0, rel=1e-4)
+        (entry,) = entries
+        assert entry["minibatch_ess_ratio"] == pytest.approx(1.0, rel=1e-4)
+        assert entry["ess_scaled_lr"] == pytest.approx(NOMINAL_LR)  # healthy batch: unbraked
         # scalar metrics still reduce to floats next to the structured key
         assert isinstance(reduced["actor/grad_norm"], float)
+
+    def test_full_consumer_chain_braked_step(self):
+        """Real actor entries through the trainer's actual consumers:
+        reduce_metrics -> _add_replay_metrics (replay/ess_scaled_lr) and
+        process_structured_metrics (staleness/* scalars) — with the braked
+        lr surfaced and no base_ess_ratio anywhere."""
+        from recipe.fully_async_policy.detach_utils import process_structured_metrics
+        from verl.utils.metric import reduce_metrics
+
+        actor = _make_actor(_ess_config())
+        metrics = actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ESS ~ 1 -> braked
+        reduced = reduce_metrics(metrics)
+        entries = reduced["staleness/ess"]
+
+        # _add_replay_metrics reads ess_scaled_lr from the entries
+        scaled_lrs = [float(e["ess_scaled_lr"]) for e in entries if e.get("ess_scaled_lr") is not None]
+        assert scaled_lrs == [pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)]
+
+        payload = process_structured_metrics({"staleness/ess": entries}, allow_media=False)
+        assert payload["staleness/ess_ratio"] == pytest.approx(0.25, rel=1e-4)
+        assert payload["actor/ess_scaled_lr"] == pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)
+        assert "staleness/base_ess_ratio" not in payload
 
 
 class TestMultiMiniBatch:
@@ -404,7 +425,7 @@ class TestMultiMiniBatch:
             ppo_mini_batch_size=2,
             ppo_micro_batch_size_per_gpu=1,
             ppo_epochs=2,
-            ess_scaling=ESSScalingConfig(enable=True, base_ess_ratio=1.0),
+            ess_scaling=ESSScalingConfig(enable=True),
         )
         actor = _make_actor(config)
         metrics = actor.update_policy(_make_batch([1.0, 1.0, 8.0, 1e-8]))
@@ -424,7 +445,7 @@ class TestBf16Ess:
         2.0 is ~0.008 vs per-token terms ~5e-4). The fp32 IS computation must
         keep the ESS ratio at the analytic value."""
         resp_len = 4096
-        actor = _make_actor(_ess_config(base_ess_ratio=1.0))
+        actor = _make_actor(_ess_config())
         orig_forward = actor._forward_micro_batch
 
         def bf16_forward(model_inputs, temperature, calculate_entropy=False):
@@ -450,21 +471,21 @@ class TestLogspaceEssRegressions:
         overflowed the fp32 squared sum, read ESS ratio = 0.0, and stepped at
         lr = 0 — a silently skipped update. The true ratio is ~1/B: maximum
         brake, but a real step."""
-        actor = _make_actor(_ess_config(base_ess_ratio=1.0))
+        actor = _make_actor(_ess_config())
         stepped = _record_stepped_lrs(actor)
         metrics = actor.update_policy(_make_batch([math.exp(60.0), 1.0, 1.0, 1.0]))
         (entry,) = metrics["staleness/ess"]
         assert entry["minibatch_ess_ratio"] == pytest.approx(0.25, rel=1e-6)
         # clipped weights are [2, 1, 1, 1] -> ESS = 25/7, exact on the clipped path too
         assert entry["minibatch_ess_ratio_clipped"] == pytest.approx(25.0 / 28.0, rel=1e-6)
-        # legacy rule: min(1, 0.25/1.0) = 0.25, sqrt -> half the nominal LR, not zero
-        assert stepped == [pytest.approx(NOMINAL_LR * 0.25**0.5, rel=1e-4)]
+        # min-ESS rule: ESS = 1 <= min_ess 1.1 -> lr * 0.5, never zero
+        assert stepped == [pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)]
 
     def test_deep_underflow_equal_weights_run_unbraked(self):
         """All weights e^-138 (raw-space fp32: every weight flushed to 0.0,
         ESS ratio read 0 -> lr 0). Identical weights mean ESS ratio = 1:
         the brake must not engage at all."""
-        actor = _make_actor(_ess_config(base_ess_ratio=1.0))
+        actor = _make_actor(_ess_config())
         stepped = _record_stepped_lrs(actor)
         metrics = actor.update_policy(_make_batch([1e-60] * BATCH_SIZE))
         (entry,) = metrics["staleness/ess"]
@@ -475,13 +496,13 @@ class TestLogspaceEssRegressions:
 
 class TestGuards:
     def test_missing_rollout_log_probs_raises_for_ess(self):
-        actor = _make_actor(_ess_config(base_ess_ratio=1.0))
+        actor = _make_actor(_ess_config())
         batch = _make_batch([1.0] * BATCH_SIZE, skip_recompute=False, include_rollout_log_probs=False)
         with pytest.raises(ValueError, match="ess_scaling"):
             actor.update_policy(batch)
 
     def test_multiple_param_groups_scaled_and_restored(self):
-        config = _ess_config(base_ess_ratio=1.0, trigger_ratio=0.5)
+        config = _ess_config()
         module = nn.Linear(1, 1, bias=True)
         with torch.no_grad():
             module.weight.zero_()
@@ -510,7 +531,7 @@ class TestGuards:
 
         actor.actor_optimizer.step = recording_step
 
-        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ratio 0.25 < trigger 0.5
+        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ESS ~ 1 <= min_ess
         assert stepped == [(pytest.approx(0.1 * 0.5), pytest.approx(0.05 * 0.5))]
         assert [float(pg["lr"]) for pg in actor.actor_optimizer.param_groups] == [
             pytest.approx(0.1),
@@ -522,7 +543,7 @@ class TestGuards:
         plain-float reassignment ("lr was changed to a non-Tensor object") —
         the brake must mutate via fill_ and keep the object identity.
         Regression: smoke run 2026-08-17, update 2 crash on the bf16-sr arm."""
-        config = _ess_config(base_ess_ratio=1.0, trigger_ratio=0.5)
+        config = _ess_config()
         module = nn.Linear(1, 1, bias=False)
         with torch.no_grad():
             module.weight.zero_()
@@ -558,7 +579,7 @@ class TestGuards:
 
         actor._forward_micro_batch = fake_forward
 
-        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ratio 0.25 < trigger 0.5
+        actor.update_policy(_make_batch([8.0, 1e-8, 1e-8, 1e-8]))  # ESS ~ 1 <= min_ess
         assert guard.stepped_lrs == [pytest.approx(0.1 * 0.5)]
         pg_lr = actor.actor_optimizer.param_groups[0]["lr"]
         assert pg_lr is lr_tensor  # identity preserved: mutated in place, never replaced

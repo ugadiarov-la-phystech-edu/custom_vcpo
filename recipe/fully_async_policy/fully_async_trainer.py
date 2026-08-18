@@ -202,27 +202,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
             self.replay_updates_done = 0
             self.rollout_done = False
-            # Auto-calibrated ESS reference: with ess_scaling.enable=True and
-            # base_ess_ratio=null, the first update runs unscaled and its
-            # measured (on-policy, staleness-0 warm-up) ESS ratio becomes the
-            # base, passed to the actor via meta_info["ess_base_override"]
-            # and persisted in replay_buffer.pt across restarts.
-            actor_cfg = config.actor_rollout_ref.actor
-            self.replay_ess_auto_base = bool(
-                actor_cfg.ess_scaling.get("enable", False)
-                and actor_cfg.ess_scaling.get("base_ess_ratio", None) is None
-            )
-            self.replay_ess_use_clipped = bool(actor_cfg.ess_scaling.get("use_clipped", False))
-            self.replay_ess_base = None
-        else:
-            actor_cfg = config.actor_rollout_ref.actor
-            assert not (
-                actor_cfg.ess_scaling.get("enable", False)
-                and actor_cfg.ess_scaling.get("base_ess_ratio", None) is None
-            ), (
-                "ess_scaling.base_ess_ratio=null (auto-calibration from the first update) is only "
-                "supported in replay_buffer mode; set an explicit base_ess_ratio"
-            )
         # Stop-the-world accounting modes: freeze the whole pipeline during
         # validation (trainer blocks instead of training ahead on backlog) and
         # generation during checkpoint saves, so both become pure time
@@ -645,30 +624,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         batch.meta_info["n_resp_per_rollout"] = self.config.actor_rollout_ref.rollout.n
         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-        if self.replay_ess_auto_base:
-            # None until the first update's measurement is captured; the actor
-            # skips LR scaling while the override is unresolved.
-            batch.meta_info["ess_base_override"] = self.replay_ess_base
         return batch
-
-    def _capture_ess_base(self, metrics):
-        """Auto-calibration of ess_scaling.base_ess_ratio: capture the first
-        update's measured ESS ratio (the staleness-0 warm-up mini-batch, i.e.
-        the empirical on-policy rho_on) from the actor's structured
-        staleness/ess entries. No-op once captured. The field matches
-        ess_scaling.use_clipped so the reference and the scaling numerator
-        measure the same quantity."""
-        if self.replay_ess_base is not None:
-            return
-        key = "minibatch_ess_ratio_clipped" if self.replay_ess_use_clipped else "minibatch_ess_ratio"
-        entries = metrics.get("staleness/ess") or []
-        values = [float(e[key]) for e in entries if isinstance(e, dict) and e.get(key) is not None]
-        if values:
-            self.replay_ess_base = float(np.mean(values))
-            print(
-                f"[FullyAsyncTrainer][Replay] auto-calibrated ess_scaling.base_ess_ratio="
-                f"{self.replay_ess_base:.4f} from the first update ({key})"
-            )
 
     def _add_replay_metrics(self, metrics, info, new_version):
         """Item-17 metrics, computed after this update's eviction/rescoring at
@@ -708,18 +664,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         ]
         if scaled_lrs:
             metrics["replay/ess_scaled_lr"] = float(np.mean(scaled_lrs))
-        # base_ess_ratio may evolve during training: prefer the value the actor
-        # actually resolved and used this update (reported in the entries);
-        # fall back to the trainer's captured auto-base.
-        used_bases = [
-            float(e["base_ess_ratio"])
-            for e in ess_entries
-            if isinstance(e, dict) and e.get("base_ess_ratio") is not None
-        ]
-        if used_bases:
-            metrics["replay/ess_base"] = float(np.mean(used_bases))
-        elif getattr(self, "replay_ess_base", None) is not None:
-            metrics["replay/ess_base"] = self.replay_ess_base
 
     REPLAY_HIST_KEYS = ("replay/minibatch_staleness_hist", "replay/buffer_staleness_hist")
 
@@ -773,8 +717,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 with marked_timer("update_actor", timing_raw, color="red"):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
-                if self.replay_ess_auto_base:
-                    self._capture_ess_base(metrics)
                 self._log_rollout(batch, {}, timing_raw)
 
             # Post-update buffer maintenance at the version this update just
@@ -1055,20 +997,14 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         return {
             "buffer": self.replay_buffer.state_dict(),
             "updates_done": self.replay_updates_done,
-            "ess_base": self.replay_ess_base,
         }
 
     def _load_replay_checkpoint_state(self, state: dict) -> None:
+        # Older checkpoints carry an "ess_base" key from the removed
+        # auto-calibration mechanism; it is ignored (the min-ESS brake needs
+        # no measured reference).
         self.replay_buffer.load_state_dict(state["buffer"])
         self.replay_updates_done = int(state.get("updates_done", 0))
-        self.replay_ess_base = state.get("ess_base", None)
-        if self.replay_ess_auto_base and self.replay_ess_base is None:
-            print(
-                "[FullyAsyncTrainer][Replay] WARNING: ess_scaling.base_ess_ratio=null (auto) but the "
-                "checkpoint carries no stored value; it will be captured from the FIRST POST-RESUME "
-                "update, which is NOT on-policy (mature buffer) — prefer an explicit base_ess_ratio "
-                "when resuming from checkpoints predating this feature"
-            )
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """

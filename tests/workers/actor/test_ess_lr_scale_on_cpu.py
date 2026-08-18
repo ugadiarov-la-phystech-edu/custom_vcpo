@@ -11,87 +11,89 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the ESS-brake LR multiplier (verl/workers/utils/ess.py),
-including the ess_scaling.trigger_ratio intervention threshold:
-- legacy behavior (trigger_ratio=None): min(1, ess/base)
-- with a threshold: full lr at or above it, legacy attenuation below it,
-  with the documented discontinuity at the boundary
+"""Unit tests for the min-ESS LR brake (verl/workers/utils/ess.py):
+brake (constant lr_scale multiplier) when the mini-batch's global ESS is
+<= min_ess effective samples (inclusive boundary); full nominal lr above.
+Replaces the removed auto-captured-base + trigger + sqrt/linear logic.
 
 Run: pytest tests/workers/actor/test_ess_lr_scale_on_cpu.py
 """
 
 import pytest
 
-from verl.workers.utils.ess import compute_ess_lr_scale, resolve_ess_base
+from verl.workers.config.actor import ESSScalingConfig
+from verl.workers.utils.ess import compute_min_ess_lr_scale
 
 
-class TestLegacyBehavior:
-    def test_no_attenuation_at_or_above_base(self):
-        assert compute_ess_lr_scale(0.5, 0.5) == 1.0
-        assert compute_ess_lr_scale(0.9, 0.5) == 1.0
+class TestConfigValidation:
+    def test_defaults_construct(self):
+        cfg = ESSScalingConfig()
+        assert cfg.min_ess == 1.1
+        assert cfg.lr_scale == 0.5
+        assert cfg.enable is False
 
-    def test_proportional_attenuation_below_base(self):
-        assert compute_ess_lr_scale(0.25, 0.5) == pytest.approx(0.5)
-        assert compute_ess_lr_scale(0.008, 0.016) == pytest.approx(0.5)
-        assert compute_ess_lr_scale(0.0019, 0.016) == pytest.approx(0.11875)
+    def test_min_ess_below_one_rejected(self):
+        # ESS floors at 1: a threshold below it could never fire
+        with pytest.raises(AssertionError, match="min_ess"):
+            ESSScalingConfig(min_ess=0.9)
 
-    def test_tiny_base_guard(self):
-        # base is floored at 1e-8, never a division by zero
-        assert compute_ess_lr_scale(0.5, 0.0) == 1.0
+    def test_min_ess_of_exactly_one_accepted(self):
+        assert ESSScalingConfig(min_ess=1.0).min_ess == 1.0
 
-    def test_explicit_none_trigger_is_legacy(self):
-        assert compute_ess_lr_scale(0.4, 0.5, None) == pytest.approx(0.8)
-
-
-class TestTriggerRatio:
-    def test_full_lr_at_or_above_threshold(self):
-        # ratio = 0.8 >= trigger 0.5 -> no intervention despite ess < base
-        assert compute_ess_lr_scale(0.4, 0.5, 0.5) == 1.0
-        # exactly at the threshold -> no intervention (strict "less than")
-        assert compute_ess_lr_scale(0.25, 0.5, 0.5) == 1.0
-
-    def test_legacy_attenuation_below_threshold(self):
-        # ratio = 0.4 < trigger 0.5 -> legacy multiplier ess/base
-        assert compute_ess_lr_scale(0.2, 0.5, 0.5) == pytest.approx(0.4)
-        assert compute_ess_lr_scale(0.0019, 0.016, 0.5) == pytest.approx(0.11875)
-
-    def test_discontinuity_at_threshold(self):
-        eps = 1e-9
-        at = compute_ess_lr_scale(0.25, 0.5, 0.5)
-        below = compute_ess_lr_scale(0.25 - eps, 0.5, 0.5)
-        assert at == 1.0
-        assert below == pytest.approx(0.5, abs=1e-6)
-
-    def test_trigger_one_matches_legacy(self):
-        for ess in (0.1, 0.3, 0.5, 0.7):
-            assert compute_ess_lr_scale(ess, 0.5, 1.0) == compute_ess_lr_scale(ess, 0.5)
-
-    def test_trigger_above_one_is_inert(self):
-        # ratios in [1, trigger) would cap at 1 anyway; below 1 the legacy
-        # multiplier applies -> identical to legacy for any input
-        for ess in (0.1, 0.5, 0.9, 1.5):
-            assert compute_ess_lr_scale(ess, 0.5, 2.0) == compute_ess_lr_scale(ess, 0.5)
+    def test_lr_scale_bounds(self):
+        with pytest.raises(AssertionError, match="lr_scale"):
+            ESSScalingConfig(lr_scale=0.0)
+        with pytest.raises(AssertionError, match="lr_scale"):
+            ESSScalingConfig(lr_scale=1.5)
+        assert ESSScalingConfig(lr_scale=1.0).lr_scale == 1.0
 
 
-class TestResolveEssBase:
-    def test_config_value_wins_over_override(self):
-        assert resolve_ess_base(0.016, 0.033) == 0.016
+class TestBrakeSides:
+    def test_brakes_below_threshold(self):
+        assert compute_min_ess_lr_scale(1.0, 1.1, 0.5) == 0.5
+        assert compute_min_ess_lr_scale(1.05, 1.1, 0.5) == 0.5
 
-    def test_none_config_falls_back_to_override(self):
-        assert resolve_ess_base(None, 0.033) == 0.033
+    def test_full_lr_above_threshold(self):
+        assert compute_min_ess_lr_scale(1.1000001, 1.1, 0.5) == 1.0
+        assert compute_min_ess_lr_scale(2.0, 1.1, 0.5) == 1.0
+        assert compute_min_ess_lr_scale(528.0, 1.1, 0.5) == 1.0
 
-    def test_unresolved_returns_none(self):
-        assert resolve_ess_base(None, None) is None
+    def test_boundary_is_inclusive(self):
+        # ess == min_ess brakes (the rule is ESS <= min_ess)
+        assert compute_min_ess_lr_scale(1.1, 1.1, 0.5) == 0.5
 
-    def test_explicit_zero_config_wins(self):
-        # 0.0 is an explicit (if degenerate) config value, not "unset".
-        assert resolve_ess_base(0.0, 0.033) == 0.0
+    def test_constant_multiplier_no_shaping(self):
+        # The multiplier does not depend on HOW far below the threshold the
+        # ESS sits — no sqrt/linear shaping, just lr_scale.
+        assert compute_min_ess_lr_scale(1.0, 1.1, 0.5) == compute_min_ess_lr_scale(1.0999, 1.1, 0.5)
 
 
-class TestZeroBaseGuard:
-    def test_zero_base_never_divides_by_zero(self):
-        # base clamped to 1e-8 -> huge ratio, capped at full lr
-        assert compute_ess_lr_scale(0.5, 0.0) == 1.0
+class TestStructuralFloor:
+    def test_exact_floor_ess_brakes_at_lr_scale_never_zero(self):
+        """The max-shifted ESS computation floors ESS at exactly 1 for any
+        non-empty batch (single dominant sequence). With min_ess >= 1 that
+        always brakes — and the multiplier is exactly lr_scale, never 0."""
+        scale = compute_min_ess_lr_scale(1.0, 1.1, 0.5)
+        assert scale == 0.5
+        assert scale > 0.0
 
-    def test_zero_ess_and_zero_base_gives_zero(self):
-        assert compute_ess_lr_scale(0.0, 0.0) == 0.0
+    def test_empty_batch_is_a_noop(self):
+        # ess == 0 only happens for an empty global batch: no scaling.
+        assert compute_min_ess_lr_scale(0.0, 1.1, 0.5) == 1.0
+
+
+class TestParameters:
+    def test_lr_scale_value_passes_through(self):
+        assert compute_min_ess_lr_scale(1.0, 1.1, 0.25) == 0.25
+        assert compute_min_ess_lr_scale(1.0, 1.1, 1.0) == 1.0
+
+    def test_min_ess_moves_the_threshold(self):
+        # min_ess = 2: two-effective-sample batches now brake too
+        assert compute_min_ess_lr_scale(1.9, 2.0, 0.5) == 0.5
+        assert compute_min_ess_lr_scale(2.1, 2.0, 0.5) == 1.0
+
+    def test_defaults_documented_values(self):
+        # Production defaults: min_ess = 1.1 (10% above the structural floor,
+        # i.e. ratio 1.1/528 ~= 0.002083 at B = 528), lr_scale = 0.5.
+        assert compute_min_ess_lr_scale(1.0, 1.1, 0.5) == 0.5
+        assert compute_min_ess_lr_scale(1.2, 1.1, 0.5) == 1.0

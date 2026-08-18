@@ -232,21 +232,18 @@ ess_scaling:
   # Target dataclass for this configuration
   _target_: verl.workers.config.ESSScalingConfig
 
-  # Whether to enable ESS based learning-rate scaling
+  # Whether to enable min-ESS based learning-rate scaling
   enable: false
 
-  # Scaling rule for learning-rate multiplier: "sqrt" or "linear"
-  scaling_rule: sqrt
+  # Min-ESS brake threshold, in effective samples: a mini-batch whose global
+  # ESS is <= min_ess (inclusive) steps at lr * lr_scale; above it the update
+  # runs at full nominal lr. Equivalent to ess_ratio <= min_ess / B. ESS is
+  # structurally floored at 1, so min_ess >= 1 makes degenerate mini-batches
+  # always brake — at lr * lr_scale, never 0
+  min_ess: 1.1
 
-  # Baseline ESS ratio used to compute LR multiplier. null = auto-calibrate
-  # from the first update's measured ESS (replay-buffer trainer only)
-  base_ess_ratio: null
+  # Constant lr multiplier applied on braked steps (no sqrt/linear shaping)
+  lr_scale: 0.5
 
   # Whether to use clipped ESS ratio instead of unclipped ESS ratio
   use_clipped: false
-
-  # Intervention threshold on ess_ratio / base_ess_ratio: scaling engages only
-  # for mini-batches where the ratio falls BELOW this value; at or above it the
-  # update runs at full nominal lr. null = legacy behavior (engage whenever
-  # ratio < 1). The lr multiplier jumps from 1 to rule(ratio) at the threshold.
-  trigger_ratio: null

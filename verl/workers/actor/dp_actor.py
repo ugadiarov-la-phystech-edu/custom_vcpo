@@ -39,7 +39,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-from verl.workers.utils.ess import compute_ess_lr_scale, compute_global_ess_from_log_weights, resolve_ess_base
+from verl.workers.utils.ess import compute_global_ess_from_log_weights, compute_min_ess_lr_scale
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -381,36 +381,24 @@ class DataParallelPPOActor(BasePPOActor):
         minibatch_idx: int,
         seq_log_is: list[float],
         rollout_is_threshold: float | None,
-        ess_base_override: float | None,
     ):
-        """ESS-braked optimizer step (VCPO), mirroring the Megatron
-        _optimizer_step_with_buffer contract: compute the mini-batch ESS ratio
-        globally over the DP group from the collected per-sequence LOG IS
-        ratios (max-shifted exp — exact for weights anywhere on the fp range),
-        scale the LR by the sqrt/linear rule when the trigger engages, step,
-        restore the nominal LR, and return the structured staleness/ess entry
-        the fully-async trainer consumes (_capture_ess_base, replay metrics)."""
+        """Min-ESS-braked optimizer step: compute the mini-batch ESS globally
+        over the DP group from the collected per-sequence LOG IS ratios
+        (max-shifted exp — exact for weights anywhere on the fp range, ESS
+        floored at 1), step at lr * lr_scale when ESS <= min_ess (full nominal
+        lr otherwise), restore the nominal LR, and return the structured
+        staleness/ess entry the fully-async trainer consumes."""
         ess_cfg = self.config.ess_scaling
         ess, ess_ratio, ess_clipped, ess_ratio_clipped, _ = compute_global_ess_from_log_weights(
             seq_log_is, rollout_is_threshold
         )
-        ess_ratio_for_scaling = ess_ratio_clipped if ess_cfg.use_clipped else ess_ratio
+        ess_for_scaling = ess_clipped if ess_cfg.use_clipped else ess
 
-        ess_base = resolve_ess_base(ess_cfg.get("base_ess_ratio", None), ess_base_override)
         param_groups = self.actor_optimizer.param_groups
         base_lrs = [float(pg["lr"]) for pg in param_groups]
         scaled = False
-        if ess_base is not None and param_groups:
-            lr_scale = compute_ess_lr_scale(
-                float(ess_ratio_for_scaling), float(ess_base), ess_cfg.get("trigger_ratio", None)
-            )
-            scaling_rule = ess_cfg.scaling_rule
-            if scaling_rule == "sqrt":
-                lr_mult = lr_scale**0.5
-            elif scaling_rule == "linear":
-                lr_mult = lr_scale
-            else:
-                raise NotImplementedError(f"{scaling_rule} not implemented for ESS scaling")
+        if param_groups:
+            lr_mult = compute_min_ess_lr_scale(float(ess_for_scaling), ess_cfg.min_ess, ess_cfg.lr_scale)
             for pg, base_lr in zip(param_groups, base_lrs, strict=True):
                 self._set_param_group_lr(pg, base_lr * lr_mult)
             scaled = True
@@ -430,9 +418,6 @@ class DataParallelPPOActor(BasePPOActor):
             "minibatch_ess_ratio": ess_ratio,
             "minibatch_ess_ratio_clipped": ess_ratio_clipped,
             "ess_scaled_lr": lr,
-            # The reference actually used for scaling this step (config value or
-            # driver override); None while unresolved (scaling is a no-op then).
-            "base_ess_ratio": float(ess_base) if ess_base is not None else None,
         }
         return grad_norm, entry
 
@@ -523,12 +508,10 @@ class DataParallelPPOActor(BasePPOActor):
             if "rollout_log_probs" not in data.batch.keys():
                 raise ValueError("skip_recompute_old_log_prob=True requires rollout_log_probs in batch")
 
-        # ESS-guided LR scaling (VCPO), ported from megatron_actor's per-traj
-        # path: per-sequence IS ratios vs the behavior (rollout) policy are
-        # collected across the mini-batch and the optimizer step's LR is scaled
-        # by the sqrt/linear rule when the ESS ratio falls below the reference.
+        # Min-ESS LR brake: per-sequence IS ratios vs the behavior (rollout)
+        # policy are collected across the mini-batch; the optimizer step runs
+        # at lr * lr_scale when the global ESS is <= min_ess effective samples.
         ess_enabled = getattr(self.config, "ess_scaling", None) is not None and self.config.ess_scaling.enable
-        ess_base_override = data.meta_info.get("ess_base_override", None)
         rollout_is_threshold = None
         if ess_enabled:
             if "rollout_log_probs" not in data.batch.keys():
@@ -769,7 +752,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if ess_enabled:
                     grad_norm, ess_entry = self._ess_scaled_optimizer_step(
-                        minibatch_counter, minibatch_seq_log_is, rollout_is_threshold, ess_base_override
+                        minibatch_counter, minibatch_seq_log_is, rollout_is_threshold
                     )
                     mini_batch_metrics = {
                         "actor/grad_norm": grad_norm.detach().item(),

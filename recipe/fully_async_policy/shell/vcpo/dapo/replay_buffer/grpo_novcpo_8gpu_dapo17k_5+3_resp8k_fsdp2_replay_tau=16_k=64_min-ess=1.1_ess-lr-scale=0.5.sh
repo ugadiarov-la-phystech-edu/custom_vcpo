@@ -8,41 +8,50 @@
 #SBATCH --error=./slurm/%A_%x.err
 #SBATCH --job-name=grpo-novcpo-replay-ess-fsdp2
 
-# bf16 + torchao stochastic-rounding AdamW variant of the FSDP2 triggered
-# ESS-braked replay arm
-# (grpo_novcpo_..._fsdp2_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh),
-# swapping in the trainer precision recipe of the bf16-sr-adamw B33x1 script
-# while KEEPING the base arm's fixed micro-batching (use_dynamic_bsz=False,
-# 1 seq per micro-batch — the exact parity compute pattern):
-#   * fsdp_config.model_dtype=bf16 + torchao _AdamW with bf16 stochastic
-#     rounding, fully GPU-resident (no CPU offload, no fp32 master). Sharded
-#     over dp=3: ~5.5 (bf16 params) + 5.5 (grads) + 10.9 (bf16 moments)
-#     ~= 22 GB static per trainer GPU — HALF the fp32 arm's ~44 GB; with the
-#     10240-token fixed micro-batches the peak drops from the base arm's
-#     ~52-57 GiB to an estimated ~30-35 GiB.
-#   * model_dtype=bf16 is REQUIRED for this: verl builds the FSDP actor in
-#     fp32 by default, which doubles static memory AND makes
-#     bf16_stochastic_round silently inert (SR only acts on bf16 params).
-#     Stochastic rounding makes master-less bf16 updates unbiased — at
-#     lr=1e-6 a deterministic bf16 update rounds to zero for ~98% of weights.
-#   * NUMERICS: this arm gives up the base FSDP2 arm's "fp32 masters, higher
-#     optimizer fidelity than HDO" property. Its bf16-master character is
-#     CLOSER to the winning Megatron HDO trigger-arm
-#     (main_params_dtype=bfloat16 there), but the mechanisms differ — SR with
-#     bf16 moments here vs deterministic rounding with fp32 moments there.
-#     Treat all cross-recipe comparisons as system-level, not ablations.
-#     Checkpoints are NOT interchangeable with the fp32 FSDP2 arms.
-#   * The ESS brake composes unchanged: _ess_scaled_optimizer_step scales the
-#     optimizer param-group LRs, which torchao _AdamW honors like any torch
-#     optimizer. Requires torchao in the environment.
-# Everything else is identical to the base FSDP2 arm: trainer-side replay
+# FSDP2 PORT of the TRIGGERED ESS-braked replay arm
+# (grpo_novcpo_..._megatron_offload_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh).
+# Every algorithmic knob is identical to the Megatron arm: trainer-side replay
 # buffer (tau=16, eviction k=64, rmb=1, sync after every update, DAPO
 # insertion gate, frozen advantages / behavior log-probs), token-IS 2.0
-# against cached behavior log-probs, ESS brake sqrt/base=auto/trigger=1/3
-# attached to the ordinary mini-batch update (dp_actor port),
-# seq_adv_post_scale=True for Megatron per-traj loss parity, B=33 prompts x
-# 16 responses, lr 1e-6 constant, 8K responses, two validation sets,
-# stop-the-world validation/saves.
+# against cached behavior log-probs, ESS brake sqrt/base=auto/trigger=1/3,
+# B=33 prompts x 16 responses, lr 1e-6 constant, 8K responses. Only the
+# training backend changes:
+#   * strategy=fsdp2 on 3 trainer GPUs: params/grads/optimizer fully sharded
+#     over dp=3 -> fp32 masters+moments fit ON GPU (~52-57 GiB total) — NO
+#     CPU offload, NO bf16-master deviation, NO precision-aware workaround.
+#     Higher optimizer fidelity than the Megatron HDO recipe.
+#   * actor.seq_adv_post_scale=True: the dp_actor computes the clipped policy
+#     loss with UNIT advantages and applies each sequence's constant advantage
+#     as a post-clip scale — the exact loss semantics of the Megatron
+#     per-traj path (clip branch selected as if A=1). Without this flag the
+#     FSDP loss would pick the other clip branch for negative advantages and
+#     the arms would not be comparable.
+#   * The ESS brake attaches to the ordinary mini-batch update (dp_actor
+#     port): per-sequence IS ratios vs the cached behavior log-probs, ESS
+#     all-reduced over the world group, LR scaled by sqrt(ess_ratio/base)
+#     below the trigger, staleness/ess metrics identical to the Megatron arm.
+#     (This branch is FSDP2-only: the Megatron per-traj/OPOB machinery and its
+#     update_policy_per_traj / grad_baselining knobs were removed.)
+#   * micro_bsz_per_gpu=1, use_dynamic_bsz=False: not required by the FSDP
+#     path (no per-traj isolation), kept for exact 1/len(minibatch) parity
+#     weighting and closest compute pattern to the Megatron arm. Dynamic bsz
+#     is a later perf knob (parity weighting stays exact under it).
+#   * activation recompute -> model.enable_gradient_checkpointing=True.
+# Comparison caveats vs the Megatron arm: numerics are curve-comparable, not
+# step-comparable (different reduction order, fp32 vs bf16 masters);
+# checkpoints are NOT interchangeable between backends.
+# Validation gates (in order): peak trainer memory ~52-57 GiB and no OOM
+# through a param sync (FSDP all-gather spike); auto-base captured on update
+# 1 (replay/ess_base); brake rate ~30% with the bimodal ESS-quotient
+# distribution of the Megatron arm; early val curve ~0.35@20 / ~0.42@40.
+
+# MIN-ESS UPDATE (2026-08-19): this script was converted from the
+# ess-sqrt_base=auto_trig=0.33333 trigger arm when the brake was reformulated
+# — the auto-captured on-policy base was a one-mini-batch lottery draw (CV 63%
+# across seeds on this backend) and is replaced by the backend-independent
+# min-ESS floor rule (see the Min-ESS LR brake section below). Header text
+# below may still describe the old trigger geometry where it narrates past
+# runs; the ESS block and overrides are authoritative.
 
 set -xeuo pipefail
 
@@ -142,24 +151,23 @@ lr=1e-6
 lr_warmup_steps=0
 weight_decay=0.1
 
-# ================= ESS-guided LR scaling (VCPO, dp_actor port) =================
+# ================= Min-ESS LR brake (dp_actor) =================
 # The ESS brake lives in the standard mini-batch update; seq_adv_post_scale
 # reproduces the Megatron arm's per-traj loss semantics (see header).
 seq_adv_post_scale=True
 ess_enable=${ess_enable:-True}
-ess_rule=${ess_rule:-sqrt}  # sqrt | linear
-# rho_on reference; null = auto-calibrate from the first update's measured
-# ESS (fresh runs only), or set explicitly (1.0 = paper value for math)
-ess_base=${ess_base:-null}
+# Min-ESS rule (replaces the auto-captured-base + trigger + sqrt logic): a
+# mini-batch whose global ESS carries <= min_ess effective samples steps at
+# lr * ess_lr_scale; above it the update runs at full nominal lr. Equivalent
+# to ess_ratio <= min_ess/B (B = 528 here). The log-space ESS floors ESS at
+# exactly 1, so degenerate (single-dominant-sequence) mini-batches always
+# brake — at ess_lr_scale, never 0. No measured reference, no base capture:
+# the threshold is backend-independent, unlike the auto-base (11x apart
+# between the fsdp2 and Megatron arms for near-identical raw ESS traces).
+min_ess=${min_ess:-1.1}
+ess_lr_scale=${ess_lr_scale:-0.5}
 ess_use_clipped=False # ESS from unclipped ratios (paper): the brake must see what truncation hides
-# Intervention threshold on ess_ratio/base: scaling engages only for
-# mini-batches where the ratio falls BELOW this value; at or above it the
-# update runs at full nominal lr. Same trigger geometry as the winning
-# Megatron arm (base/3 deadband on the auto-calibrated reference).
-ess_trigger=${ess_trigger:-0.33333}
-ess_base_tag=${ess_base}
-[ "${ess_base_tag}" = "null" ] && ess_base_tag="auto"
-[ "${ess_trigger}" != "null" ] && ess_base_tag="${ess_base_tag}-trig-${ess_trigger}"
+ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
 
 # ================= IS / Rollout Correction =================
 # Token-level truncated IS with PPO-clip loss against the *cached* behavior
@@ -208,7 +216,7 @@ save_freq=${save_freq:-20}
 max_actor_ckpt_to_keep=1 # keep only the most recent checkpoint
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} fsdp2-noofl sr-adamw B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} fsdp2-noofl B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -261,12 +269,10 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.grad_clip=${grad_clip} \
     actor_rollout_ref.actor.seq_adv_post_scale=${seq_adv_post_scale} \
     actor_rollout_ref.actor.ess_scaling.enable=${ess_enable} \
-    actor_rollout_ref.actor.ess_scaling.scaling_rule=${ess_rule} \
-    actor_rollout_ref.actor.ess_scaling.base_ess_ratio=${ess_base} \
+    actor_rollout_ref.actor.ess_scaling.min_ess=${min_ess} \
+    actor_rollout_ref.actor.ess_scaling.lr_scale=${ess_lr_scale} \
     actor_rollout_ref.actor.ess_scaling.use_clipped=${ess_use_clipped} \
-    actor_rollout_ref.actor.ess_scaling.trigger_ratio=${ess_trigger} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
-    actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
@@ -275,9 +281,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
     actor_rollout_ref.actor.optim.weight_decay=${weight_decay} \
     actor_rollout_ref.actor.optim.clip_grad=${grad_clip} \
-    actor_rollout_ref.actor.optim.optimizer_impl=torchao.optim \
-    actor_rollout_ref.actor.optim.optimizer=_AdamW \
-    "actor_rollout_ref.actor.optim.override_optimizer_config={bf16_stochastic_round:true}" \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Fast OOM/sanity smoke for the bf16-sr-adamw FSDP2 dynbsz replay arm
-# (grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_dynbsz_bf16-sr-adamw_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh).
+# (grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_dynbsz_bf16-sr-adamw_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh).
 #
 # Purpose: verify the UNTESTED memory envelope of that arm on the real model —
 # bf16 params + torchao _AdamW (bf16 stochastic rounding, fully GPU-resident,
 # no fp32 master) sharded over trainer DP=3, with dynamic batching at the
-# raised 30720-token micro-batch budget (estimated peak ~52-60 GiB on 80 GB) —
-# plus the wiring: torchao import/construction, the dp_actor ESS brake with
-# auto-calibrated base + trigger, and the replay loop.
+# arm's default 25600-token micro-batch budget (measured peak ~67-76 GiB on
+# 80 GB in production) —
+# plus the wiring: torchao import/construction, the dp_actor min-ESS brake
+# (lr * ess_lr_scale when ESS <= min_ess), and the replay loop.
 #
-# The memory peak is set by the model size, the 30720-token packed
+# The memory peak is set by the model size, the 25600-token packed
 # micro-batches and the sharded optimizer states — NOT by the mini-batch
 # size — so the smoke keeps Qwen3-8B and the full 2048/8192 sequence lengths
 # and the full token budget, but shrinks the mini-batch to 6 groups
@@ -18,19 +19,18 @@
 # and checkpointing are disabled: fastest possible path to the risky updates.
 #
 # The run is launched in the background, watched until SMOKE_UPDATES (default
-# 2) model updates complete — update 1 captures the auto base_ess_ratio,
-# update 2 is the first potentially-braked step and the first with replayed
-# (stale) groups in the mix — then torn down with the bracketed pkill
-# patterns. Asserts on the log:
+# 2) model updates complete — update 2 is the first potentially-braked step
+# and the first with replayed (stale) groups in the mix — then torn down with
+# the bracketed pkill patterns. Asserts on the log:
 #   1. no Traceback / CUDA OOM anywhere (the main check; a missing torchao
 #      or a model_dtype/SR misconfiguration also surfaces here);
 #   2. >= SMOKE_UPDATES updates completed;
-#   3. base_ess_ratio was auto-calibrated from update 1 (value printed);
-#   4. replay/ess_base and replay/ess_scaled_lr metrics logged (the dp_actor
-#      brake emitted its structured entries and the trainer consumed them).
+#   3. staleness/ess_ratio and replay/ess_scaled_lr logged (the dp_actor
+#      brake emitted its structured entries and the trainer consumed them);
+#   4. no replay/ess_base tag (the removed auto-base must not resurface).
 # Reports per-GPU memory peaks; warns if a trainer GPU (index >= 5 in the
-# 5+3 layout) exceeded 70000 MiB (above the expected ~52-60 GiB band) and
-# flags > 79000 MiB as OOM-risk territory.
+# 5+3 layout) exceeded 78000 MiB (above the ~74-78 GiB band the production
+# run held at this budget) and flags > 80500 MiB as at-the-device-limit.
 #
 # WARNING: tears down ray/vllm/fully_async processes on this host at the end —
 # run only on a box this smoke owns (8 free GPUs).
@@ -47,7 +47,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/../../../../../.."  # repo root, so the fork's verl shadows the installed one
 
-SCRIPT="recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_dynbsz_bf16-sr-adamw_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh"
+SCRIPT="recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_dynbsz_bf16-sr-adamw_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh"
 LOG=${SMOKE_LOG:-logs/smoke_replay_ess_fsdp2_bf16sr_dynbsz_5+3.log}
 MEMLOG="${LOG%.log}.gpumem.csv"
 WANT_UPDATES=${SMOKE_UPDATES:-2}
@@ -55,13 +55,14 @@ DEADLINE=$(($(date +%s) + ${SMOKE_TIMEOUT:-3600}))
 mkdir -p "$(dirname "${LOG}")"
 
 # Ray block-buffers worker stdout: without this the milestone prints
-# (auto-calibrated base, [Replay] global_steps) sit in worker pipes for many
+# ([Replay] global_steps, step metrics) sit in worker pipes for many
 # minutes and the log-based assertions below misfire even though the run is
 # healthy (observed on the Megatron smoke's first remote execution).
 export PYTHONUNBUFFERED=1
 
 # The launch script honors these env overrides. Full-size model, sequence
-# lengths and 30720-token dynbsz budget (they set the memory peak); small
+# lengths and the script's default 25600-token dynbsz budget (they set the
+# memory peak; no ppo_max_token_len override is exported here); small
 # mini-batch + short replay horizon + no validation/saves (they don't, and
 # they get us to the first updates fastest).
 export exp_name="SMOKE-replay-ess-fsdp2-bf16sr-dynbsz-5+3"
@@ -118,9 +119,9 @@ fail=0
 note() { echo "[smoke] $*"; }
 bad()  { echo "[smoke][FAIL] $*"; fail=1; }
 
-# --- 1. crashes (the main check: does the 30720 budget fit the bf16 recipe?) -
+# --- 1. crashes (the main check: does the 25600 budget fit the bf16 recipe?) -
 if grep -aqE "CUDA out of memory" "${LOG}"; then
-    bad "CUDA OOM — the 30720-token dynbsz budget does NOT fit the bf16-sr recipe:"
+    bad "CUDA OOM — the 25600-token dynbsz budget does NOT fit the bf16-sr recipe:"
     grep -anE "CUDA out of memory" "${LOG}" | head -2
 elif grep -aqE "Traceback" "${LOG}"; then
     bad "Traceback found in log (torchao import? model_dtype? dp_actor guard?):"
@@ -137,24 +138,23 @@ else
     bad "only ${updates}/${WANT_UPDATES} updates completed before timeout/exit"
 fi
 
-# --- 3. auto base_ess_ratio captured -----------------------------------------
-capture_line=$(grep -ao "auto-calibrated ess_scaling.base_ess_ratio=[0-9.]*" "${LOG}" | head -1)
-if [ -n "${capture_line}" ]; then
-    note "${capture_line} (from the staleness-0 first update)"
+# --- 3. brake metrics logged --------------------------------------------------
+if grep -aq "staleness/ess_ratio:" "${LOG}"; then
+    note "ESS measured: $(grep -ao 'staleness/ess_ratio:[0-9.e-]*' "${LOG}" | tail -1)"
 else
-    bad "no auto-calibration line — base_ess_ratio was never captured (dp_actor staleness/ess entries missing?)"
-fi
-
-# --- 4. brake metrics logged --------------------------------------------------
-if grep -aq "replay/ess_base:" "${LOG}"; then
-    note "replay/ess_base logged"
-else
-    bad "replay/ess_base never appeared in step metrics"
+    bad "staleness/ess_ratio never appeared in step metrics (dp_actor staleness/ess entries missing?)"
 fi
 if grep -aq "replay/ess_scaled_lr:" "${LOG}"; then
     note "effective lr logged: $(grep -ao 'replay/ess_scaled_lr:[0-9.e-]*' "${LOG}" | tail -1)"
 else
     bad "replay/ess_scaled_lr never appeared in step metrics"
+fi
+
+# --- 4. removed auto-base must not resurface ----------------------------------
+if grep -aq "replay/ess_base:\|auto-calibrated ess_scaling" "${LOG}"; then
+    bad "removed auto-base mechanism resurfaced in the log"
+else
+    note "no auto-base tags (min-ESS rule needs no measured reference)"
 fi
 
 # --- 5. GPU memory peaks ------------------------------------------------------
@@ -163,18 +163,21 @@ if [ -s "${MEMLOG}" ]; then
     awk -F', ' '{ if ($2 > m[$1]) m[$1] = $2 } END { for (g in m) printf "  GPU %s: %d\n", g, m[g] }' \
         "${MEMLOG}" | sort -V
     trainer_peak=$(awk -F', ' '$1 >= 5 { if ($2 > p) p = $2 } END { print p+0 }' "${MEMLOG}")
-    if [ "${trainer_peak}" -gt 79000 ]; then
-        bad "trainer-GPU peak ${trainer_peak} MiB > 79000 — effectively no headroom, expect OOM under real packing variance"
-    elif [ "${trainer_peak}" -gt 70000 ]; then
-        note "WARNING: trainer-GPU peak ${trainer_peak} MiB — above the expected ~52-60 GiB band; consider ppo_max_token_len=20480"
+    # Band calibrated on the 2026-08 production run at the same 25600 budget:
+    # trainer GPUs held ~74-80 GB nvidia-smi used (76.3 GB torch-reserved)
+    # steadily without OOM — high absolute usage is EXPECTED on this recipe.
+    if [ "${trainer_peak}" -gt 80500 ]; then
+        bad "trainer-GPU peak ${trainer_peak} MiB > 80500 — at the device limit, expect OOM under real packing variance"
+    elif [ "${trainer_peak}" -gt 78000 ]; then
+        note "WARNING: trainer-GPU peak ${trainer_peak} MiB — above the ~74-78 GiB production band; consider ppo_max_token_len=20480"
     else
-        note "trainer-GPU peak ${trainer_peak} MiB — within the expected band, headroom OK"
+        note "trainer-GPU peak ${trainer_peak} MiB — within the production band, headroom OK"
     fi
 fi
 
 echo
 if [ "${fail}" -eq 0 ]; then
-    echo "[smoke] PASS — bf16-sr + torchao + 30720-token dynbsz survived on the real model; auto base captured, brake metrics flowing"
+    echo "[smoke] PASS — bf16-sr + torchao + 25600-token dynbsz survived on the real model; min-ESS brake metrics flowing"
 else
     echo "[smoke] FAIL — see messages above; full log: ${LOG}"
 fi

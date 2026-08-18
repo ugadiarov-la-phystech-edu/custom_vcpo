@@ -24,7 +24,7 @@ from collections.abc import Sequence
 import torch
 import torch.distributed as dist
 
-__all__ = ["compute_ess_lr_scale", "compute_global_ess_from_log_weights", "resolve_ess_base"]
+__all__ = ["compute_global_ess_from_log_weights", "compute_min_ess_lr_scale"]
 
 
 def compute_global_ess_from_log_weights(
@@ -109,25 +109,19 @@ def compute_global_ess_from_log_weights(
     return ess, ess_ratio, ess_clipped, ess_ratio_clipped, count
 
 
-def resolve_ess_base(config_base, override):
-    """Resolve the ESS-scaling reference ratio.
+def compute_min_ess_lr_scale(ess: float, min_ess: float, lr_scale: float) -> float:
+    """LR multiplier of the min-ESS brake.
 
-    An explicit config value wins; base_ess_ratio=None (auto-calibration)
-    resolves to the driver-provided override — the first update's measured
-    on-policy ESS ratio, passed back via meta_info["ess_base_override"].
-    Returns None while neither is available (scaling is then a no-op)."""
-    return config_base if config_base is not None else override
+    Brake when the mini-batch's global ESS carries at most ``min_ess``
+    effective samples (inclusive: ess == min_ess brakes): return ``lr_scale``;
+    above the threshold return 1.0 (full nominal lr). In ratio units this is
+    ess_ratio <= min_ess / B — the raw-ESS form needs no batch size.
 
-
-def compute_ess_lr_scale(ess_ratio: float, base_ess_ratio: float, trigger_ratio: float | None = None) -> float:
-    """LR multiplier of the ESS brake (before the sqrt/linear rule).
-
-    Legacy (trigger_ratio=None): min(1, ess_ratio / base) — attenuate whenever
-    the measured ESS falls below the reference. With ess_scaling.trigger_ratio
-    set, scaling engages only when ess_ratio / base < trigger_ratio; at or
-    above the threshold the mini-batch runs at full nominal lr (multiplier 1),
-    so the multiplier jumps discontinuously at the threshold."""
-    ratio = float(ess_ratio) / max(float(base_ess_ratio), 1e-8)
-    if trigger_ratio is not None and ratio >= float(trigger_ratio):
-        return 1.0
-    return min(1.0, ratio)
+    No measured reference is involved: the threshold sits just above the
+    structural floor ESS = 1 that the max-shifted computation guarantees for
+    any non-empty batch (a single dominant sequence reads exactly 1), so
+    degenerate mini-batches always brake at exactly lr_scale — never 0.
+    ess == 0 means an empty global batch: no scaling."""
+    if ess > 0 and float(ess) <= float(min_ess):
+        return float(lr_scale)
+    return 1.0

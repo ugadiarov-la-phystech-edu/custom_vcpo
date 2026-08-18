@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
 # Multi-seed driver for estimate_ess_base_1mb.sh: runs the one-mini-batch
-# on-policy ESS base estimator N times with distinct seeds (sequentially —
+# on-policy ESS ratio measurement N times with distinct seeds (sequentially —
 # each run needs all 8 GPUs) and prints mean/std/min/max of the collected
-# ess_ratio samples at the end. Results accumulate in ${RESULTS_FILE}
-# (seed,ess_ratio,ess_ratio_clipped; failed runs record NA and are excluded
-# from the summary, as is any non-numeric junk).
+# ess_ratio samples at the end. Under the min-ESS brake there is no base to
+# calibrate — this is a numerics diagnostic (backend recompute-mismatch
+# level, rho_on), kept under its historical filename. Results accumulate in
+# ${RESULTS_FILE} (seed,ess_ratio,ess_ratio_clipped; failed runs record NA
+# and are excluded from the summary, as is any non-numeric junk).
 #
 # Between runs it waits until nvidia-smi reports no compute processes (up to
 # ${GPU_WAIT_S}) so the next vLLM engine init never races the previous run's

@@ -240,7 +240,7 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
     Returns only scalar-safe payload unless current backends are console+wandb.
 
     Scalar Metrics
-        staleness/base_ess_ratio, staleness/ess_ratio(_clipped), actor/ess_scaled_lr
+        staleness/ess_ratio(_clipped), actor/ess_scaled_lr
         replay/*_staleness_p50 (from the replay staleness histograms)
 
     Images (wandb only)
@@ -270,14 +270,6 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
             for info in ess_entries
             if "ess_scaled_lr" in info and info["ess_scaled_lr"] is not None
         ]
-        base_ess_ratio = [
-            float(info["base_ess_ratio"])
-            for info in ess_entries
-            if "base_ess_ratio" in info and info["base_ess_ratio"] is not None
-        ]
-
-        if base_ess_ratio:
-            payload["staleness/base_ess_ratio"] = float(np.mean(base_ess_ratio))
         if ess_ratio:
             payload["staleness/ess_ratio"] = float(np.mean(ess_ratio))
         if ess_ratio_clipped:

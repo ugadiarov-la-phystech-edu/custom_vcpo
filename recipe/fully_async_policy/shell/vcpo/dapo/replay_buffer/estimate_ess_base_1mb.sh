@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 
-# One-mini-batch estimator of the on-policy ESS base ratio (rho_on) for the
-# fsdp2 dynbsz bf16-sr-adamw replay arm.
+# One-mini-batch estimator of the on-policy ESS ratio (rho_on) for the
+# fsdp2 dynbsz bf16-sr-adamw replay arm. The min-ESS brake needs no measured
+# reference — this remains a numerics diagnostic (backend recompute-mismatch
+# level), not a calibration input.
 #
 # Launches the production script
-#   grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_dynbsz_bf16-sr-adamw_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh
+#   grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_dynbsz_bf16-sr-adamw_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh
 # with all controllable seeds set from ${SEED}, lets it generate the first
-# (staleness-0, warm-up) mini-batch of B=33 groups and run update 1 — the
-# exact measurement ess_scaling.base_ess_ratio=null auto-calibrates from —
-# then extracts staleness/ess_ratio (and the clipped variant) from the step:1
+# (staleness-0, warm-up) mini-batch of B=33 groups and run update 1, then
+# extracts staleness/ess_ratio (and the clipped variant) from the step:1
 # console metrics line, appends "seed,ess_ratio,ess_ratio_clipped" to
 # ${RESULTS_FILE}, and tears the run down. Validation and checkpointing are
 # disabled; nothing is trained beyond the single update. Requires 'console'
@@ -25,7 +26,7 @@
 # fixed seed does not make the first mini-batch reproducible — its membership
 # is the first 33 non-degenerate groups to COMPLETE, which depends on
 # wall-clock scheduling. Different seeds simply guarantee different prompts,
-# so repeated runs sample the distribution of the auto-captured base.
+# so repeated runs sample the distribution of the first-mini-batch ESS.
 #
 # The rollouter's prompt budget (total_rollout_steps) counts prompts BEFORE
 # the degenerate-group filter, so a budget of exactly 33 can starve the first
@@ -50,7 +51,7 @@ POLL_S=5
 STARTUP_GRACE_S=30
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-base_script="${script_dir}/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_dynbsz_bf16-sr-adamw_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh"
+base_script="${script_dir}/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_dynbsz_bf16-sr-adamw_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh"
 # .../recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer -> repo root
 repo_root="$(cd "${script_dir}/../../../../../.." && pwd)"
 
