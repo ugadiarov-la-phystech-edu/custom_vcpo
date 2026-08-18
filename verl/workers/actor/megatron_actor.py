@@ -60,6 +60,11 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
 from verl.workers.actor.entropy_utils import log_entropy_and_apply_to_loss, should_calculate_entropy
+from verl.workers.utils.ess import (
+    compute_ess_lr_scale,
+    compute_global_ess_from_log_weights,
+    resolve_ess_base,
+)
 from verl.workers.utils.vcpo import (
     _get_local_model_grads_for_norm,
     accumulate_grad_buffers,
@@ -75,17 +80,6 @@ from verl.workers.utils.vcpo import (
 )
 
 __all__ = ["MegatronPPOActor", "compute_ess_lr_scale", "resolve_ess_base"]
-
-
-def resolve_ess_base(config_base, override):
-    return config_base if config_base is not None else override
-
-
-def compute_ess_lr_scale(ess_ratio: float, base_ess_ratio: float, trigger_ratio: float | None = None) -> float:
-    ratio = float(ess_ratio) / max(float(base_ess_ratio), 1e-8)
-    if trigger_ratio is not None and ratio >= float(trigger_ratio):
-        return 1.0
-    return min(1.0, ratio)
 
 
 def _resolve_loss_multiplier(meta_info) -> float:
@@ -533,6 +527,11 @@ class MegatronPPOActor(BasePPOActor):
                         )
                     old_log_prob = log_prob.detach().clone()
                     rollout_log_prob = data["rollout_log_probs"]
+                    if meta_info.get("collect_seq_log_is"):
+                        with torch.no_grad():
+                            mask_f = data["response_mask"].to(device=log_prob.device, dtype=torch.float32)
+                            delta = (old_log_prob.float() - rollout_log_prob.float()) * mask_f
+                            stats["_ess/seq_log_is"] = delta.sum(dim=-1).cpu().tolist()
                     rollout_is_weights_proto, modified_response_mask, rollout_corr_metrics = (
                         compute_rollout_correction_and_rejection_mask(
                             old_log_prob=old_log_prob,
@@ -631,6 +630,9 @@ class MegatronPPOActor(BasePPOActor):
             loss_multiplier = _resolve_loss_multiplier(meta_info)
             if loss_multiplier != 1.0:
                 policy_loss = policy_loss * loss_multiplier
+            global_seq_count = meta_info.get("global_seq_mean_count")
+            if global_seq_count:
+                policy_loss = policy_loss * (responses.size(0) * n_micro_batch / float(global_seq_count))
             return policy_loss, [metrics, ret_entropy, rollout_log_prob, old_log_prob]
 
         def forward_step(batch_iter, model, return_schedule_plan: bool = False):
@@ -750,6 +752,8 @@ class MegatronPPOActor(BasePPOActor):
                     "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
                     "rollout_corr_config": rollout_corr_cfg,
                     "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
+                    "global_seq_mean_count": data.meta_info.get("global_seq_mean_count"),
+                    "collect_seq_log_is": bool(data.meta_info.get("collect_seq_log_is", False)),
                 }
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
@@ -896,12 +900,6 @@ class MegatronPPOActor(BasePPOActor):
         minibatch_ess_clipped = staleness_metrics["ess_clipped"]
         ess_ratio_clipped = staleness_metrics["ess_ratio_clipped"]
 
-        ess_ratio_for_scaling = ess_ratio_clipped if self.config.ess_scaling.use_clipped else ess_ratio
-        if ess_ratio_for_scaling is None:
-            ess_ratio_for_scaling = 0.0
-        lrs_now = self.get_lr()
-        lr = lrs_now[0] if lrs_now else None
-
         # ================ Optimizer Step ================
         if accum_buffers is not None:
             copy_accum_buffers_to_grad_buffers(self.actor_module, accum_buffers)
@@ -926,6 +924,25 @@ class MegatronPPOActor(BasePPOActor):
                 else:
                     # finish_grad_sync will call start_grad_sync internally for non-overlap
                     chunk.finish_grad_sync()
+
+        return self._apply_ess_scale_and_step(
+            minibatch_ess, minibatch_ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, ess_base_override
+        )
+
+    def _apply_ess_scale_and_step(
+        self,
+        minibatch_ess,
+        minibatch_ess_clipped,
+        ess_ratio,
+        ess_ratio_clipped,
+        minibatch_idx: int,
+        ess_base_override: float | None,
+    ) -> tuple[bool, dict]:
+        ess_ratio_for_scaling = ess_ratio_clipped if self.config.ess_scaling.use_clipped else ess_ratio
+        if ess_ratio_for_scaling is None:
+            ess_ratio_for_scaling = 0.0
+        lrs_now = self.get_lr()
+        lr = lrs_now[0] if lrs_now else None
 
         base_lrs = self.get_lr()
         ess_base = resolve_ess_base(self.config.ess_scaling.get("base_ess_ratio", None), ess_base_override)
@@ -970,6 +987,118 @@ class MegatronPPOActor(BasePPOActor):
 
         return update_successful, minibatch_metrics
 
+    def _ess_scaled_optimizer_step_packed(
+        self,
+        seq_log_is: list[float],
+        rollout_is_threshold: float | None,
+        minibatch_idx: int,
+        ess_base_override: float | None,
+    ) -> tuple[bool, dict]:
+        values = [0.0, 0.0, 0.0, 0.0, 0.0]
+        dist_initialized = torch.distributed.is_initialized()
+        on_last_stage = (not dist_initialized) or mpu.is_pipeline_last_stage(ignore_virtual=True)
+        if on_last_stage:
+            group = mpu.get_data_parallel_group(with_context_parallel=True) if dist_initialized else None
+            ess, ess_ratio, ess_clipped, ess_ratio_clipped, count = compute_global_ess_from_log_weights(
+                seq_log_is, rollout_is_threshold, group=group
+            )
+            values = [ess, ess_ratio, ess_clipped, ess_ratio_clipped, float(count)]
+        if dist_initialized and mpu.get_pipeline_model_parallel_world_size() > 1:
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            tensor = torch.tensor(values, device=device, dtype=torch.float64)
+            torch.distributed.broadcast(
+                tensor,
+                src=mpu.get_pipeline_model_parallel_last_rank(),
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+            values = tensor.tolist()
+        ess, ess_ratio, ess_clipped, ess_ratio_clipped, _ = values
+        return self._apply_ess_scale_and_step(
+            ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, ess_base_override
+        )
+
+    @GPUMemoryLogger(role="megatron actor", logger=logger)
+    def _update_policy_per_traj_packed(self, dataloader: Iterable[DataProto]) -> dict:
+        assert self.config.megatron.context_parallel_size == 1, (
+            "packed per-traj path does not support context parallelism: per-sequence "
+            "log-IS sums would be partial per CP rank"
+        )
+        assert self.config.loss_agg_mode == "seq-mean-token-mean", (
+            f"packed per-traj path requires loss_agg_mode=seq-mean-token-mean "
+            f"(got {self.config.loss_agg_mode}): the global-norm rescale assumes it"
+        )
+        metrics = {}
+        for minibatch_idx, minibatch in enumerate(dataloader):
+            self.actor_optimizer.zero_grad()
+            for chunk in self.actor_module:
+                chunk.zero_grad_buffer()
+
+            calculate_entropy = should_calculate_entropy(self.config)
+            skip_recompute_old_log_prob = bool(minibatch.meta_info.get("skip_recompute_old_log_prob", False)) or bool(
+                minibatch.meta_info.get("calculate_rollout_policy_is", False)
+            )
+            assert skip_recompute_old_log_prob, (
+                "packed per-traj path requires skip_recompute_old_log_prob=True: with the ratio "
+                "anchored at 1 the vanilla loss equals the per-traj post-scale loss exactly; with "
+                "recomputed old log-probs the clip-branch semantics would diverge"
+            )
+
+            rollout_corr_cfg = minibatch.meta_info.get("rollout_corr_config", None)
+            if rollout_corr_cfg is None:
+                rollout_corr_cfg = self.config.policy_loss.get("rollout_correction", {})
+            rollout_is_threshold = rollout_corr_cfg.get("rollout_is_threshold", None)
+
+            epoch_idx = int(minibatch.meta_info.get("epoch_idx", 0))
+            local_traj_records, _ = compute_staleness_statistics(
+                minibatch, minibatch_idx, rollout_is_threshold, False, epoch_idx=epoch_idx
+            )
+
+            minibatch.meta_info["global_seq_mean_count"] = len(minibatch)
+            minibatch.meta_info["collect_seq_log_is"] = True
+
+            max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
+            output = self.forward_backward_batch(
+                minibatch,
+                calculate_entropy=calculate_entropy,
+                use_dynamic_bsz=True,
+                micro_batch_size=None,
+                max_token_len=max_token_len,
+                mini_batch_size=self.config.ppo_mini_batch_size,
+            )
+
+            seq_log_is: list[float] = []
+            for metric in output["output"]:
+                metric_dict = metric[0]
+                for row_sums in metric_dict.pop("_ess/seq_log_is", []):
+                    seq_log_is.extend(float(v) for v in row_sums)
+                append_to_dict(metrics, metric_dict)
+
+            update_successful, minibatch_metrics = self._ess_scaled_optimizer_step_packed(
+                seq_log_is,
+                rollout_is_threshold,
+                minibatch_idx,
+                minibatch.meta_info.get("ess_base_override", None),
+            )
+            if not update_successful:
+                raise NotImplementedError
+
+            minibatch_metrics["actor/minibatch_grad_info"] = [
+                {
+                    "epoch_idx": epoch_idx,
+                    "minibatch_idx": minibatch_idx,
+                    "grad_norm": minibatch_metrics["actor/grad_norm"],
+                    "trainer_global_step": minibatch.meta_info.get("trainer_global_step", -1),
+                    "trainer_local_step": minibatch.meta_info.get("trainer_local_step", -1),
+                }
+            ]
+            append_to_dict(metrics, minibatch_metrics)
+
+            metrics["actor/local_traj_records"] = [asdict(rec) for rec in local_traj_records]
+
+        self.actor_optimizer.zero_grad()
+        get_torch_device().empty_cache()
+        return metrics
+
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def update_policy_per_traj(self, dataloader: Iterable[DataProto], grad_baselining: bool = False) -> dict:
         """Update the policy with per-trajectory gradient norm capture.
@@ -985,6 +1114,13 @@ class MegatronPPOActor(BasePPOActor):
             "actor/local_traj_records": list[dict]
             "staleness/ess": list[dict]
         """
+        if self.config.use_dynamic_bsz:
+            assert not grad_baselining, (
+                "OPOB (grad_baselining) needs each trajectory's gradient isolated in the grad "
+                "buffer and is incompatible with dynamic batch size; set actor.use_dynamic_bsz=False"
+            )
+            return self._update_policy_per_traj_packed(dataloader)
+
         metrics = {}
 
         accum_buffers = None
