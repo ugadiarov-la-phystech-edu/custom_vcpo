@@ -21,7 +21,7 @@
 # base_ess_ratio, trigger_ratio) no longer exist in the dataclass — sibling
 # historical scripts that still set them fail fast at Hydra instantiation.
 # Dynbsz mechanics (unchanged from the former dynbsz arm):
-#   * actor.use_dynamic_bsz=True + ppo_max_token_len_per_gpu=20480: the
+#   * actor.use_dynamic_bsz=True + ppo_max_token_len_per_gpu=15360: the
 #     buffer-free per-traj update dispatches to the PACKED path
 #     (_update_policy_per_traj_packed) — sequences packed into token-budget
 #     micro-batches instead of 176 single-sequence micro-batches per DP rank.
@@ -33,8 +33,10 @@
 #     the brake multiplier is exactly ess_lr_scale on degenerate
 #     mini-batches, never 0). Per-traj grad-norm diagnostics and per-token
 #     record lists are mbs=1-only and stay empty here. OPOB remains
-#     incompatible with dynbsz. Token budget 20480 = 2x max seq len
-#     (measured envelope: 20480 fits, 25600 OOMs on this arm).
+#     incompatible with dynbsz. Token budget 15360 = 1.5x max seq len
+#     (measured envelope on this arm, tp1/dp3 HDO 8B: 20480 OOMs at
+#     update 1 — NCCL calloc failure, ~83 GB predicted; 15360 fits at
+#     63.4 GB allocated).
 # Inherited replay-arm mechanics:
 #   * update_policy_per_traj=True: every mini-batch's sequence-level IS
 #     ratios against the cached behavior log-probs are DP-all-reduced into
@@ -139,9 +141,9 @@ gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3 (528/3=176)
 micro_bsz_per_gpu=1 # ignored by the packed path under use_dynamic_bsz=True
 use_dynamic_bsz=True
-# token budget per packed micro-batch (per GPU); 2x max_model_len keeps >= 2
-# full-length sequences per micro-batch. See header before raising.
-ppo_max_token_len=${ppo_max_token_len:-20480}
+# token budget per packed micro-batch (per GPU); 15360 = 1.5x max response
+# len — the measured fit on this arm (20480 OOMs at update 1, see header).
+ppo_max_token_len=${ppo_max_token_len:-15360}
 log_prob_micro_bsz_per_gpu=1
 
 bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}} # Rollout Bsz
