@@ -18,7 +18,7 @@ from collections.abc import Sequence
 import torch
 import torch.distributed as dist
 
-__all__ = ["compute_ess_lr_scale", "compute_global_ess_from_log_weights", "resolve_ess_base"]
+__all__ = ["compute_global_ess_from_log_weights", "compute_min_ess_lr_scale"]
 
 
 def compute_global_ess_from_log_weights(
@@ -75,12 +75,7 @@ def compute_global_ess_from_log_weights(
     return ess, ess_ratio, ess_clipped, ess_ratio_clipped, count
 
 
-def resolve_ess_base(config_base, override):
-    return config_base if config_base is not None else override
-
-
-def compute_ess_lr_scale(ess_ratio: float, base_ess_ratio: float, trigger_ratio: float | None = None) -> float:
-    ratio = float(ess_ratio) / max(float(base_ess_ratio), 1e-8)
-    if trigger_ratio is not None and ratio >= float(trigger_ratio):
-        return 1.0
-    return min(1.0, ratio)
+def compute_min_ess_lr_scale(ess: float, min_ess: float, lr_scale: float) -> float:
+    if ess > 0 and float(ess) <= float(min_ess):
+        return float(lr_scale)
+    return 1.0

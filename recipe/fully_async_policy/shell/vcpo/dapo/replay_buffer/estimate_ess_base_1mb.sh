@@ -9,7 +9,7 @@ POLL_S=5
 STARTUP_GRACE_S=30
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-base_script="${BASE_SCRIPT:-${script_dir}/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_dynbsz_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh}"
+base_script="${BASE_SCRIPT:-${script_dir}/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_dynbsz_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh}"
 repo_root="$(cd "${script_dir}/../../../../../.." && pwd)"
 
 if [ ! -f "${base_script}" ]; then

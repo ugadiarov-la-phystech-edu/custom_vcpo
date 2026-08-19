@@ -172,10 +172,9 @@ def _make_config(use_dynamic_bsz: bool, max_token_len: int):
             "megatron": {"context_parallel_size": 1, "use_remove_padding": False},
             "ess_scaling": {
                 "enable": False,
-                "scaling_rule": "sqrt",
-                "base_ess_ratio": None,
+                "min_ess": 1.1,
+                "lr_scale": 0.5,
                 "use_clipped": False,
-                "trigger_ratio": None,
             },
         }
     )

@@ -54,8 +54,7 @@ train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33}
 micro_bsz_per_gpu=1
-use_dynamic_bsz=True
-ppo_max_token_len=${ppo_max_token_len:-20480}
+use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
 
 bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}}
@@ -81,13 +80,10 @@ weight_decay=0.1
 update_policy_per_traj=True
 grad_baselining=False
 ess_enable=${ess_enable:-True}
-ess_rule=${ess_rule:-sqrt}
-ess_base=${ess_base:-null}
+min_ess=${min_ess:-1.1}
+ess_lr_scale=${ess_lr_scale:-0.5}
 ess_use_clipped=False
-ess_trigger=${ess_trigger:-0.33333}
-ess_base_tag=${ess_base}
-[ "${ess_base_tag}" = "null" ] && ess_base_tag="auto"
-[ "${ess_trigger}" != "null" ] && ess_base_tag="${ess_base_tag}-trig-${ess_trigger}"
+ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
 
 rollout_is="token"
 rollout_is_threshold="2.0"
@@ -125,7 +121,7 @@ test_freq=${test_freq:-20}
 save_freq=${save_freq:-20}
 max_actor_ckpt_to_keep=1
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo dynbsz B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -175,16 +171,14 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
     actor_rollout_ref.actor.update_policy_per_traj=${update_policy_per_traj} \
     actor_rollout_ref.actor.grad_baselining.enable=${grad_baselining} \
     actor_rollout_ref.actor.ess_scaling.enable=${ess_enable} \
-    actor_rollout_ref.actor.ess_scaling.scaling_rule=${ess_rule} \
-    actor_rollout_ref.actor.ess_scaling.base_ess_ratio=${ess_base} \
+    actor_rollout_ref.actor.ess_scaling.min_ess=${min_ess} \
+    actor_rollout_ref.actor.ess_scaling.lr_scale=${ess_lr_scale} \
     actor_rollout_ref.actor.ess_scaling.use_clipped=${ess_use_clipped} \
-    actor_rollout_ref.actor.ess_scaling.trigger_ratio=${ess_trigger} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \
@@ -222,7 +216,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.megatron.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.ref.megatron.param_offload=True \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
@@ -241,7 +234,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.n=${val_n:-1} \
     actor_rollout_ref.rollout.calculate_log_probs=${calculate_log_probs} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
     critic.megatron.tensor_model_parallel_size=${train_tp} \
     critic.megatron.pipeline_model_parallel_size=${train_pp} \

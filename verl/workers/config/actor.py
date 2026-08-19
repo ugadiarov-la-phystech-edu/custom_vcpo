@@ -61,10 +61,13 @@ class PolicyLossConfig(BaseConfig):
 @dataclass
 class ESSScalingConfig(BaseConfig):
     enable: bool = False
-    scaling_rule: str = "sqrt"  # "sqrt" | "linear"
-    base_ess_ratio: Optional[float] = None
+    min_ess: float = 1.1
+    lr_scale: float = 0.5
     use_clipped: bool = False  # use ess ratios derived from clipped is weights
-    trigger_ratio: Optional[float] = None
+
+    def __post_init__(self):
+        assert self.min_ess >= 1, f"ess_scaling.min_ess must be >= 1 (ESS floors at 1), got {self.min_ess}"
+        assert 0 < self.lr_scale <= 1, f"ess_scaling.lr_scale must be in (0, 1], got {self.lr_scale}"
 
 
 @dataclass
