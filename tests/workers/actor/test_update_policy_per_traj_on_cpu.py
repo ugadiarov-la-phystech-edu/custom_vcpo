@@ -325,10 +325,17 @@ class TestOptimizerStepWithBuffer:
         assert entry["minibatch_ess_ratio_clipped"] == 0.2
 
     def test_ess_scaled_step_restores_nominal_lr(self, monkeypatch):
-        scaling = ESSScalingConfig(enable=True, scaling_rule="sqrt", base_ess_ratio=0.5)
+        scaling = ESSScalingConfig(enable=True, min_ess=4.0, lr_scale=0.5)
         actor, _, _ = self._make_step_actor(monkeypatch, ess_scaling=scaling)
         actor._optimizer_step_with_buffer(None, [], None, do_grad_sync=False)
-        # ess_ratio 0.25 / base 0.5 = 0.5 -> sqrt rule steps at lr * sqrt(0.5)...
-        assert actor.actor_optimizer.stepped_lrs == pytest.approx([1e-6 * 0.5**0.5])
+        # ESS 4.0 <= min_ess 4.0 (inclusive) -> braked at the constant lr_scale...
+        assert actor.actor_optimizer.stepped_lrs == pytest.approx([1e-6 * 0.5])
         # ...and the nominal lr is restored afterwards.
         assert actor.actor_optimizer.param_groups[0]["lr"] == pytest.approx(1e-6)
+
+    def test_ess_above_min_ess_steps_at_full_lr(self, monkeypatch):
+        scaling = ESSScalingConfig(enable=True, min_ess=1.1, lr_scale=0.5)
+        actor, _, _ = self._make_step_actor(monkeypatch, ess_scaling=scaling)
+        actor._optimizer_step_with_buffer(None, [], None, do_grad_sync=False)
+        # ESS 4.0 > min_ess 1.1 -> full nominal lr
+        assert actor.actor_optimizer.stepped_lrs == pytest.approx([1e-6])

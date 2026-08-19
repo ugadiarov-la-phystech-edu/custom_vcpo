@@ -113,10 +113,9 @@ actor_rollout_ref:
     ess_scaling:
       _target_: verl.workers.config.ESSScalingConfig
       enable: false
-      scaling_rule: sqrt
-      base_ess_ratio: null
+      min_ess: 1.1
+      lr_scale: 0.5
       use_clipped: false
-      trigger_ratio: null
     grad_baselining:
       _target_: verl.workers.config.GradBaselineConfig
       enable: false

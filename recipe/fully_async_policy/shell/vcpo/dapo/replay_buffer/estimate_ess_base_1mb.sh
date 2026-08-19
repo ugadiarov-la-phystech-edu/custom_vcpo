@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 
-# One-mini-batch estimator of the on-policy ESS base ratio (rho_on) for the
-# Megatron DYNBSZ (packed per-traj, HDO) replay arm. The base is a property
-# of the ENTIRE numerical configuration — backend, precision recipe,
-# batching — so measure it under the exact production script it will serve;
-# point BASE_SCRIPT at a different arm (e.g. the mbs=1 trigger arm) to
+# One-mini-batch estimator of the on-policy ESS ratio (rho_on) for the
+# Megatron DYNBSZ (packed per-traj, HDO) replay arm. A rho_on DIAGNOSTIC
+# only: the min-ESS brake needs no measured reference (auto-calibration was
+# removed with the base/trigger logic), but the measurement remains useful
+# for characterizing a numerical configuration — backend, precision recipe,
+# batching. Point BASE_SCRIPT at a different arm (e.g. the mbs=1 arm) to
 # estimate for that one. NOTE: the default dynbsz script requires the
 # dyn-batch branch's actor code (_update_policy_per_traj_packed); on the
 # base branch it dies at the mbs=1 assert.
 #
 # Launches the production script (default)
-#   grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_dynbsz_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh
+#   grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_dynbsz_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh
 # with all controllable seeds set from ${SEED}, lets it generate the first
-# (staleness-0, warm-up) mini-batch of B=33 groups and run update 1 — the
-# exact measurement ess_scaling.base_ess_ratio=null auto-calibrates from —
-# then extracts staleness/ess_ratio (and the clipped variant) from the step:1
+# (staleness-0, warm-up) mini-batch of B=33 groups and run update 1, then
+# extracts staleness/ess_ratio (and the clipped variant) from the step:1
 # console metrics line, appends "seed,ess_ratio,ess_ratio_clipped" to
 # ${RESULTS_FILE}, and tears the run down. Validation and checkpointing are
 # disabled; nothing is trained beyond the single update. Requires 'console'
@@ -58,7 +58,7 @@ POLL_S=5
 STARTUP_GRACE_S=30
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-base_script="${BASE_SCRIPT:-${script_dir}/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_dynbsz_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh}"
+base_script="${BASE_SCRIPT:-${script_dir}/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_dynbsz_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh}"
 # .../recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer -> repo root
 repo_root="$(cd "${script_dir}/../../../../../.." && pwd)"
 

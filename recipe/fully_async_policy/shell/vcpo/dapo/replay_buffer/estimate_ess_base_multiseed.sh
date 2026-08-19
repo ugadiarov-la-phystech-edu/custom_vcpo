@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Multi-seed driver for estimate_ess_base_1mb.sh: runs the one-mini-batch
-# on-policy ESS base estimator (Megatron dynbsz arm by default; BASE_SCRIPT /
+# on-policy ESS ratio (rho_on) estimator — a diagnostic; the min-ESS brake
+# uses no measured reference (Megatron dynbsz arm by default; BASE_SCRIPT /
 # EXP_TAG / RESULTS_FILE pass through to the inner script) N times with distinct seeds (sequentially —
 # each run needs all 8 GPUs) and prints mean/std/min/max of the collected
 # ess_ratio samples at the end. Results accumulate in ${RESULTS_FILE}

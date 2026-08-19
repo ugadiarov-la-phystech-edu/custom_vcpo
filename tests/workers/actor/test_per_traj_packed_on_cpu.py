@@ -27,10 +27,11 @@ forward/optimizer (same harness style as test_update_policy_per_traj_on_cpu):
   finalize left untouched (no disable_grad_finalize), skip_recompute
   required;
 - ESS wiring: per-sequence log-IS sums flow from the micro-batch metrics into
-  the max-shifted ESS, the LR is scaled for the step and restored after, and
-  the staleness/ess entry carries the 7-key contract — including the
-  overflow regression (a +60 log-weight reads ratio 1/B, not 0, so the LR is
-  scaled, never zeroed);
+  the max-shifted ESS, the min-ESS brake multiplies the LR by the constant
+  lr_scale for the step (restored after) exactly when ESS <= min_ess, and
+  the staleness/ess entry carries the 6-key contract — including the
+  overflow regression (a +60 log-weight reads ESS = 1, not 0, so the braked
+  LR is exactly lr * lr_scale, never zero);
 - the n_rows*M/N rescale contract: mean-of-means over an arbitrary unequal
   packing, rescaled per micro-batch, equals the global per-sequence mean.
 
@@ -102,7 +103,7 @@ def _make_records() -> TrajRecordList:
     return records
 
 
-def _make_minibatch(skip_recompute: bool = True, ess_base_override=None) -> DataProto:
+def _make_minibatch(skip_recompute: bool = True) -> DataProto:
     batch_size, resp_len = len(TRAJ_UIDS), 4
     data = DataProto.from_dict(
         tensors={
@@ -116,8 +117,6 @@ def _make_minibatch(skip_recompute: bool = True, ess_base_override=None) -> Data
     )
     data.meta_info["skip_recompute_old_log_prob"] = skip_recompute
     data.meta_info["rollout_corr_config"] = {"rollout_is_threshold": 2.0}
-    if ess_base_override is not None:
-        data.meta_info["ess_base_override"] = ess_base_override
     return data
 
 
@@ -259,7 +258,7 @@ class TestPackedEssStep:
     the step must scale by the max-shifted ESS and restore the LR."""
 
     def test_entry_contract_and_values(self, patched_env):
-        # weights e^0=1 x3 -> ess_ratio = 1.0 exactly
+        # weights e^0=1 x3 -> ess = 3.0, ess_ratio = 1.0 exactly
         actor, _ = _make_actor(seq_log_is_per_microbatch=[[0.0, 0.0], [0.0]])
         metrics = actor._update_policy_per_traj_packed([_make_minibatch()])
         (entry,) = metrics["staleness/ess"]
@@ -268,49 +267,53 @@ class TestPackedEssStep:
         assert entry["minibatch_ess_ratio"] == pytest.approx(1.0)
         assert entry["minibatch_ess_ratio_clipped"] == pytest.approx(1.0)
         assert entry["ess_scaled_lr"] == pytest.approx(NOMINAL_LR)
-        assert entry["base_ess_ratio"] is None  # unresolved -> no scaling
+        assert "base_ess_ratio" not in entry  # removed with the auto-base logic
 
     def test_braked_step_scales_and_restores_lr(self, patched_env):
-        # log-weights [log(4), 0, 0] -> ESS ratio = 36/(3*18) = 2/3;
-        # base 1.0, sqrt rule -> lr * sqrt(2/3)
-        scaling = ESSScalingConfig(enable=True, scaling_rule="sqrt", base_ess_ratio=1.0)
+        # log-weights [log(4), 0, 0] -> ESS = 36/18 = 2.0 <= min_ess 2.0
+        # (inclusive boundary) -> lr * lr_scale, restored after the step
+        scaling = ESSScalingConfig(enable=True, min_ess=2.0, lr_scale=0.5)
         actor, _ = _make_actor(ess_scaling=scaling, seq_log_is_per_microbatch=[[math.log(4.0), 0.0], [0.0]])
         actor._update_policy_per_traj_packed([_make_minibatch()])
-        assert actor.actor_optimizer.stepped_lrs == pytest.approx([NOMINAL_LR * (2.0 / 3.0) ** 0.5])
+        assert actor.actor_optimizer.stepped_lrs == pytest.approx([NOMINAL_LR * 0.5])
         assert actor.actor_optimizer.param_groups[0]["lr"] == pytest.approx(NOMINAL_LR)
 
-    def test_overflow_dominant_weight_never_zeroes_lr(self, patched_env):
+    def test_above_threshold_runs_full_lr(self, patched_env):
+        # ESS = 2.0 > min_ess 1.1 -> full nominal lr (no shaping by distance)
+        scaling = ESSScalingConfig(enable=True, min_ess=1.1, lr_scale=0.5)
+        actor, _ = _make_actor(ess_scaling=scaling, seq_log_is_per_microbatch=[[math.log(4.0), 0.0], [0.0]])
+        actor._update_policy_per_traj_packed([_make_minibatch()])
+        assert actor.actor_optimizer.stepped_lrs == pytest.approx([NOMINAL_LR])
+
+    def test_overflow_dominant_weight_brakes_at_lr_scale_never_zero(self, patched_env):
         """Regression: a +60 log-weight made the raw-space ESS read 0.0 and
-        the brake step at lr=0. The max-shifted ESS reads exactly 1/B."""
-        scaling = ESSScalingConfig(enable=True, scaling_rule="sqrt", base_ess_ratio=1.0)
+        the old brake step at lr=0. The max-shifted ESS reads exactly 1 (the
+        structural floor), which the min-ESS rule brakes at exactly
+        lr * lr_scale — never 0."""
+        scaling = ESSScalingConfig(enable=True, min_ess=1.1, lr_scale=0.5)
         actor, _ = _make_actor(ess_scaling=scaling, seq_log_is_per_microbatch=[[60.0, 0.0], [0.0]])
         metrics = actor._update_policy_per_traj_packed([_make_minibatch()])
         (entry,) = metrics["staleness/ess"]
-        assert entry["minibatch_ess_ratio"] == pytest.approx(1.0 / 3.0, rel=1e-9)
-        assert actor.actor_optimizer.stepped_lrs == pytest.approx([NOMINAL_LR * (1.0 / 3.0) ** 0.5])
+        assert entry["minibatch_ess"] == pytest.approx(1.0, rel=1e-9)
+        assert actor.actor_optimizer.stepped_lrs == pytest.approx([NOMINAL_LR * 0.5])
         assert actor.actor_optimizer.stepped_lrs[0] > 0.0
 
     def test_deep_underflow_runs_unbraked(self, patched_env):
-        scaling = ESSScalingConfig(enable=True, scaling_rule="sqrt", base_ess_ratio=1.0)
+        # all log-weights -200 but EQUAL: max-shifted ESS = 3 > min_ess
+        scaling = ESSScalingConfig(enable=True, min_ess=1.1, lr_scale=0.5)
         actor, _ = _make_actor(ess_scaling=scaling, seq_log_is_per_microbatch=[[-200.0, -200.0], [-200.0]])
         actor._update_policy_per_traj_packed([_make_minibatch()])
         assert actor.actor_optimizer.stepped_lrs == pytest.approx([NOMINAL_LR])
 
-    def test_ess_base_override_resolves_auto_base(self, patched_env):
-        # base null in config; override 0.5; ratio 1.0 >= base -> unbraked,
-        # but the entry must report the override as the used base.
-        scaling = ESSScalingConfig(enable=True, scaling_rule="sqrt", base_ess_ratio=None)
-        actor, _ = _make_actor(ess_scaling=scaling)
-        metrics = actor._update_policy_per_traj_packed([_make_minibatch(ess_base_override=0.5)])
-        (entry,) = metrics["staleness/ess"]
-        assert entry["base_ess_ratio"] == pytest.approx(0.5)
-        assert actor.actor_optimizer.stepped_lrs == pytest.approx([NOMINAL_LR])
-
-    def test_trigger_deadband_honored(self, patched_env):
-        # ratio 2/3 >= trigger 0.33333 -> full lr despite ratio < base
-        scaling = ESSScalingConfig(enable=True, scaling_rule="sqrt", base_ess_ratio=1.0, trigger_ratio=0.33333)
+    def test_use_clipped_selects_clipped_ess(self, patched_env):
+        # rollout_is_threshold=2.0: log-weights [log(4), 0, 0] give
+        # unclipped ESS = 2.0 (brakes at min_ess=2.0) but clipped weights
+        # [2, 1, 1] give ESS = 16/6 ~= 2.667 > 2.0 -> full lr.
+        scaling = ESSScalingConfig(enable=True, min_ess=2.0, lr_scale=0.5, use_clipped=True)
         actor, _ = _make_actor(ess_scaling=scaling, seq_log_is_per_microbatch=[[math.log(4.0), 0.0], [0.0]])
-        actor._update_policy_per_traj_packed([_make_minibatch()])
+        metrics = actor._update_policy_per_traj_packed([_make_minibatch()])
+        (entry,) = metrics["staleness/ess"]
+        assert entry["minibatch_ess_clipped"] == pytest.approx(16.0 / 6.0)
         assert actor.actor_optimizer.stepped_lrs == pytest.approx([NOMINAL_LR])
 
 

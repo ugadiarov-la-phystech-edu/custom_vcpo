@@ -61,20 +61,20 @@ class PolicyLossConfig(BaseConfig):
 @dataclass
 class ESSScalingConfig(BaseConfig):
     enable: bool = False
-    scaling_rule: str = "sqrt"  # "sqrt" | "linear"
-    # Base (reference) ess_ratio for scaling: lr_scale = min(1, ess_ratio / base).
-    # None = auto-calibrate: the driver captures the first update's measured ESS
-    # ratio (on-policy rho_on) and passes it back via
-    # meta_info["ess_base_override"]; until then scaling is a no-op.
-    # Auto mode is supported by the replay-buffer trainer only.
-    base_ess_ratio: Optional[float] = None
-    use_clipped: bool = False  # use ess ratios derived from clipped is weights
-    # Intervention threshold on ess_ratio / base_ess_ratio: scaling engages only
-    # for mini-batches where the ratio falls BELOW this value; at or above it the
-    # update runs at full nominal lr. None = legacy behavior (engage whenever
-    # ratio < 1). Values <= 1 widen the full-lr deadband; note the lr multiplier
-    # jumps discontinuously from 1 to rule(ratio) at the threshold.
-    trigger_ratio: Optional[float] = None
+    # Min-ESS brake threshold, in effective samples: a mini-batch whose global
+    # ESS is <= min_ess (inclusive) steps at lr * lr_scale; above it the update
+    # runs at full nominal lr. Equivalent to ess_ratio <= min_ess / B. The
+    # max-shifted ESS computation floors ESS at exactly 1 for any non-empty
+    # batch, so with min_ess >= 1 degenerate (single-dominant-sequence)
+    # mini-batches always brake — and never below lr * lr_scale.
+    min_ess: float = 1.1
+    # Constant lr multiplier applied on braked steps (no sqrt/linear shaping)
+    lr_scale: float = 0.5
+    use_clipped: bool = False  # use ESS derived from clipped is weights
+
+    def __post_init__(self):
+        assert self.min_ess >= 1, f"ess_scaling.min_ess must be >= 1 (ESS floors at 1), got {self.min_ess}"
+        assert 0 < self.lr_scale <= 1, f"ess_scaling.lr_scale must be in (0, 1], got {self.lr_scale}"
 
 
 @dataclass
