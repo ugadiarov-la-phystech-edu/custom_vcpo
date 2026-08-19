@@ -229,21 +229,17 @@ save_queue_state=False # no queue snapshots in checkpoints: resume is disabled
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
 test_freq=${test_freq:-20}
-save_freq=${save_freq:-20}
-# Keep EVERY checkpoint (null disables the keep-N pruning) for offline
-# evaluation across training. Checkpoints hold ONLY a ready-to-serve HF
-# model ('hf_model', global_step_N/actor/huggingface — load it directly with
-# vLLM/transformers for eval, no merge step): no optimizer, no sharded
-# weights. hf_model has NO load path in the checkpoint manager, so these
-# checkpoints CANNOT be resumed from — resume_mode=disable below makes that
-# explicit (every launch starts fresh) instead of letting auto-resume
-# silently restore step counters and replay state around base weights.
-# Disk: ~16 GB (bf16 hf) per checkpoint. All resume-state persistence is
-# switched OFF below — pure dead weight under resume_mode=disable:
-# replay_buffer.save_state=False drops replay_buffer.pt (~7-12 GB) and
-# save_queue_state=False drops the message/rollout queue snapshots (and
-# skips the generation pause the queue snapshot needs). Only the tiny
-# data.pt dataloader state and timing_state.json are still written.
+# Model checkpointing is OFF: save_freq<=0 disables _check_save_checkpoint's
+# save gate entirely (fully_async_trainer.py), so no global_step_N/ directory
+# — not even an hf_model — is ever written; zero checkpoint disk footprint.
+# resume_mode=disable is kept as a safety net: with no checkpoints of its own
+# to resume from, this only matters if a prior run left one under the same
+# exp_name/log_dir, which would otherwise be picked up by resume_mode=auto.
+# replay_buffer.save_state / save_queue_state are moot with saving off
+# (nothing ever calls the code path they gate) but left False for when
+# save_freq is overridden back on. Re-enable saving with save_freq=N>0 and
+# set ckpt_save_contents/max_actor_ckpt_to_keep as needed.
+save_freq=${save_freq:--1}
 max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable
