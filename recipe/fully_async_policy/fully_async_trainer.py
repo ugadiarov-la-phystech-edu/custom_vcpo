@@ -792,11 +792,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             validation_time = self.timing_validation_offset
             save_time = self.timing_save_offset
             virtual_training_time = self.virtual_training_time_offset
+        fmt = "%Y-%m-%d %H:%M:%S"
         timing_state = {
             "wall_time_since_first_sample": wall_time,
             "cumulative_validation_time": validation_time,
             "cumulative_save_time": save_time,
             "cumulative_training_time": virtual_training_time,
+            "first_sample_datetime": (
+                datetime.fromtimestamp(self.rollouter_first_sample_time).strftime(fmt)
+                if self.rollouter_first_sample_time is not None
+                else None
+            ),
+            "checkpoint_saved_datetime": datetime.fromtimestamp(save_start).strftime(fmt),
         }
         with open(os.path.join(local_global_step_folder, "timing_state.json"), "w") as f:
             json.dump(timing_state, f, indent=2)

@@ -26,6 +26,7 @@ Run: pytest recipe/fully_async_policy/unittest/test_cumulative_training_time_on_
 import asyncio
 import json
 import time
+from datetime import datetime
 
 import ray.cloudpickle
 from omegaconf import OmegaConf
@@ -278,11 +279,15 @@ def test_timing_state_checkpoint_roundtrip(tmp_path):
     saver._save_timing_state(str(tmp_path), save_start=150.0)
 
     state = json.loads((tmp_path / "timing_state.json").read_text())
+    fmt = "%Y-%m-%d %H:%M:%S"
     assert state == {
         "wall_time_since_first_sample": 50.0,
         "cumulative_validation_time": 5.0,
         "cumulative_save_time": 2.0,
         "cumulative_training_time": 35.0,  # virtual: 120 + (150-130) - 5 - 100
+        # informational date-time anchors (local time of the fake epochs)
+        "first_sample_datetime": datetime.fromtimestamp(100.0).strftime(fmt),
+        "checkpoint_saved_datetime": datetime.fromtimestamp(150.0).strftime(fmt),
     }
 
     resumed = _make_trainer()
@@ -322,6 +327,10 @@ def test_timing_state_save_carries_offsets_forward_without_anchor(tmp_path):
     assert state["cumulative_validation_time"] == 5.0
     assert state["cumulative_save_time"] == 2.0
     assert state["cumulative_training_time"] == 35.0
+    # no first sample yet in this segment -> no datetime anchor for it,
+    # but the save moment is always stamped
+    assert state["first_sample_datetime"] is None
+    assert state["checkpoint_saved_datetime"] == datetime.fromtimestamp(999.0).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def test_timing_state_second_resume_chains_totals(tmp_path):
