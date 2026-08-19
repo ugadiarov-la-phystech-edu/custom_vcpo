@@ -719,6 +719,33 @@ def test_load_replay_checkpoint_state_tolerates_old_ess_base_key():
     assert not hasattr(restored, "replay_ess_base")
 
 
+def test_save_replay_state_gated_by_flag(tmp_path):
+    # replay_buffer.save_state=False skips the 7-12 GB replay_buffer.pt
+    # (resume state — dead weight for never-resumed runs)
+    import os
+
+    for flag, expect_file in ((True, True), (False, False)):
+        trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
+        trainer.replay_enable = True
+        trainer.replay_save_state = flag
+        trainer.replay_buffer.add(_sample(group_version=0), current_version=0)
+        folder = tmp_path / f"global_step_{int(flag)}"
+        folder.mkdir()
+        trainer._save_replay_state(str(folder))
+        assert os.path.exists(folder / "replay_buffer.pt") is expect_file
+
+
+def test_replay_save_state_defaults_to_true_in_recipe_configs():
+    # The yaml default keeps old behavior (persist replay_buffer.pt); the
+    # checkpoint-off scripts opt out explicitly with save_state=False.
+    import os
+
+    cfg_dir = os.path.join(os.path.dirname(__file__), "..", "config")
+    for name in ("fully_async_ppo_trainer.yaml", "fully_async_ppo_megatron_trainer.yaml"):
+        cfg = OmegaConf.load(os.path.join(cfg_dir, name))
+        assert cfg.async_training.replay_buffer.save_state is True, name
+
+
 def test_add_replay_metrics_reports_scaled_lr_not_base():
     trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
     for _ in range(2):
