@@ -199,6 +199,7 @@ replay_tau=${replay_tau:-16}
 replay_staleness_threshold=${replay_staleness_threshold:-64}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
+replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
 dynamic_filtering_enable=False
@@ -207,13 +208,29 @@ opportunistic_enable=False
 opportunistic_max_extra_epochs=0
 serialize_validation=${serialize_validation:-True}
 pause_generation_during_save=${pause_generation_during_save:-True}
+save_queue_state=False # no queue snapshots in checkpoints: resume is disabled
 
 # ================= Training/Rollout Steps =================
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
 test_freq=${test_freq:-20}
 save_freq=${save_freq:-20}
-max_actor_ckpt_to_keep=1 # keep only the most recent checkpoint
+# Keep EVERY checkpoint (null disables the keep-N pruning) for offline
+# evaluation across training. Checkpoints hold ONLY a ready-to-serve HF
+# model ('hf_model', global_step_N/actor/huggingface — load it directly with
+# vLLM/transformers for eval, no merge step): no optimizer, no sharded
+# weights. hf_model has NO load path in the checkpoint manager, so these
+# checkpoints CANNOT be resumed from — resume_mode=disable below makes that
+# explicit (every launch starts fresh) instead of letting auto-resume
+# silently restore step counters and replay state around base weights.
+# All resume-state persistence is switched off too (pure dead weight under
+# resume_mode=disable): replay_buffer.save_state=False drops replay_buffer.pt
+# (~7-12 GB) and save_queue_state=False drops the queue snapshots (and skips
+# the generation pause the queue snapshot needs). Per checkpoint only the
+# ~16 GB bf16 hf model, the tiny data.pt and timing_state.json are written.
+max_actor_ckpt_to_keep=null
+ckpt_save_contents="['hf_model']"
+resume_mode=disable
 
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} fsdp2-noofl B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
@@ -314,6 +331,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.val_before_train=${val_before_train} \
     trainer.save_freq=${save_freq} \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
+    "actor_rollout_ref.actor.checkpoint.save_contents=${ckpt_save_contents}" \
+    trainer.resume_mode=${resume_mode} \
     trainer.rollout_data_dir="${log_dir}" \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
@@ -338,9 +357,11 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.ppo_epochs=null \
     async_training.serialize_validation="${serialize_validation}" \
     async_training.pause_generation_during_save="${pause_generation_during_save}" \
+    async_training.save_queue_state="${save_queue_state}" \
     async_training.replay_buffer.enable="${replay_enable}" \
     async_training.replay_buffer.tau="${replay_tau}" \
     async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
+    async_training.replay_buffer.save_state="${replay_save_state}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"

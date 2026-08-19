@@ -115,6 +115,11 @@ async_training:
     # Seed for the weighted without-replacement sampling of replayed groups
     sampling_seed: 1234
 
+    # Persist replay_buffer.pt (7-12 GB of resume state) with each checkpoint.
+    # Disable for never-resumed runs (e.g. hf_model-only checkpoints under
+    # trainer.resume_mode=disable) to cut checkpoint size and save time
+    save_state: True
+
   # Stop-the-world validation: after a sync that triggers validation, the
   # trainer blocks until the validation sweep completes instead of training
   # ahead on backlog. With generation already paused, the whole pipeline
