@@ -55,7 +55,7 @@ gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33}
 micro_bsz_per_gpu=1
 use_dynamic_bsz=True
-ppo_max_token_len=${ppo_max_token_len:-20480}
+ppo_max_token_len=${ppo_max_token_len:-15360}
 log_prob_micro_bsz_per_gpu=1
 
 bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}}
