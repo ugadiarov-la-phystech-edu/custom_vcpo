@@ -63,6 +63,8 @@ async_training:
 
     sampling_seed: 1234
 
+    save_state: True
+
   serialize_validation: False
 
   pause_generation_during_save: False
