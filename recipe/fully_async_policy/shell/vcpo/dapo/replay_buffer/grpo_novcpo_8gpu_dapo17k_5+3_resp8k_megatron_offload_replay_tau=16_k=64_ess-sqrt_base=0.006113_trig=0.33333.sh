@@ -8,24 +8,27 @@
 #SBATCH --error=./slurm/%A_%x.err
 #SBATCH --job-name=grpo-novcpo-replay-ess
 
-# TRIGGERED ESS-braked replay arm: identical to
-# grpo_novcpo_..._replay_tau=16_k=64_ess-sqrt_base=auto.sh (auto-calibrated
-# base, trainer-side replay buffer, tau=16, eviction k=64, rmb=1, sync after
-# every update, DAPO insertion gate, frozen advantages / behavior log-probs)
-# except for ONE deliberate change:
-#   * ess_scaling.trigger_ratio=0.33333 — the brake engages only for
-#     mini-batches where ess_ratio / base falls BELOW 1/3; at or above it the
+# FIXED-BASE triggered ESS-braked replay arm: identical to
+# grpo_novcpo_..._replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh
+# (trainer-side replay buffer, tau=16, eviction k=64, rmb=1, sync after
+# every update, DAPO insertion gate, frozen advantages / behavior log-probs,
+# trigger_ratio=0.33333 deadband) except for ONE deliberate change:
+#   * ess_scaling.base_ess_ratio=0.006113 — the EXACT value the base=auto
+#     reference run auto-calibrated on its first (staleness-0, on-policy)
+#     update on this setup (ESS 3.23 of B=528 sequences; run reached
+#     val-core 0.625 @ step 280 without divergence). Pinning it makes the
+#     brake deterministic and comparable across runs: no dependence on the
+#     first update's sampled mini-batch, and braking is active from update 1
+#     instead of update 2. With trigger_ratio=0.33333 the brake engages when
+#     ess_ratio < 0.33333 * 0.006113 = 0.002038, i.e. below ESS ~1.08 of 528
+#     — effectively only on ESS-floor mini-batches (one sequence dominating
+#     the IS weights), where lr scales by sqrt(ratio/base) ~ 0.55x at the
+#     structural floor ESS=1.
+# Inherited mechanics of the trig=0.33333 arm:
+#   * ess_scaling.trigger_ratio=0.33333 — at or above ratio 1/3 of base the
 #     update runs at FULL nominal lr (hard knee: the multiplier jumps from 1
-#     to sqrt(ratio) at the threshold). With the auto-calibrated base
-#     (rho_on ~= 0.033 measured on this setup) braking starts below ESS
-#     ~0.011. Motivation: base=auto braked proportionally on healthy steps
-#     from update 1 and lost 0.02-0.05 val vs the fixed 0.016 deadband at
-#     equal ctt, while the 0.016 arm showed braking is only needed at the
-#     detachment threshold. This arm keeps auto's self-calibrated reference
-#     but adds the deadband as a RATIO of the reference (base/3) instead of
-#     a hand-picked absolute value — if it matches the 0.016 arm's curve, the
-#     deadband generalizes across setups without re-measuring rho_on.
-# Inherited mechanics of the base=auto arm:
+#     to sqrt(ratio) at the threshold); the deadband is a RATIO of the
+#     reference (base/3), not a hand-picked absolute value.
 #   * update_policy_per_traj=True: every mini-batch's sequence-level IS
 #     ratios against the cached behavior log-probs are DP-all-reduced into
 #     ess_ratio = (sum w)^2 / (B * sum w^2), logged as staleness/ess_ratio.
@@ -35,15 +38,11 @@
 #     lacked: in its collapse precursors (token-IS mean 24-250, pearson<0.9)
 #     the ESS ratio plummets, so the LR shrinks exactly when the off-policy
 #     runaway starts, turning collapses into slowdowns.
-#   * base_ess_ratio=null (default): AUTO-CALIBRATED — the first update (the
-#     staleness-0 warm-up mini-batch, i.e. the empirical on-policy rho_on for
-#     this exact setup) runs unscaled, its measured ESS ratio becomes the
-#     base (logged as replay/ess_base, persisted in replay_buffer.pt), and
-#     braking starts from update 2. Override ess_base with an explicit value
-#     (e.g. 1.0 for the paper reference, or a measured operating point from
-#     ..._estimate_base_ess_ratio.sh) to skip auto-calibration. NOTE: auto
-#     mode is for fresh runs — resuming from a checkpoint without a stored
-#     base captures a mature-buffer (non-on-policy) reference instead.
+#   * base_ess_ratio=0.006113 (fixed): auto-calibration is skipped — the
+#     explicit config value wins unconditionally (resolve_ess_base in
+#     megatron_actor.py), the first update is braked normally, and the value
+#     is logged as replay/ess_base every update. Override ess_base to change
+#     it (null would re-enable auto-calibration from the first update).
 #   * Costs vs the unbraked arm: slower updates from the per-traj path's
 #     micro-batch-size-1 scheduling (the earlier ~20% figure included
 #     per-traj buffer accumulation + grad norms, both gone now). With
@@ -163,6 +162,29 @@ lr=1e-6
 lr_warmup_steps=0
 weight_decay=0.1
 
+# ================= Seeds =================
+# ONE master seed for every RNG this configuration actually uses. Each can
+# still be overridden separately via its env var; by default all take SEED.
+# (Seeds that are inert in this config are NOT pinned: actor.data_loader_seed
+# — actor.shuffle=False and replay mode composes one mini-batch per update;
+# async_training.ppo_epochs_shuffle_seed — ppo_epochs=null;
+# opportunistic_epochs.shuffle_seed — opportunistic epochs disabled.)
+SEED=${SEED:-1}
+# Train-prompt order: data.shuffle=True (yaml default) draws prompts via a
+# RandomSampler whose torch.Generator is seeded from data.seed. The yaml
+# default is null = UNSEEDED — prompt order would differ between runs.
+data_seed=${data_seed:-${SEED}}
+# Megatron model/parallel RNG (init, dropout, TP rng state). ref and critic
+# resolve their megatron.seed from this value via oc.select automatically.
+megatron_seed=${megatron_seed:-${SEED}}
+# Replay-buffer weighted group sampling (defined here; used in the replay
+# section's override below)
+replay_sampling_seed=${replay_sampling_seed:-${SEED}}
+# NOT covered: the vLLM engine seed. RolloutConfig has no `seed` field
+# (a `+actor_rollout_ref.rollout.seed=` override crashes worker init with
+# ConfigKeyError), so vllm_async_server falls back to seed=0. Note vLLM
+# continuous batching is not bitwise-reproducible at temperature=1.0 anyway.
+
 # ================= ESS-guided LR scaling (VCPO) =================
 update_policy_per_traj=True
 # OPOB off -> the per-traj path runs BUFFER-FREE: no grad accum buffers are
@@ -174,18 +196,18 @@ update_policy_per_traj=True
 grad_baselining=False
 ess_enable=${ess_enable:-True}
 ess_rule=${ess_rule:-sqrt}  # sqrt | linear
-# rho_on reference; null = auto-calibrate from the first update's measured
-# ESS (fresh runs only), or set explicitly (1.0 = paper value for math)
-ess_base=${ess_base:-null}
+# rho_on reference, FIXED to the value the base=auto_trig=0.33333 reference
+# run auto-calibrated on its first on-policy update (ESS 3.23 / B=528):
+# deterministic brake, active from update 1. null = re-enable auto-calibration
+ess_base=${ess_base:-0.006113}
 ess_use_clipped=False # ESS from unclipped ratios (paper): the brake must see what truncation hides
 # Intervention threshold on ess_ratio/base: scaling engages only for
 # mini-batches where the ratio falls BELOW this value; at or above it the
 # update runs at full nominal lr (the multiplier jumps from 1 to
-# sqrt(ratio) at the threshold). 0.33333 ~= a deadband at base/3: with the
-# auto-calibrated base (rho_on ~= 0.033 on this setup) braking engages only
-# below ESS ~0.011 — between the base=auto arm (brakes below 0.033,
-# over-braked healthy steps) and the fixed 0.016 deadband arm. null = legacy
-# (engage whenever ratio < 1).
+# sqrt(ratio) at the threshold). 0.33333 = a deadband at base/3: with
+# base=0.006113 braking engages only below ess_ratio 0.002038, i.e.
+# ESS < ~1.08 of the 528-sequence mini-batch — essentially only on
+# ESS-floor mini-batches. null = legacy (engage whenever ratio < 1).
 ess_trigger=${ess_trigger:-0.33333}
 ess_base_tag=${ess_base}
 [ "${ess_base_tag}" = "null" ] && ess_base_tag="auto"
@@ -223,7 +245,7 @@ replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-16}
 replay_staleness_threshold=${replay_staleness_threshold:-64}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
-replay_sampling_seed=${replay_sampling_seed:-1234}
+# replay_sampling_seed is defined in the Seeds section (defaults to SEED)
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
@@ -262,7 +284,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_rule}-base-${ess_base_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -291,6 +313,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     data.return_raw_chat=${return_raw_chat} \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=8 \
+    data.seed=${data_seed} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
@@ -323,6 +346,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ess_scaling.base_ess_ratio=${ess_base} \
     actor_rollout_ref.actor.ess_scaling.use_clipped=${ess_use_clipped} \
     actor_rollout_ref.actor.ess_scaling.trigger_ratio=${ess_trigger} \
+    actor_rollout_ref.actor.megatron.seed=${megatron_seed} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \

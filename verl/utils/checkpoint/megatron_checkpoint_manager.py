@@ -424,55 +424,69 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             self.previous_saved_paths = self.previous_saved_paths[keep_start:]
 
         local_path = local_mkdir_safe(local_path)
-        dist_checkpoint_path = get_dist_checkpoint_path(local_path)
 
         # Note that model weights, optimizer states, and extra states are generated
-        # together in a state dict, we save them in one time
+        # together in a state dict, we save them in one time. With nothing to
+        # dist-save (e.g. save_contents=['hf_model']) the dist-checkpointing
+        # pass is skipped entirely — no state dict, no dist_ckpt/ directory.
+        async_save_request = None
+        dist_checkpoint_path = None
+        hf_config_tokenizer_path = None
         if self.use_dist_checkpointing:
-            # Generate state dict for saving
-            state_dict = self.generate_state_dict(
-                self.should_save_model, self.should_save_optimizer, self.should_save_extra
-            )
-            log_with_rank(f"Generated state dict for saving: {state_dict.keys()}", rank=self.rank, logger=logger)
-            for vpp_rank, model in enumerate(self.model):
-                if len(self.model) > 1:
-                    model_i_keys = state_dict[f"model{vpp_rank}"].keys()
-                    log_with_rank(f"Generated state dict for saving: {model_i_keys}", rank=self.rank, logger=logger)
-                else:
-                    log_with_rank(
-                        f"Generated state dict for saving: {state_dict['model'].keys()}", rank=self.rank, logger=logger
-                    )
-            # Start Async save if enabled
-            async_save_request = save_dist_checkpointing(
-                sharded_state_dict=state_dict,
-                ckpt_path=dist_checkpoint_path,
-                async_save=self.checkpoint_config.async_save,
-            )
+            if self.should_save_model or self.should_save_optimizer or self.should_save_extra:
+                dist_checkpoint_path = get_dist_checkpoint_path(local_path)
+                # Generate state dict for saving
+                state_dict = self.generate_state_dict(
+                    self.should_save_model, self.should_save_optimizer, self.should_save_extra
+                )
+                log_with_rank(f"Generated state dict for saving: {state_dict.keys()}", rank=self.rank, logger=logger)
+                if self.should_save_model:
+                    # The 'model'/'modelN' keys exist only when the model state was generated
+                    for vpp_rank, model in enumerate(self.model):
+                        if len(self.model) > 1:
+                            model_i_keys = state_dict[f"model{vpp_rank}"].keys()
+                            log_with_rank(
+                                f"Generated state dict for saving: {model_i_keys}", rank=self.rank, logger=logger
+                            )
+                        else:
+                            log_with_rank(
+                                f"Generated state dict for saving: {state_dict['model'].keys()}",
+                                rank=self.rank,
+                                logger=logger,
+                            )
+                # Start Async save if enabled
+                async_save_request = save_dist_checkpointing(
+                    sharded_state_dict=state_dict,
+                    ckpt_path=dist_checkpoint_path,
+                    async_save=self.checkpoint_config.async_save,
+                )
 
-            # Synchronize all async save requests
-            if not self.checkpoint_config.async_save:
-                assert async_save_request is None, "Async save request should be None when not using async save."
-                torch.distributed.barrier()
+                # Synchronize all async save requests
+                if not self.checkpoint_config.async_save:
+                    assert async_save_request is None, "Async save request should be None when not using async save."
+                    torch.distributed.barrier()
         else:
             assert self.use_hf_checkpoint, "When not using distributed checkpointing, use_hf_checkpoint should be True."
-            # Generate optimizer and exra state dicts
-            state_dict = self.generate_state_dict(
-                generate_model=False,
-                generate_optimizer=self.should_save_optimizer,
-                generate_extra=self.should_save_extra,
-            )
-            # Save optimizer and extra states to local path
-            # Start Async save if enabled
-            async_save_request = save_dist_checkpointing(
-                sharded_state_dict=state_dict,
-                ckpt_path=dist_checkpoint_path,
-                async_save=self.checkpoint_config.async_save,
-            )
+            if self.should_save_optimizer or self.should_save_extra:
+                dist_checkpoint_path = get_dist_checkpoint_path(local_path)
+                # Generate optimizer and exra state dicts
+                state_dict = self.generate_state_dict(
+                    generate_model=False,
+                    generate_optimizer=self.should_save_optimizer,
+                    generate_extra=self.should_save_extra,
+                )
+                # Save optimizer and extra states to local path
+                # Start Async save if enabled
+                async_save_request = save_dist_checkpointing(
+                    sharded_state_dict=state_dict,
+                    ckpt_path=dist_checkpoint_path,
+                    async_save=self.checkpoint_config.async_save,
+                )
 
-            # Synchronize all async save requests
-            if not self.checkpoint_config.async_save:
-                assert async_save_request is None, "Async save request should be None when not using async save."
-                torch.distributed.barrier()
+                # Synchronize all async save requests
+                if not self.checkpoint_config.async_save:
+                    assert async_save_request is None, "Async save request should be None when not using async save."
+                    torch.distributed.barrier()
 
         if self.should_save_model:
             # Save adapter-only checkpoint if PEFT is enabled
@@ -507,8 +521,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
                 log_with_rank(f"Saved bridge checkpoint to {hf_ckpt_path}", rank=self.rank, logger=logger)
 
-            # Only rank 0 saves the hf config and tokenizer to huggingface path
-            # No matter whether we save hf model or not
+        # Only rank 0 saves the hf config and tokenizer to huggingface path —
+        # also for hf_model-only checkpoints (the weight savers write bare
+        # weights; without config/tokenizer the export is not loadable as HF)
+        if self.should_save_model or self.should_save_hf_model:
             if self.rank == 0:
                 # Save tokenizer
                 hf_config_tokenizer_path = get_hf_model_checkpoint_path(local_path)
@@ -630,9 +646,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
         def finalize_save_fn():
             # Rank 0 uploads checkpoint to HDFS if hdfs_path is provided
-            log_with_rank(
-                f"Dist checkpointing save completed for {dist_checkpoint_path}", rank=self.rank, logger=logger
-            )
+            log_with_rank(f"Checkpoint save completed for {local_path}", rank=self.rank, logger=logger)
             if self.rank == 0:
                 local_latest_checkpointed_iteration = os.path.join(
                     os.path.dirname(os.path.dirname(local_path)), "latest_checkpointed_iteration.txt"
@@ -644,16 +658,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     from verl.utils import hdfs_io
 
                     hdfs_io.makedirs(hdfs_path, exist_ok=True)
-                    hdfs_io.copy(src=dist_checkpoint_path, dst=hdfs_path, dirs_exist_ok=True)
-                    hdfs_io.copy(src=hf_config_tokenizer_path, dst=hdfs_path, dirs_exist_ok=True)
+                    # Skipped saves leave these paths None (e.g. no dist
+                    # state with save_contents=['hf_model'])
+                    if dist_checkpoint_path is not None:
+                        hdfs_io.copy(src=dist_checkpoint_path, dst=hdfs_path, dirs_exist_ok=True)
+                    if hf_config_tokenizer_path is not None:
+                        hdfs_io.copy(src=hf_config_tokenizer_path, dst=hdfs_path, dirs_exist_ok=True)
 
-        if self.checkpoint_config.async_save:
-            assert async_save_request is not None, "Async save request should not be None when using async save."
+        if async_save_request is not None:
+            assert self.checkpoint_config.async_save, "Async save request implies async_save is enabled."
             async_save_request.add_finalize_fn(finalize_save_fn)
             from megatron.core.dist_checkpointing.strategies.base import async_calls
 
             async_calls.schedule_async_request(async_save_request)
         else:
+            # Sync save, or the dist-checkpointing pass was skipped (nothing
+            # to dist-save): finalize immediately.
             finalize_save_fn()
 
         self.previous_saved_paths.append(local_path)

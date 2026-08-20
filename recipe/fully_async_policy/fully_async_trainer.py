@@ -173,6 +173,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             assert self.replay_requires_mini_batches >= 1, "replay_buffer.requires_mini_batches must be >= 1"
             self.replay_warmup_updates = math.ceil(self.replay_requires_mini_batches)
             self.replay_sampling_seed = int(replay_cfg.get("sampling_seed", 1234))
+            # Persist replay_buffer.pt with each checkpoint (7-12 GB of resume
+            # state); disable for never-resumed runs (e.g. hf_model-only
+            # checkpoints under trainer.resume_mode=disable)
+            self.replay_save_state = bool(replay_cfg.get("save_state", True))
             assert self.trigger_parameter_sync_step == 1, (
                 "replay_buffer mode syncs weights after every update: set "
                 "async_training.trigger_parameter_sync_step=1"
@@ -930,19 +934,26 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
         ray.get(self.param_synchronizer.rollouter_save_checkpoint.remote(local_global_step_folder))
         self._save_timing_state(local_global_step_folder, save_start)
-        if self.replay_enable:
-            replay_path = os.path.join(local_global_step_folder, "replay_buffer.pt")
-            torch.save(self._replay_checkpoint_state(), replay_path)
-            print(
-                f"[FullyAsyncTrainer][Replay] Saved replay buffer "
-                f"({self.replay_buffer.size()} groups) to {replay_path}"
-            )
+        self._save_replay_state(local_global_step_folder)
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.current_param_version))
+
+    def _save_replay_state(self, local_global_step_folder):
+        """Persist the replay buffer next to the checkpoint unless
+        replay_buffer.save_state=False (resume state only — dead weight for
+        runs that will never be resumed)."""
+        if not self.replay_enable or not self.replay_save_state:
+            return
+        replay_path = os.path.join(local_global_step_folder, "replay_buffer.pt")
+        torch.save(self._replay_checkpoint_state(), replay_path)
+        print(
+            f"[FullyAsyncTrainer][Replay] Saved replay buffer "
+            f"({self.replay_buffer.size()} groups) to {replay_path}"
+        )
 
     def _save_timing_state(self, local_global_step_folder, save_start):
         """Persist the cumulative timing totals so a resumed run continues the
@@ -968,11 +979,23 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             validation_time = self.timing_validation_offset
             save_time = self.timing_save_offset
             virtual_training_time = self.virtual_training_time_offset
+        # Human-readable anchors (informational only — restore ignores them):
+        # when this run's first sample arrived and when this checkpoint was
+        # saved. first_sample_datetime is null before the first sample; after
+        # a resume it is the CURRENT segment's first sample, not the original
+        # run's (the cross-segment total lives in wall_time_since_first_sample).
+        fmt = "%Y-%m-%d %H:%M:%S"
         timing_state = {
             "wall_time_since_first_sample": wall_time,
             "cumulative_validation_time": validation_time,
             "cumulative_save_time": save_time,
             "cumulative_training_time": virtual_training_time,
+            "first_sample_datetime": (
+                datetime.fromtimestamp(self.rollouter_first_sample_time).strftime(fmt)
+                if self.rollouter_first_sample_time is not None
+                else None
+            ),
+            "checkpoint_saved_datetime": datetime.fromtimestamp(save_start).strftime(fmt),
         }
         with open(os.path.join(local_global_step_folder, "timing_state.json"), "w") as f:
             json.dump(timing_state, f, indent=2)
