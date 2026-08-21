@@ -92,7 +92,7 @@ class TestEpochStamping:
 class TestComputeStalenessStatisticsEpochIdx:
     def test_epoch_idx_is_propagated_into_traj_records(self):
         data = _make_dataproto(batch_size=4)
-        records, _ = compute_staleness_statistics(data, minibatch_idx=7, rollout_is_threshold=None, epoch_idx=1)
+        records = compute_staleness_statistics(data, minibatch_idx=7, epoch_idx=1)
         assert len(records) == 4
         assert all(r.epoch_idx == 1 for r in records)
         assert all(r.minibatch_idx == 7 for r in records)
@@ -100,14 +100,12 @@ class TestComputeStalenessStatisticsEpochIdx:
     def test_epoch_idx_defaults_to_zero(self):
         """Callers that omit epoch_idx keep the old behaviour."""
         data = _make_dataproto(batch_size=4)
-        records, _ = compute_staleness_statistics(data, minibatch_idx=0, rollout_is_threshold=None)
+        records = compute_staleness_statistics(data, minibatch_idx=0)
         assert all(r.epoch_idx == 0 for r in records)
 
     def test_epoch_idx_is_coerced_to_int(self):
         data = _make_dataproto(batch_size=2)
-        records, _ = compute_staleness_statistics(
-            data, minibatch_idx=0, rollout_is_threshold=None, epoch_idx=np.int64(2)
-        )
+        records = compute_staleness_statistics(data, minibatch_idx=0, epoch_idx=np.int64(2))
         assert all(isinstance(r.epoch_idx, int) and r.epoch_idx == 2 for r in records)
 
     def test_records_are_serializable_with_epoch_idx(self):
@@ -115,6 +113,6 @@ class TestComputeStalenessStatisticsEpochIdx:
         from dataclasses import asdict
 
         data = _make_dataproto(batch_size=2)
-        records, _ = compute_staleness_statistics(data, minibatch_idx=3, rollout_is_threshold=None, epoch_idx=1)
+        records = compute_staleness_statistics(data, minibatch_idx=3, epoch_idx=1)
         dumped = [asdict(r) for r in records]
         assert all(d["epoch_idx"] == 1 and d["minibatch_idx"] == 3 for d in dumped)

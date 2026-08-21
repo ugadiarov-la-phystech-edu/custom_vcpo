@@ -387,9 +387,14 @@ class DataParallelPPOActor(BasePPOActor):
         (max-shifted exp — exact for weights anywhere on the fp range, ESS
         floored at 1), step at lr * lr_scale when ESS <= min_ess (full nominal
         lr otherwise), restore the nominal LR, and return the structured
-        staleness/ess entry the fully-async trainer consumes."""
+        staleness/ess entry the fully-async trainer consumes.
+
+        The measured sequence count goes to the brake as well: it is what lets
+        an unmeasurable batch (a non-finite log-IS from broken log-probs) fail
+        closed instead of stepping at full lr, while an empty one still steps
+        unbraked."""
         ess_cfg = self.config.ess_scaling
-        ess, ess_ratio, ess_clipped, ess_ratio_clipped, _ = compute_global_ess_from_log_weights(
+        ess, ess_ratio, ess_clipped, ess_ratio_clipped, ess_count = compute_global_ess_from_log_weights(
             seq_log_is, rollout_is_threshold
         )
         ess_for_scaling = ess_clipped if ess_cfg.use_clipped else ess
@@ -398,7 +403,9 @@ class DataParallelPPOActor(BasePPOActor):
         base_lrs = [float(pg["lr"]) for pg in param_groups]
         scaled = False
         if param_groups:
-            lr_mult = compute_min_ess_lr_scale(float(ess_for_scaling), ess_cfg.min_ess, ess_cfg.lr_scale)
+            lr_mult = compute_min_ess_lr_scale(
+                float(ess_for_scaling), ess_cfg.min_ess, ess_cfg.lr_scale, count=ess_count
+            )
             for pg, base_lr in zip(param_groups, base_lrs, strict=True):
                 self._set_param_group_lr(pg, base_lr * lr_mult)
             scaled = True

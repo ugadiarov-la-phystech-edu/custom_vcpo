@@ -78,8 +78,49 @@ class TestStructuralFloor:
         assert scale > 0.0
 
     def test_empty_batch_is_a_noop(self):
-        # ess == 0 only happens for an empty global batch: no scaling.
+        # count == 0: the ESS was not measured (empty global batch). Nothing
+        # to brake.
+        assert compute_min_ess_lr_scale(0.0, 1.1, 0.5, count=0) == 1.0
+
+    def test_zero_ess_without_count_keeps_legacy_reading(self):
+        # Callers that cannot supply a count keep the old "ess == 0 means an
+        # empty batch" reading rather than braking on ambiguous input.
         assert compute_min_ess_lr_scale(0.0, 1.1, 0.5) == 1.0
+
+
+class TestFailsClosed:
+    """A measurement that broke must brake, not hand out full nominal lr.
+
+    On finite log-weights the max-shifted computation cannot produce a
+    non-positive or non-finite ESS, so those values mean the input itself was
+    unusable — a NaN log-prob, or a -inf rollout log-prob making the sequence
+    log-IS +inf. The rule used to return 1.0 for exactly those cases."""
+
+    def test_zero_ess_over_a_non_empty_batch_brakes(self):
+        assert compute_min_ess_lr_scale(0.0, 1.1, 0.5, count=528) == 0.5
+
+    def test_nan_ess_brakes(self):
+        assert compute_min_ess_lr_scale(float("nan"), 1.1, 0.5, count=528) == 0.5
+        # ...and even without a count: NaN is never a healthy reading.
+        assert compute_min_ess_lr_scale(float("nan"), 1.1, 0.5) == 0.5
+
+    def test_infinite_ess_brakes(self):
+        assert compute_min_ess_lr_scale(float("inf"), 1.1, 0.5, count=528) == 0.5
+        assert compute_min_ess_lr_scale(float("-inf"), 1.1, 0.5, count=528) == 0.5
+
+    def test_negative_ess_brakes(self):
+        assert compute_min_ess_lr_scale(-1.0, 1.1, 0.5, count=528) == 0.5
+
+    def test_no_data_wins_over_broken_data(self):
+        # count == 0 is checked first: a NaN ESS over an empty batch is just
+        # "nothing was measured", and braking a no-op step would be noise.
+        assert compute_min_ess_lr_scale(float("nan"), 1.1, 0.5, count=0) == 1.0
+
+    def test_healthy_batch_with_count_is_unbraked(self):
+        assert compute_min_ess_lr_scale(400.0, 1.1, 0.5, count=528) == 1.0
+
+    def test_degenerate_batch_with_count_still_brakes(self):
+        assert compute_min_ess_lr_scale(1.0, 1.1, 0.5, count=528) == 0.5
 
 
 class TestParameters:

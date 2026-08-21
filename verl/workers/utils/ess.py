@@ -27,6 +27,16 @@ import torch.distributed as dist
 __all__ = ["compute_global_ess_from_log_weights", "compute_min_ess_lr_scale"]
 
 
+def _is_corrupt(log_w: torch.Tensor) -> bool:
+    """True when a log-weight cannot be interpreted as a weight at all.
+
+    NaN means broken upstream log-probs; +inf cannot arise from a finite sum
+    of log-probs, so it means the same. -inf is NOT corrupt — it is exactly a
+    zero weight (a token the policy assigns probability 0), and the max-shift
+    handles it without any special case."""
+    return bool(log_w.numel()) and bool((torch.isnan(log_w) | (log_w == math.inf)).any())
+
+
 def compute_global_ess_from_log_weights(
     seq_log_is: Sequence[float],
     rollout_is_threshold: float | None = None,
@@ -53,10 +63,14 @@ def compute_global_ess_from_log_weights(
 
     When torch.distributed is initialized the maxima and shifted sums are
     all-reduced over ``group`` (None = the world group, the DP group of the
-    FSDP trainer). Two tiny collectives: MAX on 2 doubles, SUM on 5.
+    FSDP trainer). Two tiny collectives: MAX on 2 doubles, SUM on 6 — the 6th
+    being a corruption flag, so a non-finite log-weight on any rank (broken
+    upstream log-probs, or a -inf rollout log-prob turning the ratio into
+    +inf) makes the ESS NaN globally instead of reading as a healthy batch.
+    The brake fails closed on NaN.
 
     Returns (ess, ess_ratio, ess_clipped, ess_ratio_clipped, global_count);
-    all zeros when the global batch is empty.
+    all zeros when the global batch is empty, NaN ESS when it is corrupt.
     """
     s = torch.as_tensor([float(v) for v in seq_log_is], dtype=torch.float64)
     if rollout_is_threshold is not None and float(rollout_is_threshold) > 0:
@@ -64,13 +78,23 @@ def compute_global_ess_from_log_weights(
     else:
         s_clip = s
 
+    finite = torch.isfinite(s)
+    finite_clip = torch.isfinite(s_clip)
+    corrupt_local = _is_corrupt(s)
+
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     neg_inf = float("-inf")
+
+    def _finite_max(log_w: torch.Tensor, mask: torch.Tensor) -> float:
+        # Non-finite entries are excluded from the shift: one rank's NaN must
+        # not poison the MAX all-reduce (whose result is then implementation
+        # defined). The corruption travels as a flag in the SUM below instead,
+        # which turns the ESS into NaN for every rank at once.
+        kept = log_w[mask]
+        return kept.max().item() if kept.numel() else neg_inf
+
     maxes = torch.tensor(
-        [
-            s.max().item() if s.numel() else neg_inf,
-            s_clip.max().item() if s_clip.numel() else neg_inf,
-        ],
+        [_finite_max(s, finite), _finite_max(s_clip, finite_clip)],
         device=device,
         dtype=torch.float64,
     )
@@ -84,22 +108,30 @@ def compute_global_ess_from_log_weights(
         e = torch.exp(log_w - m)
         return float(e.sum()), float((e * e).sum())
 
-    w_sum, w_sq_sum = _shifted_sums(s, shift)
-    wc_sum, wc_sq_sum = _shifted_sums(s_clip, shift_clip)
+    w_sum, w_sq_sum = _shifted_sums(s[finite], shift)
+    wc_sum, wc_sq_sum = _shifted_sums(s_clip[finite_clip], shift_clip)
     sums = torch.tensor(
-        [w_sum, w_sq_sum, wc_sum, wc_sq_sum, float(s.numel())],
+        [w_sum, w_sq_sum, wc_sum, wc_sq_sum, float(s.numel()), 1.0 if corrupt_local else 0.0],
         device=device,
         dtype=torch.float64,
     )
     if dist.is_initialized():
         dist.all_reduce(sums, op=dist.ReduceOp.SUM, group=group)
-    g_sum, g_sq_sum, gc_sum, gc_sq_sum, count = sums.tolist()
+    g_sum, g_sq_sum, gc_sum, gc_sq_sum, count, corrupt = sums.tolist()
     count = int(count)
+    corrupt = corrupt > 0.0
 
     def _ess(sum_w: float, sum_w_sq: float) -> tuple[float, float]:
         # The rank holding the global max contributes exactly 1 to sum_w_sq,
         # so a positive count implies a positive denominator — no eps needed.
-        if count <= 0 or sum_w_sq <= 0.0:
+        if count <= 0:
+            return 0.0, 0.0
+        if corrupt:
+            # The ESS of a batch carrying a non-finite log-weight is unknowable.
+            # Reporting NaN (rather than a sum that silently reads as healthy)
+            # is what lets the brake fail closed on it.
+            return math.nan, math.nan
+        if sum_w_sq <= 0.0:
             return 0.0, 0.0
         ess = (sum_w * sum_w) / sum_w_sq
         return ess, ess / count
@@ -109,7 +141,7 @@ def compute_global_ess_from_log_weights(
     return ess, ess_ratio, ess_clipped, ess_ratio_clipped, count
 
 
-def compute_min_ess_lr_scale(ess: float, min_ess: float, lr_scale: float) -> float:
+def compute_min_ess_lr_scale(ess: float, min_ess: float, lr_scale: float, count: int | None = None) -> float:
     """LR multiplier of the min-ESS brake.
 
     Brake when the mini-batch's global ESS carries at most ``min_ess``
@@ -121,7 +153,28 @@ def compute_min_ess_lr_scale(ess: float, min_ess: float, lr_scale: float) -> flo
     structural floor ESS = 1 that the max-shifted computation guarantees for
     any non-empty batch (a single dominant sequence reads exactly 1), so
     degenerate mini-batches always brake at exactly lr_scale — never 0.
-    ess == 0 means an empty global batch: no scaling."""
-    if ess > 0 and float(ess) <= float(min_ess):
+
+    ``count`` is the number of sequences the ESS was measured over, and it is
+    what separates "no data" from "broken measurement":
+
+    * count == 0 — the ESS was not measured (an empty global batch): no
+      scaling, 1.0.
+    * a non-finite ESS, or ESS <= 0 over a non-empty batch, cannot happen with
+      the max-shifted computation on finite log-weights, so it means the
+      measurement itself broke (a NaN log-prob, or a -inf rollout log-prob
+      making the ratio +inf). The brake then FAILS CLOSED (lr_scale) rather
+      than handing out full nominal lr on what is almost certainly the most
+      degenerate mini-batch of the run.
+
+    Callers that cannot supply ``count`` keep the legacy reading of ess == 0
+    as "empty batch" (1.0); non-finite still fails closed."""
+    ess = float(ess)
+    if count is not None and int(count) <= 0:
+        return 1.0
+    if not math.isfinite(ess):
+        return float(lr_scale)
+    if ess <= 0:
+        return float(lr_scale) if count is not None else 1.0
+    if ess <= float(min_ess):
         return float(lr_scale)
     return 1.0

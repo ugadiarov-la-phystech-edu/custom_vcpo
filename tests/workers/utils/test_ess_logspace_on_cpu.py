@@ -159,6 +159,45 @@ class TestEdgeCases:
         assert ratio_c == pytest.approx(ratio, rel=1e-12)
 
 
+class TestNonFiniteInputs:
+    """A non-finite log-weight means the measurement itself broke: a NaN
+    log-prob after a bad step, or a -inf rollout log-prob turning the ratio
+    into +inf. The ESS is then unknowable and must read NaN, so the brake can
+    fail closed. Before this, the non-finite max made the shifted sums 0 and
+    the ESS read a healthy-looking 0.0 -> full nominal lr on the worst batch
+    of the run."""
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_corrupt_entry_gives_nan_ess_with_a_real_count(self, bad):
+        ess, ratio, ess_c, ratio_c, n = compute_global_ess_from_log_weights([0.0, -1.0, bad, -2.0], 2.0)
+        assert math.isnan(ess) and math.isnan(ratio)
+        assert math.isnan(ess_c) and math.isnan(ratio_c)
+        assert n == 4  # count still reports the batch size: broken != empty
+
+    def test_corrupt_entry_does_not_read_as_zero(self):
+        """The old behaviour, pinned so it cannot come back: a +inf weight
+        used to make every shifted sum 0.0 and the ESS a plain 0.0."""
+        ess, ratio, *_ = compute_global_ess_from_log_weights([float("inf"), 0.0, 0.0, 0.0])
+        assert ess != 0.0 and ratio != 0.0
+
+    def test_negative_infinity_is_a_legitimate_zero_weight(self):
+        # exp(-inf) == 0 exactly; that is a weight of zero, not corruption.
+        ess, ratio, _, _, n = compute_global_ess_from_log_weights([0.0, float("-inf"), float("-inf"), float("-inf")])
+        assert (ess, ratio, n) == (1.0, 0.25, 4)
+
+    def test_all_negative_infinity_reads_zero_over_a_non_empty_batch(self):
+        ess, ratio, _, _, n = compute_global_ess_from_log_weights([float("-inf")] * 4)
+        assert (ess, ratio, n) == (0.0, 0.0, 4)
+
+    def test_finite_neighbours_of_a_corrupt_entry_do_not_rescue_it(self):
+        """Even one bad sequence in an otherwise healthy mini-batch poisons
+        the measurement — the brake must not be handed a plausible number."""
+        logs = [0.1 * i for i in range(64)] + [float("nan")]
+        ess, _, _, _, n = compute_global_ess_from_log_weights(logs)
+        assert math.isnan(ess)
+        assert n == 65
+
+
 @pytest.fixture()
 def single_rank_gloo(tmp_path_factory):
     created = False
@@ -186,3 +225,27 @@ class TestDistributedPath:
         assert with_dist[2] == pytest.approx(clipped_ref_ess, rel=1e-9)
         assert with_dist[3] == pytest.approx(clipped_ref_ratio, rel=1e-9)
         assert with_dist[4] == 4
+
+    @pytest.mark.usefixtures("single_rank_gloo")
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_corruption_survives_the_collectives(self, bad):
+        """The corruption flag rides the SUM all-reduce as a 6th element, so
+        it cannot be lost the way a NaN in the MAX all-reduce would be
+        (NCCL's MAX over NaN is implementation defined). The local max itself
+        is taken over finite entries only, which is what keeps that MAX
+        meaningful for the other ranks."""
+        assert dist.is_initialized()
+        ess, ratio, ess_c, ratio_c, n = compute_global_ess_from_log_weights([1.0, bad, -3.0], 2.0)
+        assert math.isnan(ess) and math.isnan(ratio)
+        assert math.isnan(ess_c) and math.isnan(ratio_c)
+        assert n == 3
+
+    @pytest.mark.usefixtures("single_rank_gloo")
+    def test_healthy_batch_unaffected_by_the_corruption_flag(self):
+        logs = [0.5, 0.0, -1.0]
+        assert dist.is_initialized()
+        ess, ratio, _, _, n = compute_global_ess_from_log_weights(logs)
+        ref_ess, ref_ratio = naive_ess([math.exp(v) for v in logs])
+        assert ess == pytest.approx(ref_ess, rel=1e-9)
+        assert ratio == pytest.approx(ref_ratio, rel=1e-9)
+        assert n == 3

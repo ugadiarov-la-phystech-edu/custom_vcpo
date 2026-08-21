@@ -494,6 +494,70 @@ class TestLogspaceEssRegressions:
         assert stepped == [pytest.approx(NOMINAL_LR)]
 
 
+class TestNonFiniteEssRegressions:
+    """Broken log-probs must brake, not step at full lr.
+
+    A NaN log-prob, or a -inf rollout log-prob (making the sequence log-IS
+    +inf), used to leave the shifted sums at 0 -> ESS 0.0 -> the brake read
+    that as "empty batch" and stepped at full nominal lr. These go through the
+    REAL update_policy path, so they also pin that the corrupt value reaches
+    the trainer's staleness/ess entry instead of a healthy-looking 0.0."""
+
+    def test_infinite_seq_log_is_brakes(self):
+        actor = _make_actor(_ess_config())
+        stepped = _record_stepped_lrs(actor)
+        # target weight +inf -> rollout log-prob -inf -> seq log-IS +inf
+        metrics = actor.update_policy(_make_batch([float("inf"), 1.0, 1.0, 1.0]))
+        (entry,) = metrics["staleness/ess"]
+        assert math.isnan(entry["minibatch_ess"])
+        assert math.isnan(entry["minibatch_ess_ratio"])
+        assert stepped == [pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)]
+        assert entry["ess_scaled_lr"] == pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)
+
+    def test_nan_seq_log_is_reports_corrupt_and_never_steps(self):
+        """NaN log-probs poison the loss too, so _optimizer_step's existing
+        non-finite-grad guard (dp_actor.py:303) drops the update before the
+        brake can matter. What the brake owes here is an honest measurement:
+        NaN, not the 0.0 that used to read as an empty batch."""
+        actor = _make_actor(_ess_config())
+        stepped = _record_stepped_lrs(actor)
+        metrics = actor.update_policy(_make_batch([float("nan"), 1.0, 1.0, 1.0]))
+        (entry,) = metrics["staleness/ess"]
+        assert math.isnan(entry["minibatch_ess"])
+        assert entry["ess_scaled_lr"] == pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)  # brake engaged
+        assert stepped == []  # ...and the step was dropped anyway
+
+    def test_corrupt_ess_never_reads_as_a_healthy_zero(self):
+        """The precise old failure: ESS 0.0 and a full-lr step."""
+        actor = _make_actor(_ess_config())
+        stepped = _record_stepped_lrs(actor)
+        metrics = actor.update_policy(_make_batch([float("inf"), 1.0, 1.0, 1.0]))
+        (entry,) = metrics["staleness/ess"]
+        assert entry["minibatch_ess"] != 0.0
+        assert stepped != [pytest.approx(NOMINAL_LR, rel=1e-6)]
+
+    def test_zero_weight_sequence_is_not_corruption(self):
+        """A sequence the policy gives probability 0 has log-IS -inf, which is
+        an exact zero weight — the other three sequences still describe a
+        healthy batch (ESS = 3) and the step must run unbraked."""
+        actor = _make_actor(_ess_config())
+        stepped = _record_stepped_lrs(actor)
+        metrics = actor.update_policy(_make_batch([0.0, 1.0, 1.0, 1.0]))
+        (entry,) = metrics["staleness/ess"]
+        assert entry["minibatch_ess"] == pytest.approx(3.0, rel=1e-6)
+        assert entry["minibatch_ess_ratio"] == pytest.approx(0.75, rel=1e-6)
+        assert stepped == [pytest.approx(NOMINAL_LR, rel=1e-6)]
+
+    def test_healthy_batch_still_steps_at_nominal_lr(self):
+        """The guard must not cost anything on ordinary batches."""
+        actor = _make_actor(_ess_config())
+        stepped = _record_stepped_lrs(actor)
+        metrics = actor.update_policy(_make_batch([1.0, 1.1, 0.9, 1.0]))
+        (entry,) = metrics["staleness/ess"]
+        assert entry["minibatch_ess"] > 1.1
+        assert stepped == [pytest.approx(NOMINAL_LR, rel=1e-6)]
+
+
 class TestGuards:
     def test_missing_rollout_log_probs_raises_for_ess(self):
         actor = _make_actor(_ess_config())
