@@ -1,9 +1,12 @@
+import math
+
 import torch
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple, Literal
 from verl import DataProto
 from megatron.core import parallel_state as mpu
 from verl.utils.torch_functional import allgather_dict_into_list
+from verl.workers.utils.ess import ess_from_log_weights
 from collections import defaultdict
 
 
@@ -48,6 +51,11 @@ class TrajRecord:
     rollout_is_geom_mean: Optional[float] = None
     rollout_seq_is: Optional[float] = None
     rollout_seq_is_clipped: Optional[float] = None
+    # Sum of masked token log-ratios, i.e. log(rollout_seq_is), kept unexp'd.
+    # ESS is computed from this: exp() in fp32 flushes sums below ~-87 to 0 and
+    # sums above ~88.7 to inf, which silently drove the LR to ~1e-25 (and, in
+    # the mirror case, disabled the brake) before the log-space computation.
+    rollout_seq_log_is: Optional[float] = None
 
 
 class TrajRecordList(list):
@@ -267,6 +275,12 @@ def compute_is_info(
             geom_mean = torch.exp(((log_ratio * mask_float).sum()) / (token_count + 1e-8))
             record.rollout_is_geom_mean = float(geom_mean.detach().item())
 
+            # Keep the log-sum unexp'd for the ESS computation; the exp'd
+            # values below stay for OPOB weighting and the seq-IS metrics,
+            # where saturation to 0/inf is tolerable.
+            seq_log_is = (log_ratio.float() * mask_float.float()).sum()
+            record.rollout_seq_log_is = float(seq_log_is.detach().item())
+
             seq_is = torch.exp(((log_ratio * mask_float).sum()))
             seq_is_value = float(seq_is.detach().item())
             record.rollout_seq_is = seq_is_value
@@ -277,12 +291,21 @@ def compute_is_info(
 def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold: float | None, eps: float = 1e-8):
     """
     ESS Calculations:
-        ess = (sum w_i)^2 / (sum w_i^2) 
+        ess = (sum w_i)^2 / (sum w_i^2)
         ess_ratio = ess / minibatch_size
-        
+
         ess_clipped = ess with clipped w_i
         ess_ratio_clipped = ess_clipped / minibatch_size
 
+    Evaluated from the per-sequence LOG weights via ess_from_log_weights: the
+    max-shifted form is exact at any float range, so ESS lands in [1, B] for
+    any non-empty batch. The previous raw-space arithmetic read ESS = 0 when
+    every fp32 exp() underflowed (driving the LR to ~1e-25 in production) and
+    NaN when one overflowed (silently disabling the brake).
+
+    ``eps`` is retained for signature compatibility and is unused: after the
+    shift the max weight contributes exactly 1, so the denominator is positive
+    whenever the batch is non-empty.
     """
     dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     is_leader = (
@@ -294,46 +317,31 @@ def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold:
     local_dicts: list[dict] = [asdict(r) for r in local_records_list] if is_leader else []
     global_records: list[dict] = allgather_dict_into_list(local_dicts, group=dp_group)
 
-    IS_sum = 0.0
-    IS_sq_sum = 0.0
-    IS_sum_unclipped = 0.0
-    IS_sq_sum_unclipped = 0.0
-    ESS = 0.0
-    ESS_unclipped = 0.0
-    minibatch_size = 0
-
+    seq_log_is: list[float] = []
     for rec in global_records:
-        seq_is_unclipped = rec.get("rollout_seq_is")
-        if seq_is_unclipped is None:
+        log_w = rec.get("rollout_seq_log_is")
+        if log_w is None:
+            # Records predating the log field (or produced by a path that only
+            # fills the exp'd one): recover the exponent where it is representable.
+            seq_is = rec.get("rollout_seq_is")
+            if seq_is is None or not math.isfinite(seq_is) or seq_is <= 0.0:
+                continue
+            log_w = math.log(float(seq_is))
+        elif not math.isfinite(log_w):
             continue
-        seq_is_clipped = rec.get("rollout_seq_is_clipped")
-        if seq_is_clipped is None:
-            seq_is_clipped = float(seq_is_unclipped)
-            if rollout_is_threshold is not None and rollout_is_threshold > 0:
-                seq_is_clipped = min(seq_is_clipped, float(rollout_is_threshold))
+        seq_log_is.append(float(log_w))
 
-        IS_sum_unclipped += float(seq_is_unclipped)
-        IS_sq_sum_unclipped += float(seq_is_unclipped) ** 2
-        IS_sum += float(seq_is_clipped)
-        IS_sq_sum += float(seq_is_clipped) ** 2
-        minibatch_size += 1
-
-    if minibatch_size > 0:
-        ESS = (IS_sum) ** 2 / (IS_sq_sum + eps)
-        ess_ratio = ESS / minibatch_size
-        ESS_unclipped = (IS_sum_unclipped) ** 2 / (IS_sq_sum_unclipped + eps)
-        ess_ratio_unclipped = ESS_unclipped / minibatch_size
-    else:
-        ESS = 0.0
-        ess_ratio = 0.0
-        ESS_unclipped = 0.0
-        ess_ratio_unclipped = 0.0
+    # The gathered list is already the global batch, so use the collective-free
+    # variant — reducing again over dp_group would multiply the counts.
+    ess, ess_ratio, ess_clipped, ess_ratio_clipped, _ = ess_from_log_weights(
+        seq_log_is, rollout_is_threshold
+    )
 
     staleness_info = {
-        "ess": ESS_unclipped,
-        "ess_ratio": ess_ratio_unclipped,
-        "ess_clipped": ESS,
-        "ess_ratio_clipped": ess_ratio,
+        "ess": ess,
+        "ess_ratio": ess_ratio,
+        "ess_clipped": ess_clipped,
+        "ess_ratio_clipped": ess_ratio_clipped,
     }
 
     return staleness_info

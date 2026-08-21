@@ -21,6 +21,7 @@ Note that our model doesn't have to be `MegatronModule` because we don't share e
 
 import itertools
 import logging
+import math
 import os
 from contextlib import ExitStack
 from dataclasses import asdict
@@ -94,8 +95,15 @@ def compute_ess_lr_scale(ess_ratio: float, base_ess_ratio: float, trigger_ratio:
     the measured ESS falls below the reference. With ess_scaling.trigger_ratio
     set, scaling engages only when ess_ratio / base < trigger_ratio; at or
     above the threshold the mini-batch runs at full nominal lr (multiplier 1),
-    so the multiplier jumps discontinuously at the threshold."""
+    so the multiplier jumps discontinuously at the threshold.
+
+    A non-finite ess_ratio means the measurement failed, not that the batch is
+    degenerate: run at nominal lr rather than scaling by NaN. The log-space ESS
+    cannot produce one, but the guard keeps a bad measurement from silently
+    zeroing the step."""
     ratio = float(ess_ratio) / max(float(base_ess_ratio), 1e-8)
+    if not math.isfinite(ratio):
+        return 1.0
     if trigger_ratio is not None and ratio >= float(trigger_ratio):
         return 1.0
     return min(1.0, ratio)
