@@ -39,10 +39,12 @@
 #     Gradient parity with the mbs=1 path is EXACT (skip_recompute anchors
 #     the PPO ratio at 1, and the n_rows*M/N rescale makes the loss the
 #     global per-sequence mean, invariant to packing); the ESS brake consumes
-#     per-sequence log-IS sums via the max-shifted (log-space) ESS — same
-#     quantity, better numerics (no fp32-exp censoring, ESS floored at 1, so
-#     the brake multiplier is exactly ess_lr_scale on degenerate
-#     mini-batches, never 0). Per-traj grad-norm diagnostics and per-token
+#     per-sequence log-IS sums via the max-shifted (log-space) ESS — no
+#     fp32-exp censoring, ESS floored at 1, so the brake multiplier is
+#     exactly ess_lr_scale on degenerate mini-batches, never 0. The mbs=1
+#     arm now reduces the same way (both go through
+#     verl/workers/utils/ess.py), so all three arms' ESS traces are directly
+#     comparable. Per-traj grad-norm diagnostics and per-token
 #     record lists are mbs=1-only and stay empty here. OPOB remains
 #     incompatible with dynbsz. Token budget 15360 = 1.5x max seq len
 #     (measured envelope on this arm, tp1/dp3 HDO 8B: 20480 OOMs at

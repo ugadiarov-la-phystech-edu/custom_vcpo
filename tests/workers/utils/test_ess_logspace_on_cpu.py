@@ -36,7 +36,7 @@ import math
 import pytest
 import torch.distributed as dist
 
-from verl.workers.utils.ess import compute_global_ess_from_log_weights
+from verl.workers.utils.ess import compute_global_ess_from_log_weights, ess_from_log_weights
 
 
 def naive_ess(weights: list[float]) -> tuple[float, float]:
@@ -157,6 +157,59 @@ class TestEdgeCases:
         ess, ratio, ess_c, ratio_c, _ = compute_global_ess_from_log_weights(logs, rollout_is_threshold=2.0)
         assert ess_c == pytest.approx(ess, rel=1e-12)
         assert ratio_c == pytest.approx(ratio, rel=1e-12)
+
+
+class TestCollectiveFreeCore:
+    """ess_from_log_weights is the arithmetic both per-traj paths share: the
+    packed path reaches it through the all-reduce wrapper, the mbs=1 path
+    calls it directly on already-gathered records."""
+
+    @pytest.mark.parametrize(
+        "logs",
+        [
+            [3.0, 0.2, 1.5, 0.7],
+            [-200.0] * 8,
+            [200.0, 0.0, -1.0],
+            [0.0, -3000.0, -3000.0],
+            [],
+        ],
+    )
+    @pytest.mark.parametrize("threshold", [None, 2.0])
+    def test_matches_the_allreduce_wrapper_without_dist(self, logs, threshold):
+        assert not dist.is_initialized()
+        core = ess_from_log_weights(logs, threshold)
+        wrapped = compute_global_ess_from_log_weights(logs, threshold)
+        for a, b in zip(core, wrapped, strict=True):
+            if isinstance(a, float) and math.isnan(a):
+                assert math.isnan(b)
+            else:
+                assert a == pytest.approx(b, rel=1e-15)
+
+
+class TestNonFiniteInputs:
+    """A non-finite log-weight means the upstream log-probs are broken; the
+    ESS is then unknowable, so it is reported as NaN and the brake fails
+    closed. Silently dropping the entry would let a corrupt batch read as
+    healthy and step at full lr."""
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    @pytest.mark.parametrize("fn", [ess_from_log_weights, compute_global_ess_from_log_weights])
+    def test_corrupt_entry_gives_nan_ess_with_a_real_count(self, bad, fn):
+        ess, ratio, ess_c, ratio_c, n = fn([0.0, -1.0, bad, -2.0], 2.0)
+        assert math.isnan(ess) and math.isnan(ratio)
+        assert math.isnan(ess_c) and math.isnan(ratio_c)
+        assert n == 4  # count still reports the batch size: broken != empty
+
+    @pytest.mark.parametrize("fn", [ess_from_log_weights, compute_global_ess_from_log_weights])
+    def test_negative_infinity_is_a_legitimate_zero_weight(self, fn):
+        # exp(-inf) == 0 exactly; that is a weight of zero, not corruption.
+        ess, ratio, _, _, n = fn([0.0, float("-inf"), float("-inf"), float("-inf")])
+        assert (ess, ratio, n) == (1.0, 0.25, 4)
+
+    @pytest.mark.parametrize("fn", [ess_from_log_weights, compute_global_ess_from_log_weights])
+    def test_all_negative_infinity_reads_zero_over_a_non_empty_batch(self, fn):
+        ess, ratio, _, _, n = fn([float("-inf")] * 4)
+        assert (ess, ratio, n) == (0.0, 0.0, 4)
 
 
 @pytest.fixture()
