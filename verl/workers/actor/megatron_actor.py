@@ -897,6 +897,7 @@ class MegatronPPOActor(BasePPOActor):
         ess_ratio = staleness_metrics.get("ess_ratio")
         minibatch_ess_clipped = staleness_metrics["ess_clipped"]
         ess_ratio_clipped = staleness_metrics["ess_ratio_clipped"]
+        ess_count = staleness_metrics.get("count")
 
         # ================ Optimizer Step ================
         if accum_buffers is not None:
@@ -924,7 +925,7 @@ class MegatronPPOActor(BasePPOActor):
                     chunk.finish_grad_sync()
 
         return self._apply_ess_scale_and_step(
-            minibatch_ess, minibatch_ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx
+            minibatch_ess, minibatch_ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, ess_count
         )
 
     def _apply_ess_scale_and_step(
@@ -934,6 +935,7 @@ class MegatronPPOActor(BasePPOActor):
         ess_ratio,
         ess_ratio_clipped,
         minibatch_idx: int,
+        ess_count: int | None = None,
     ) -> tuple[bool, dict]:
         ess_for_scaling = minibatch_ess_clipped if self.config.ess_scaling.use_clipped else minibatch_ess
         if ess_for_scaling is None:
@@ -947,6 +949,7 @@ class MegatronPPOActor(BasePPOActor):
                 float(ess_for_scaling),
                 float(self.config.ess_scaling.min_ess),
                 float(self.config.ess_scaling.lr_scale),
+                count=None if ess_count is None else int(ess_count),
             )
             for pg, base_lr in zip(self.actor_optimizer.param_groups, base_lrs, strict=True):
                 pg["lr"] = float(base_lr) * lr_scale
@@ -1000,8 +1003,10 @@ class MegatronPPOActor(BasePPOActor):
                 group=mpu.get_pipeline_model_parallel_group(),
             )
             values = tensor.tolist()
-        ess, ess_ratio, ess_clipped, ess_ratio_clipped, _ = values
-        return self._apply_ess_scale_and_step(ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx)
+        ess, ess_ratio, ess_clipped, ess_ratio_clipped, count = values
+        return self._apply_ess_scale_and_step(
+            ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, int(count)
+        )
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def _update_policy_per_traj_packed(self, dataloader: Iterable[DataProto]) -> dict:

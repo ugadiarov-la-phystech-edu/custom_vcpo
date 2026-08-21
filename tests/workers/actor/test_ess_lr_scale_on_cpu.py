@@ -80,9 +80,47 @@ class TestStructuralFloor:
         assert scale > 0.0
 
     def test_empty_batch_is_a_noop(self):
-        # ess == 0 only happens for an empty global batch (or the mbs=1
-        # path's raw-space overflow censoring): no scaling.
+        # count == 0: the ESS was not measured at all (empty global batch, or
+        # a path that never fills the IS fields). Nothing to brake.
+        assert compute_min_ess_lr_scale(0.0, 1.1, 0.5, count=0) == 1.0
+
+    def test_zero_ess_without_count_keeps_legacy_reading(self):
+        # Callers that cannot supply a count keep the old "ess == 0 means an
+        # empty batch" reading rather than braking on ambiguous input.
         assert compute_min_ess_lr_scale(0.0, 1.1, 0.5) == 1.0
+
+
+class TestFailsClosed:
+    """A broken measurement must brake, not hand out full lr.
+
+    The raw-space pipeline this replaced did the opposite: a mini-batch whose
+    per-sequence weights all underflowed fp32 read ESS = 0 and one containing
+    an overflowed weight read NaN, and both ran at full nominal lr — precisely
+    on the most off-policy batches (observed at steps 345/346/348 of the
+    2026-08 replay run)."""
+
+    def test_zero_ess_over_a_non_empty_batch_brakes(self):
+        assert compute_min_ess_lr_scale(0.0, 1.1, 0.5, count=528) == 0.5
+
+    def test_nan_ess_brakes(self):
+        assert compute_min_ess_lr_scale(float("nan"), 1.1, 0.5, count=528) == 0.5
+        # ...and even without a count: NaN is never a healthy reading.
+        assert compute_min_ess_lr_scale(float("nan"), 1.1, 0.5) == 0.5
+
+    def test_infinite_ess_brakes(self):
+        assert compute_min_ess_lr_scale(float("inf"), 1.1, 0.5, count=528) == 0.5
+        assert compute_min_ess_lr_scale(float("-inf"), 1.1, 0.5, count=528) == 0.5
+
+    def test_negative_ess_brakes(self):
+        assert compute_min_ess_lr_scale(-1.0, 1.1, 0.5, count=528) == 0.5
+
+    def test_no_data_wins_over_broken_data(self):
+        # count == 0 is checked first: a NaN ESS over an empty batch is just
+        # "nothing was measured", and braking a no-op step would be noise.
+        assert compute_min_ess_lr_scale(float("nan"), 1.1, 0.5, count=0) == 1.0
+
+    def test_healthy_batch_with_count_is_unbraked(self):
+        assert compute_min_ess_lr_scale(400.0, 1.1, 0.5, count=528) == 1.0
 
 
 class TestParameters:
