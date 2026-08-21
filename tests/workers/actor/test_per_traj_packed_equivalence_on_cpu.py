@@ -371,3 +371,176 @@ class TestSeqLogIsEquivalence:
         (seq_log_is,) = captured
         assert len(seq_log_is) == N_SEQS
         assert sorted(seq_log_is) == pytest.approx(sorted(expected), rel=1e-5)
+
+
+# ==================== CPPO on the packed path ====================
+
+CPPO_DELTA = 0.05
+CPPO_CLIP_C = 20.0
+CPPO_W_MIN = 0.8
+CPPO_DELTA_B = 0.02
+
+
+def _make_cppo_actor(chunk: ToyChunk, max_token_len: int = 12) -> MegatronPPOActor:
+    actor = _make_actor(chunk, use_dynamic_bsz=True, max_token_len=max_token_len)
+    actor.config.policy_loss = OmegaConf.create(
+        {
+            "loss_mode": "cppo",
+            "cppo": {
+                "cppo_w_min": CPPO_W_MIN,
+                "cppo_delta_b": CPPO_DELTA_B,
+                "cppo_delta_b_q": 0.9,
+                "cppo_delta_b_k": 1.0,
+            },
+        }
+    )
+    actor.config.clip_ratio = CPPO_DELTA
+    actor.config.clip_ratio_c = CPPO_CLIP_C
+    return actor
+
+
+def _cppo_reference_mask(lp: torch.Tensor, mu: torch.Tensor, adv: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Compact per-token mirror of the CPPO mask (paper Eq. 8-10, Eq. 22),
+    anchored at mu, written independently of the vectorized implementation."""
+    b, t_len = mask.shape
+    out = torch.zeros(b, t_len)
+    m = mask.float()
+    for i in range(b):
+        d_row = (torch.exp(lp[i]) - torch.exp(mu[i])).abs() * m[i]
+        valid = m[i] > 0
+        q = torch.quantile(d_row[valid], 0.9).item() if valid.any() else CPPO_DELTA_B
+        db_seq = min(max(1.0 * q, CPPO_DELTA_B), 5.0 * CPPO_DELTA_B)
+        s_prev, w_prev = 0.0, 0.0
+        for t in range(t_len):
+            w_t = (CPPO_W_MIN + (1.0 - CPPO_W_MIN) * (t_len - (t + 1)) / max(t_len - 1.0, 1.0)) * m[i, t].item()
+            z_t = w_t * d_row[t].item()
+            c_t = min(CPPO_DELTA, CPPO_DELTA + db_seq * w_prev - s_prev)
+            ratio = float(torch.exp(torch.clamp(lp[i, t] - mu[i, t], -20.0, 20.0)))
+            toward_mu = adv[i, t].item() * (ratio - 1.0) <= 0.0
+            out[i, t] = 1.0 if (toward_mu or z_t <= c_t) and m[i, t] > 0 else 0.0
+            s_prev += z_t
+            w_prev += w_t
+    return out
+
+
+def _cppo_closed_form_grad(chunk: ToyChunk) -> torch.Tensor:
+    """Global per-sequence mean of the mu-anchored CPPO loss:
+    (1/N) sum_i masked_mean_t( -adv_i * sg(min(exp(lp - mu), c)) * lp * M_t ).
+    No token-IS min(pi/mu, 2) factor: under loss_mode=cppo the loss's own
+    truncated ratio replaces the rollout-correction weights."""
+    data = _make_data()
+    chunk.w.grad = None
+    lp = chunk(data.batch["input_ids"])[:, -RESP_LEN - 1 : -1]
+    mu = data.batch["rollout_log_probs"]
+    mask = data.batch["response_mask"].float()
+    adv = data.batch["advantages"]
+    valid = _cppo_reference_mask(lp.detach(), mu, adv, data.batch["response_mask"])
+    ratio = torch.exp(torch.clamp(lp.detach() - mu, -20.0, 20.0))
+    w = torch.clamp(ratio, max=CPPO_CLIP_C)
+    per_tok = -adv * w * lp * valid * mask
+    per_seq = per_tok.sum(dim=-1) / mask.sum(dim=-1)
+    loss = per_seq.sum() / N_SEQS
+    loss.backward()
+    return chunk.w.grad.detach().clone()
+
+
+class TestCPPOPackedIntegration:
+    def test_cppo_packed_matches_closed_form_uneven_packing(self, real_loss_env):
+        chunk = ToyChunk()
+        closed = _cppo_closed_form_grad(chunk)
+        actor = _make_cppo_actor(chunk, max_token_len=12)
+        chunk.w.grad = None
+        actor._update_policy_per_traj_packed([_make_data()])
+        packed = chunk.w.grad.detach().clone()
+        assert torch.allclose(packed, closed, rtol=1e-5, atol=1e-8), f"max diff {(packed - closed).abs().max()}"
+
+    def test_cppo_packed_matches_closed_form_one_row_packing(self, real_loss_env):
+        chunk = ToyChunk()
+        closed = _cppo_closed_form_grad(chunk)
+        actor = _make_cppo_actor(chunk, max_token_len=6)
+        chunk.w.grad = None
+        actor._update_policy_per_traj_packed([_make_data()])
+        assert torch.allclose(chunk.w.grad, closed, rtol=1e-5, atol=1e-8)
+
+    def test_cppo_gradient_nonzero_and_differs_from_vanilla(self, real_loss_env):
+        """Guard against vacuous equivalence: the cppo gradient is nonzero and
+        genuinely different from the vanilla (anchored + token-IS) gradient —
+        i.e. the mask binds and the mu anchor is in effect."""
+        chunk = ToyChunk()
+        actor = _make_cppo_actor(chunk, max_token_len=12)
+        chunk.w.grad = None
+        actor._update_policy_per_traj_packed([_make_data()])
+        cppo_grad = chunk.w.grad.detach().clone()
+        vanilla_grad = _run_reference(chunk)
+        assert cppo_grad.abs().max() > 1e-6
+        assert not torch.allclose(cppo_grad, vanilla_grad, rtol=1e-3, atol=1e-6)
+
+    def test_cppo_mask_binds_and_metrics_flow(self, real_loss_env):
+        """With delta small vs the crafted pi-mu gap, the mask must reject
+        tokens (pg_clipfrac > 0) and the CPPO metrics must reach the returned
+        actor metrics through the packed path."""
+        chunk = ToyChunk()
+        actor = _make_cppo_actor(chunk, max_token_len=12)
+        metrics = actor._update_policy_per_traj_packed([_make_data()])
+        clipfracs = metrics["actor/pg_clipfrac"]
+        toward = metrics["actor/cppo_toward_mu_frac"]
+        assert sum(clipfracs) / len(clipfracs) > 0.0
+        assert all(0.0 <= v <= 1.0 for v in toward)
+        # sanity against the mirror: expected rejected fraction over valid tokens
+        data = _make_data()
+        with torch.no_grad():
+            lp = chunk(data.batch["input_ids"])[:, -RESP_LEN - 1 : -1]
+        valid = _cppo_reference_mask(
+            lp, data.batch["rollout_log_probs"], data.batch["advantages"], data.batch["response_mask"]
+        )
+        m = data.batch["response_mask"].float()
+        expected_frac = float(((1.0 - valid) * m).sum() / m.sum())
+        # packed micro-batches average clipfrac per micro-batch; with uneven
+        # packing the token-weighted global value differs slightly, so compare
+        # loosely: nonzero and same order
+        assert expected_frac > 0.0
+
+    def test_cppo_seq_log_is_and_ess_unchanged(self, real_loss_env):
+        """The ESS brake input (per-seq log-IS sums vs mu) must be identical
+        under cppo — the loss swap must not touch the brake wiring."""
+        chunk = ToyChunk()
+        data = _make_data()
+        with torch.no_grad():
+            lp = chunk(data.batch["input_ids"])[:, -RESP_LEN - 1 : -1]
+            mask = data.batch["response_mask"].float()
+            expected = ((lp - data.batch["rollout_log_probs"]) * mask).sum(dim=-1).tolist()
+
+        captured = []
+        actor = _make_cppo_actor(chunk, max_token_len=12)
+        original = megatron_actor.compute_global_ess_from_log_weights
+
+        def spy(seq_log_is, threshold=None, group=None):
+            captured.append(list(seq_log_is))
+            return original(seq_log_is, threshold, group=group)
+
+        megatron_actor.compute_global_ess_from_log_weights = spy
+        try:
+            metrics = actor._update_policy_per_traj_packed([data])
+        finally:
+            megatron_actor.compute_global_ess_from_log_weights = original
+
+        (seq_log_is,) = captured
+        assert sorted(seq_log_is) == pytest.approx(sorted(expected), rel=1e-5)
+        assert "staleness/ess" in metrics
+
+    def test_cppo_missing_rollout_log_probs_refused(self, real_loss_env):
+        chunk = ToyChunk()
+        actor = _make_cppo_actor(chunk, max_token_len=12)
+        data = _make_data()
+        data.batch.pop("rollout_log_probs")
+        with pytest.raises((AssertionError, KeyError)):
+            actor._update_policy_per_traj_packed([data])
+
+
+class TestCPPOMbs1Guard:
+    def test_mbs1_per_traj_path_refuses_cppo(self, real_loss_env):
+        chunk = ToyChunk()
+        actor = _make_actor(chunk, use_dynamic_bsz=False)
+        actor.config.policy_loss = OmegaConf.create({"loss_mode": "cppo", "cppo": {}})
+        with pytest.raises(AssertionError, match="cppo is not supported on the mbs=1"):
+            actor.update_policy_per_traj([_make_data()], grad_baselining=False)

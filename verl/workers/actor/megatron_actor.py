@@ -578,8 +578,23 @@ class MegatronPPOActor(BasePPOActor):
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
+                old_log_prob_for_loss = old_log_prob
+                if loss_mode == "cppo" and skip_recompute_old_log_prob:
+                    # CPPO's mask and truncated-IS weight measure drift against the
+                    # BEHAVIOR policy: the loss must see mu (the cached rollout
+                    # log-probs), not the ratio-anchored log_prob.detach() — with the
+                    # anchor, ratio == 1 and D_t == 0, so the mask would never bind.
+                    # The loss's own truncated ratio (clip_ratio_c cap) replaces the
+                    # token-IS weights, so they are not applied on top. The detached
+                    # old_log_prob variable still feeds the ESS/IS metrics above.
+                    assert rollout_log_prob is not None, (
+                        "loss_mode=cppo with skip_recompute_old_log_prob=True requires "
+                        "rollout_log_probs in the batch (behavior-policy anchor)"
+                    )
+                    old_log_prob_for_loss = rollout_log_prob
+                    rollout_is_weights = None
                 pg_loss, pg_metrics = policy_loss_fn(
-                    old_log_prob=old_log_prob,
+                    old_log_prob=old_log_prob_for_loss,
                     log_prob=log_prob,
                     advantages=advantages,
                     response_mask=response_mask,
@@ -1061,7 +1076,12 @@ class MegatronPPOActor(BasePPOActor):
         this path requires skip_recompute_old_log_prob=True: the PPO ratio is
         exp(log_prob - log_prob.detach()) == 1, so the clip branches collapse
         and the vanilla loss with row-constant advantages equals the per-traj
-        A=+1 post-scale loss token-for-token. The only remaining difference —
+        A=+1 post-scale loss token-for-token. (With loss_mode="cppo" the
+        ratio-anchor argument does not apply — loss_func instead feeds the
+        cached behavior log-probs as the loss's old_log_prob and the CPPO
+        mask/truncated-IS weight take over; this path keeps real row-constant
+        advantages in the tensor, which the sign-dependent CPPO mask requires,
+        so cppo is packed-path-only — see the assert in update_policy_per_traj.) The only remaining difference —
         Megatron's mean-of-means over unequal micro-batches vs the per-traj
         global 1/N — is removed by the n_rows*M/N rescale in loss_func
         (meta_info["global_seq_mean_count"]), making gradients invariant to
@@ -1181,6 +1201,13 @@ class MegatronPPOActor(BasePPOActor):
                 "buffer and is incompatible with dynamic batch size; set actor.use_dynamic_bsz=False"
             )
             return self._update_policy_per_traj_packed(dataloader)
+
+        assert self.config.policy_loss.get("loss_mode", "vanilla") != "cppo", (
+            "loss_mode=cppo is not supported on the mbs=1 per-traj path: it replaces the batch "
+            "advantages with ones and folds the true advantage into the loss multiplier, which "
+            "breaks CPPO's advantage-sign-dependent toward-mu clause. Use the packed path "
+            "(actor.use_dynamic_bsz=True) instead."
+        )
 
         metrics = {}
 
