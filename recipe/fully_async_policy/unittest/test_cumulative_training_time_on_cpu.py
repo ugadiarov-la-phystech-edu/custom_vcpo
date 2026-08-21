@@ -26,6 +26,7 @@ Run: pytest recipe/fully_async_policy/unittest/test_cumulative_training_time_on_
 import asyncio
 import json
 import time
+from datetime import datetime
 
 import ray.cloudpickle
 from omegaconf import OmegaConf
@@ -90,10 +91,29 @@ def _make_rollouter(first_sample_time, test_freq=1, validate_duration=0.03):
     return r
 
 
-def _make_trainer(first_sample_time=None, cumulative_validation_time=0.0, cumulative_save_time=0.0):
-    """Minimal FullyAsyncTrainer with only the attributes under test."""
+_UNSET = object()
+
+
+def _fmt(epoch: float) -> str:
+    """The local-time rendering _save_timing_state writes for an epoch."""
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _make_trainer(
+    first_sample_time=None,
+    cumulative_validation_time=0.0,
+    cumulative_save_time=0.0,
+    run_first_sample_time=_UNSET,
+):
+    """Minimal FullyAsyncTrainer with only the attributes under test.
+
+    ``run_first_sample_time`` is the chained origin; it defaults to the
+    segment anchor, which is what a fresh run produces once its first sample
+    arrives. Pass it explicitly to model a resume (origin restored from the
+    checkpoint) or None to model a run that has seen no sample yet."""
     t = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
     t.rollouter_first_sample_time = first_sample_time
+    t.run_first_sample_time = first_sample_time if run_first_sample_time is _UNSET else run_first_sample_time
     t.rollouter_cumulative_validation_time = cumulative_validation_time
     t.cumulative_save_time = cumulative_save_time
     t.timing_wall_offset = 0.0
@@ -283,10 +303,16 @@ def test_timing_state_checkpoint_roundtrip(tmp_path):
         "cumulative_validation_time": 5.0,
         "cumulative_save_time": 2.0,
         "cumulative_training_time": 35.0,  # virtual: 120 + (150-130) - 5 - 100
+        # wall-clock anchors: the raw origin epoch (what a resume reads back)
+        # plus both moments rendered in local time for a human reader
+        "first_sample_time": 100.0,
+        "first_sample_datetime": _fmt(100.0),
+        "checkpoint_saved_datetime": _fmt(150.0),
     }
 
     resumed = _make_trainer()
     resumed._restore_timing_state(str(tmp_path))
+    assert resumed.run_first_sample_time == 100.0, "the origin travels with the checkpoint"
     assert resumed.timing_wall_offset == 50.0
     assert resumed.timing_validation_offset == 5.0
     assert resumed.timing_save_offset == 2.0
@@ -322,6 +348,11 @@ def test_timing_state_save_carries_offsets_forward_without_anchor(tmp_path):
     assert state["cumulative_validation_time"] == 5.0
     assert state["cumulative_save_time"] == 2.0
     assert state["cumulative_training_time"] == 35.0
+    # no sample in this segment and none inherited -> no origin to report,
+    # but the save moment is always stamped
+    assert state["first_sample_time"] is None
+    assert state["first_sample_datetime"] is None
+    assert state["checkpoint_saved_datetime"] == _fmt(999.0)
 
 
 def test_timing_state_second_resume_chains_totals(tmp_path):
@@ -341,6 +372,146 @@ def test_timing_state_second_resume_chains_totals(tmp_path):
     assert run3.timing_validation_offset == 8.0
     assert run3.timing_save_offset == 3.0
     assert run3.virtual_training_time_offset == (230.0 - 200.0) + 35.0
+
+
+def test_origin_survives_a_resume_and_a_new_segment_anchor(tmp_path):
+    """The point of chaining: after a resume, first_sample_datetime still names
+    when the RUN began, not when this segment did. rollouter_first_sample_time
+    re-anchors (every duration is measured from it) — the origin must not."""
+    run1 = _make_trainer(first_sample_time=100.0)
+    run1._save_timing_state(str(tmp_path), save_start=150.0)
+
+    run2 = _make_trainer(first_sample_time=None, run_first_sample_time=None)
+    run2._restore_timing_state(str(tmp_path))
+    assert run2.run_first_sample_time == 100.0
+
+    # this segment's rollouter reports its own, much later, first sample
+    run2.message_queue_client = _StubMessageQueueClient(
+        val_payloads=[ray.cloudpickle.dumps(ValidateMetrics(timing_raw={}, param_version=1, first_sample_time=9000.0))]
+    )
+    run2._log_validation_data()
+    assert run2.rollouter_first_sample_time == 9000.0, "durations still measure from this segment"
+    assert run2.run_first_sample_time == 100.0, "but the origin does not move"
+
+    run2._save_timing_state(str(tmp_path), save_start=9100.0)
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    assert state["first_sample_time"] == 100.0
+    assert state["first_sample_datetime"] == _fmt(100.0)
+    assert state["checkpoint_saved_datetime"] == _fmt(9100.0), "the save moment is this segment's"
+
+
+def test_origin_is_set_once_within_a_fresh_run():
+    """A fresh run adopts the first anchor it sees and keeps it, mirroring the
+    rollouter's own set-once behaviour."""
+    trainer = _make_trainer(first_sample_time=None, run_first_sample_time=None)
+    trainer.message_queue_client = _StubMessageQueueClient(
+        val_payloads=[
+            ray.cloudpickle.dumps(ValidateMetrics(timing_raw={}, param_version=1, first_sample_time=100.0)),
+            ray.cloudpickle.dumps(ValidateMetrics(timing_raw={}, param_version=2, first_sample_time=777.0)),
+        ]
+    )
+    trainer._log_validation_data()
+    assert trainer.run_first_sample_time == 100.0
+    assert trainer.rollouter_first_sample_time == 777.0
+
+
+def test_origin_ignores_none_first_sample_time():
+    """A ValidateMetrics with no anchor must not blank the origin."""
+    trainer = _make_trainer(first_sample_time=100.0)
+    trainer.message_queue_client = _StubMessageQueueClient(
+        val_payloads=[ray.cloudpickle.dumps(ValidateMetrics(timing_raw={}, param_version=1))]
+    )
+    trainer._log_validation_data()
+    assert trainer.run_first_sample_time == 100.0
+
+
+def test_origin_chains_across_two_resumes(tmp_path):
+    """Origin survives resume-of-a-resume, alongside the totals that
+    test_timing_state_second_resume_chains_totals pins."""
+    run1 = _make_trainer(first_sample_time=100.0)
+    run1._save_timing_state(str(tmp_path), save_start=150.0)
+
+    run2 = _make_trainer(first_sample_time=200.0, run_first_sample_time=None)
+    run2._restore_timing_state(str(tmp_path))
+    run2._save_timing_state(str(tmp_path), save_start=240.0)
+
+    run3 = _make_trainer(run_first_sample_time=None)
+    run3._restore_timing_state(str(tmp_path))
+    assert run3.run_first_sample_time == 100.0
+
+    run3.rollouter_first_sample_time = 5000.0
+    run3._save_timing_state(str(tmp_path), save_start=5050.0)
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    assert state["first_sample_datetime"] == _fmt(100.0)
+
+
+def test_legacy_checkpoint_without_origin_reanchors_to_this_segment(tmp_path):
+    """timing_state.json written before first_sample_time existed: the run
+    re-anchors to the current segment rather than raising."""
+    (tmp_path / "timing_state.json").write_text(
+        json.dumps(
+            {
+                "wall_time_since_first_sample": 50.0,
+                "cumulative_validation_time": 5.0,
+                "cumulative_save_time": 2.0,
+                "cumulative_training_time": 35.0,
+                "first_sample_datetime": "2026-01-01 00:00:00",  # string-only, unusable
+                "checkpoint_saved_datetime": "2026-01-01 00:01:00",
+            }
+        )
+    )
+    trainer = _make_trainer(run_first_sample_time=None)
+    trainer._restore_timing_state(str(tmp_path))
+    assert trainer.run_first_sample_time is None
+    assert trainer.timing_wall_offset == 50.0  # the durations still restore
+
+    trainer.message_queue_client = _StubMessageQueueClient(
+        val_payloads=[ray.cloudpickle.dumps(ValidateMetrics(timing_raw={}, param_version=1, first_sample_time=300.0))]
+    )
+    trainer._log_validation_data()
+    assert trainer.run_first_sample_time == 300.0
+
+
+def test_legacy_restore_does_not_blank_a_known_origin(tmp_path):
+    """Order-independence: the live flow restores before any anchor arrives
+    (load_checkpoint is awaited before fit), but a restore that finds no
+    first_sample_time must leave an already-known origin alone rather than
+    clearing it."""
+    (tmp_path / "timing_state.json").write_text(
+        json.dumps({"wall_time_since_first_sample": 50.0, "cumulative_training_time": 35.0})
+    )
+    trainer = _make_trainer(first_sample_time=300.0)  # origin already adopted
+    trainer._restore_timing_state(str(tmp_path))
+    assert trainer.run_first_sample_time == 300.0
+    assert trainer.timing_wall_offset == 50.0
+
+
+def test_anchors_do_not_disturb_the_duration_totals(tmp_path):
+    """The origin is informational: an origin far from this segment's anchor
+    must leave every duration exactly where it was."""
+    trainer = _make_trainer(first_sample_time=100.0, cumulative_validation_time=5.0, cumulative_save_time=2.0)
+    trainer.run_first_sample_time = 1.0  # ancient origin from a much earlier run
+    trainer._step_virtual_start = 120.0
+    trainer._step_actual_start = 130.0
+    trainer._step_wait_valid_time = 5.0
+    trainer._save_timing_state(str(tmp_path), save_start=150.0)
+
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    assert state["wall_time_since_first_sample"] == 50.0
+    assert state["cumulative_validation_time"] == 5.0
+    assert state["cumulative_save_time"] == 2.0
+    assert state["cumulative_training_time"] == 35.0
+    assert state["first_sample_time"] == 1.0
+
+
+def test_checkpoint_saved_datetime_follows_save_start_not_now(tmp_path):
+    """Every other value in the file is a snapshot at save_start; the stamp
+    must be too, or a slow save would report a time nothing else agrees with."""
+    trainer = _make_trainer(first_sample_time=100.0)
+    trainer._save_timing_state(str(tmp_path), save_start=150.0)
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    assert state["checkpoint_saved_datetime"] == _fmt(150.0)
+    assert state["checkpoint_saved_datetime"] != _fmt(time.time())
 
 
 def test_restore_timing_state_missing_file_keeps_zero_offsets(tmp_path):

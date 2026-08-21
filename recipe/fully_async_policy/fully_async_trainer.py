@@ -121,6 +121,11 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.cumulative_save_time = 0.0
         self.rollouter_first_sample_time = None
         self.rollouter_cumulative_validation_time = 0.0
+        # When the RUN began, as opposed to when this process's segment did:
+        # rollouter_first_sample_time re-anchors on every restart (and every
+        # duration in this file is measured from it), so the origin is tracked
+        # separately and chained through timing_state.json across resumes.
+        self.run_first_sample_time = None
         # Totals carried over from the run a checkpoint was resumed from (see
         # _save_timing_state/_restore_timing_state). The in-memory counters above
         # only cover the current process; adding these offsets keeps the
@@ -905,11 +910,27 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             validation_time = self.timing_validation_offset
             save_time = self.timing_save_offset
             virtual_training_time = self.virtual_training_time_offset
+        # Wall-clock anchors: when the run's first sample arrived and when
+        # this checkpoint was saved. Both are null/absent before the first
+        # sample ever arrives. first_sample_time is the ORIGIN — restored from
+        # the checkpoint a resume started from, so it keeps naming when the
+        # whole run began rather than when this segment did; the raw epoch is
+        # stored alongside the formatted string because that is what a resume
+        # reads back (parsing the string would round to whole seconds and shift
+        # by the timezone offset if the checkpoint moves between machines).
+        fmt = "%Y-%m-%d %H:%M:%S"
         timing_state = {
             "wall_time_since_first_sample": wall_time,
             "cumulative_validation_time": validation_time,
             "cumulative_save_time": save_time,
             "cumulative_training_time": virtual_training_time,
+            "first_sample_time": self.run_first_sample_time,
+            "first_sample_datetime": (
+                datetime.fromtimestamp(self.run_first_sample_time).strftime(fmt)
+                if self.run_first_sample_time is not None
+                else None
+            ),
+            "checkpoint_saved_datetime": datetime.fromtimestamp(save_start).strftime(fmt),
         }
         with open(os.path.join(local_global_step_folder, "timing_state.json"), "w") as f:
             json.dump(timing_state, f, indent=2)
@@ -924,6 +945,15 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.timing_wall_offset = timing_state.get("wall_time_since_first_sample", 0.0)
         self.timing_validation_offset = timing_state.get("cumulative_validation_time", 0.0)
         self.timing_save_offset = timing_state.get("cumulative_save_time", 0.0)
+        # Checkpoints written before this field re-anchor to the current
+        # segment's first sample, exactly as they did before it existed —
+        # hence the guard rather than a plain assignment: restoring one of
+        # those must not blank an origin that is already known. In the live
+        # flow load_checkpoint is awaited before either fit() starts
+        # (fully_async_main.py), so this is belt-and-braces.
+        restored_origin = timing_state.get("first_sample_time")
+        if restored_origin is not None:
+            self.run_first_sample_time = restored_origin
         # Checkpoints from before the virtual-clock metric only carry the naive
         # subtraction value; it is the best available continuation point.
         self.virtual_training_time_offset = timing_state.get(
@@ -1188,6 +1218,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             val_metrics: ValidateMetrics = ray.cloudpickle.loads(val_data)
             if val_metrics.first_sample_time is not None:
                 self.rollouter_first_sample_time = val_metrics.first_sample_time
+                if self.run_first_sample_time is None:
+                    # First sample of the run: a value restored from a resumed
+                    # checkpoint already holds the origin and must not move.
+                    self.run_first_sample_time = val_metrics.first_sample_time
             if val_metrics.cumulative_validation_time is not None:
                 self.rollouter_cumulative_validation_time = val_metrics.cumulative_validation_time
             if val_metrics.metrics:
