@@ -72,6 +72,11 @@ policy_loss:
   # loss_mode == "cppo". The token-level divergence threshold delta is read from
   # actor.clip_ratio (repurposed, same convention as DPPO) and the truncated-IS cap from
   # actor.clip_ratio_c; these add the position weight and the cumulative prefix budget.
+  # WARNING: when enabling cppo, ALSO set actor.clip_ratio (paper: 0.15 dense / 0.20 MoE)
+  # and actor.clip_ratio_c (reference: 20.0) explicitly — the verl defaults (0.2 / 3.0)
+  # silently give a different algorithm. cppo_delta_b=0 disables the whole per-sequence
+  # budget calibration (clamp collapses to 0), not just the floor — keep it positive.
+  # Megatron-actor-only in this fork (mu-anchored dispatch in megatron_actor.loss_func).
   cppo:
 
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs

@@ -283,9 +283,7 @@ class TestMaskSemantics:
         full_ref = _reference_mask(lp, olp, adv, mask, cfg)
         solo_ref = _reference_mask(lp[:1], olp[:1], adv[:1], mask[:1], cfg)
         assert torch.equal(full_ref[:1], solo_ref)
-        loss_solo, _ = _call(
-            lp[:1].detach().requires_grad_(True), olp[:1], adv[:1], mask[:1], cfg
-        )
+        loss_solo, _ = _call(lp[:1].detach().requires_grad_(True), olp[:1], adv[:1], mask[:1], cfg)
         ref_solo = _reference_loss(lp[:1], olp[:1], adv[:1], mask[:1], cfg)
         assert torch.allclose(loss_solo, ref_solo, rtol=1e-6, atol=1e-8)
 
@@ -409,7 +407,7 @@ class TestDegenerateSettings:
         d = (torch.exp(lp.detach()) - torch.exp(olp)).abs()
         ratio = torch.exp(torch.clamp(lp.detach() - olp, -20.0, 20.0))
         toward = (adv * (ratio - 1.0)) <= 0
-        uniform = ((toward | (d <= 0.12)).float() * mask.float())
+        uniform = (toward | (d <= 0.12)).float() * mask.float()
         assert torch.equal(ref, uniform)
         loss, _ = _call(lp, olp, adv, mask, cfg)
         assert torch.allclose(loss, _reference_loss(lp, olp, adv, mask, cfg), rtol=1e-6, atol=1e-8)

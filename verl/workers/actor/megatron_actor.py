@@ -585,11 +585,23 @@ class MegatronPPOActor(BasePPOActor):
                     # log-probs), not the ratio-anchored log_prob.detach() — with the
                     # anchor, ratio == 1 and D_t == 0, so the mask would never bind.
                     # The loss's own truncated ratio (clip_ratio_c cap) replaces the
-                    # token-IS weights, so they are not applied on top. The detached
-                    # old_log_prob variable still feeds the ESS/IS metrics above.
+                    # TOKEN-level IS weights, so they are not applied on top. The
+                    # detached old_log_prob variable still feeds the ESS/IS metrics
+                    # above. (Without skip_recompute — the paper's own multi-ministep
+                    # regime — old_log_probs already are the collection policy and
+                    # nothing here needs to change.)
                     assert rollout_log_prob is not None, (
                         "loss_mode=cppo with skip_recompute_old_log_prob=True requires "
                         "rollout_log_probs in the batch (behavior-policy anchor)"
+                    )
+                    assert rollout_corr_cfg.get("rollout_rs", None) is None, (
+                        "loss_mode=cppo does not support rollout_rs rejection: rejected tokens "
+                        "punch holes in response_mask, dropping exactly the highest-divergence "
+                        "tokens from the prefix budget and its quantile calibration"
+                    )
+                    assert rollout_corr_cfg.get("rollout_is", "token") in (None, "token"), (
+                        "loss_mode=cppo subsumes only TOKEN-level IS weights via its truncated "
+                        "ratio; sequence-level rollout_is would be silently dropped"
                     )
                     old_log_prob_for_loss = rollout_log_prob
                     rollout_is_weights = None

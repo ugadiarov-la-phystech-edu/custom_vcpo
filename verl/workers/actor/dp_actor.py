@@ -470,6 +470,13 @@ class DataParallelPPOActor(BasePPOActor):
                             compute_rollout_correction_and_rejection_mask,
                         )
 
+                        assert self.config.policy_loss.get("loss_mode", "vanilla") != "cppo", (
+                            "loss_mode=cppo is ported for the Megatron actor only: this FSDP path "
+                            "anchors old_log_prob at log_prob.detach(), which makes CPPO's ratio == 1 "
+                            "and D_t == 0 — the drift mask would silently never bind. The cppo loss "
+                            "needs the behavior log-probs (mu) as old_log_prob; see megatron_actor's "
+                            "loss_func dispatch."
+                        )
                         old_log_prob = log_prob.detach()
                         rollout_is_weights_proto, modified_response_mask, deferred_corr_metrics = (
                             compute_rollout_correction_and_rejection_mask(

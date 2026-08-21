@@ -116,6 +116,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
+    if loss_mode == "cppo":
+        raise NotImplementedError(
+            "loss_mode=cppo is ported for the Megatron actor only: the cppo loss requires the "
+            "behavior-policy log-probs (mu) as old_log_prob and subsumes the token-IS weights "
+            "(see megatron_actor's loss_func dispatch); this engine path passes recomputed "
+            "old_log_probs with rollout_is_weights applied on top, which silently changes the "
+            "algorithm."
+        )
+
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     pg_loss, pg_metrics = policy_loss_fn(
         old_log_prob=old_log_prob,

@@ -1036,7 +1036,11 @@ def compute_policy_loss_cppo(
     delta (the token-level threshold scale) is read from ``config.clip_ratio`` (a
     DIVERGENCE threshold here, not a ratio clip; paper default 0.15 for dense models,
     0.20 for the 30B-A3B MoE model). ``config.clip_ratio_c`` is the truncated
-    importance-sampling cap on the detached ratio weight (reference default 20.0).
+    importance-sampling cap on the detached ratio weight (the reference scripts use
+    20.0). WARNING: verl's actor defaults are clip_ratio=0.2 and clip_ratio_c=3.0 —
+    flipping only ``loss_mode=cppo`` therefore trains with delta=0.2 and a ~7x
+    tighter IS cap than the reference; set both explicitly (the shipped cppo launch
+    script does: clip_ratio=0.15, clip_ratio_c=20.0).
 
     The prefix-average threshold delta_b is calibrated per sequence from its own
     divergence statistics (paper Eq. 22, Base-model warm-up calibration)::
