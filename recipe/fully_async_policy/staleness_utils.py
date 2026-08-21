@@ -1,9 +1,12 @@
+import math
+
 import torch
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple, Literal
 from verl import DataProto
 from megatron.core import parallel_state as mpu
 from verl.utils.torch_functional import allgather_dict_into_list
+from verl.workers.utils.ess import ess_from_log_weights
 from collections import defaultdict
 
 
@@ -48,6 +51,11 @@ class TrajRecord:
     rollout_is_geom_mean: Optional[float] = None
     rollout_seq_is: Optional[float] = None
     rollout_seq_is_clipped: Optional[float] = None
+    # Masked sum of the token log-ratios, i.e. log(rollout_seq_is), kept
+    # unexp'd. ESS is computed from this: exp() in fp32 flushes sums below
+    # ~-87 to 0 and turns sums above ~88.7 into inf, which censored the brake
+    # signal at both ends (see verl/workers/utils/ess.py).
+    rollout_seq_log_is: Optional[float] = None
 
 
 class TrajRecordList(list):
@@ -234,6 +242,7 @@ def compute_is_info(
         rollout_log_probs
         kl_rollout_old  (K3 f-divergence form)
         rollout_is_geom_mean
+        rollout_seq_log_is
         rollout_seq_is
         rollout_seq_is_clipped
     """
@@ -267,6 +276,11 @@ def compute_is_info(
             geom_mean = torch.exp(((log_ratio * mask_float).sum()) / (token_count + 1e-8))
             record.rollout_is_geom_mean = float(geom_mean.detach().item())
 
+            # Log-space first: this is what the ESS reduction consumes, and
+            # unlike its exp() it is exact over the whole range of drifts.
+            seq_log_is = (log_ratio.float() * mask_float.float()).sum()
+            record.rollout_seq_log_is = float(seq_log_is.detach().item())
+
             seq_is = torch.exp(((log_ratio * mask_float).sum()))
             seq_is_value = float(seq_is.detach().item())
             record.rollout_seq_is = seq_is_value
@@ -277,12 +291,22 @@ def compute_is_info(
 def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold: float | None, eps: float = 1e-8):
     """
     ESS Calculations:
-        ess = (sum w_i)^2 / (sum w_i^2) 
+        ess = (sum w_i)^2 / (sum w_i^2)
         ess_ratio = ess / minibatch_size
-        
+
         ess_clipped = ess with clipped w_i
         ess_ratio_clipped = ess_clipped / minibatch_size
 
+    Evaluated on the per-sequence LOG weights (``rollout_seq_log_is``) via the
+    max-shifted computation in :func:`~verl.workers.utils.ess.ess_from_log_weights`,
+    the same arithmetic the packed (dynamic-bsz) path uses — so both per-traj
+    paths brake on the same number. Computing it from ``rollout_seq_is``
+    instead censored the result at both ends of the fp32 range (a batch of
+    weights below exp(-87) read ESS = 0, one above exp(88.7) read NaN) and the
+    brake then ran those steps unbraked.
+
+    ``eps`` is accepted for backwards compatibility and no longer used: the
+    max-shift makes the denominator positive whenever the batch is non-empty.
     """
     dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     is_leader = (
@@ -294,46 +318,32 @@ def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold:
     local_dicts: list[dict] = [asdict(r) for r in local_records_list] if is_leader else []
     global_records: list[dict] = allgather_dict_into_list(local_dicts, group=dp_group)
 
-    IS_sum = 0.0
-    IS_sq_sum = 0.0
-    IS_sum_unclipped = 0.0
-    IS_sq_sum_unclipped = 0.0
-    ESS = 0.0
-    ESS_unclipped = 0.0
-    minibatch_size = 0
-
+    seq_log_is: list[float] = []
     for rec in global_records:
-        seq_is_unclipped = rec.get("rollout_seq_is")
-        if seq_is_unclipped is None:
-            continue
-        seq_is_clipped = rec.get("rollout_seq_is_clipped")
-        if seq_is_clipped is None:
-            seq_is_clipped = float(seq_is_unclipped)
-            if rollout_is_threshold is not None and rollout_is_threshold > 0:
-                seq_is_clipped = min(seq_is_clipped, float(rollout_is_threshold))
+        log_is = rec.get("rollout_seq_log_is")
+        if log_is is None:
+            # Records written before rollout_seq_log_is existed: recover the
+            # exponent where the stored weight still carries information.
+            # A censored 0/inf/NaN cannot be recovered and is skipped, exactly
+            # as a record with no IS fields at all is.
+            seq_is = rec.get("rollout_seq_is")
+            if seq_is is None or not math.isfinite(float(seq_is)) or float(seq_is) <= 0.0:
+                continue
+            log_is = math.log(float(seq_is))
+        seq_log_is.append(float(log_is))
 
-        IS_sum_unclipped += float(seq_is_unclipped)
-        IS_sq_sum_unclipped += float(seq_is_unclipped) ** 2
-        IS_sum += float(seq_is_clipped)
-        IS_sq_sum += float(seq_is_clipped) ** 2
-        minibatch_size += 1
-
-    if minibatch_size > 0:
-        ESS = (IS_sum) ** 2 / (IS_sq_sum + eps)
-        ess_ratio = ESS / minibatch_size
-        ESS_unclipped = (IS_sum_unclipped) ** 2 / (IS_sq_sum_unclipped + eps)
-        ess_ratio_unclipped = ESS_unclipped / minibatch_size
-    else:
-        ESS = 0.0
-        ess_ratio = 0.0
-        ESS_unclipped = 0.0
-        ess_ratio_unclipped = 0.0
+    ESS_unclipped, ess_ratio_unclipped, ESS, ess_ratio, count = ess_from_log_weights(
+        seq_log_is, rollout_is_threshold
+    )
 
     staleness_info = {
         "ess": ESS_unclipped,
         "ess_ratio": ess_ratio_unclipped,
         "ess_clipped": ESS,
         "ess_ratio_clipped": ess_ratio,
+        # Number of sequences the ESS was measured over: the brake needs it to
+        # tell "not measured" (0 -> no scaling) from "measurement broke".
+        "count": count,
     }
 
     return staleness_info

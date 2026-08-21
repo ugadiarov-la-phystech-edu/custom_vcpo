@@ -916,6 +916,7 @@ class MegatronPPOActor(BasePPOActor):
         ess_ratio = staleness_metrics.get("ess_ratio")
         minibatch_ess_clipped = staleness_metrics["ess_clipped"]
         ess_ratio_clipped = staleness_metrics["ess_ratio_clipped"]
+        ess_count = staleness_metrics.get("count")
 
         # ================ Optimizer Step ================
         if accum_buffers is not None:
@@ -947,7 +948,7 @@ class MegatronPPOActor(BasePPOActor):
                     chunk.finish_grad_sync()
 
         return self._apply_ess_scale_and_step(
-            minibatch_ess, minibatch_ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx
+            minibatch_ess, minibatch_ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, ess_count
         )
 
     def _apply_ess_scale_and_step(
@@ -957,6 +958,7 @@ class MegatronPPOActor(BasePPOActor):
         ess_ratio,
         ess_ratio_clipped,
         minibatch_idx: int,
+        ess_count: int | None = None,
     ) -> tuple[bool, dict]:
         """Shared tail of the per-traj step paths: apply the min-ESS brake
         (constant lr_scale multiplier when the global ESS is <= min_ess) for
@@ -964,13 +966,13 @@ class MegatronPPOActor(BasePPOActor):
         staleness/ess entry. Gradients must already be finalized/synced when
         this is called.
 
-        The packed path's log-space ESS is structurally floored at 1, so the
-        brake never scales below lr * lr_scale there. The per-traj
-        compute_ess_info path works in raw IS space with float64 sums: safe
-        up to the fp32 torch.exp limit (log-weight ~88.7), beyond which the
-        per-sequence weight is inf and ESS reads NaN/0 — the brake then runs
-        the step at full lr (compute_min_ess_lr_scale returns 1.0 for
-        non-positive/NaN ESS). Neither path can zero the lr."""
+        Both paths now measure the ESS in max-shifted log space, so it is
+        structurally floored at 1 for any non-empty batch and the brake can
+        never scale below lr * lr_scale — nor silently disengage on the
+        degenerate batches it exists to catch. ``ess_count`` carries how many
+        sequences the measurement covered: 0 means the ESS was not measured
+        (no scaling), while a broken measurement over a non-empty batch fails
+        closed to lr_scale."""
         ess_for_scaling = minibatch_ess_clipped if self.config.ess_scaling.use_clipped else minibatch_ess
         if ess_for_scaling is None:
             ess_for_scaling = 0.0
@@ -983,6 +985,7 @@ class MegatronPPOActor(BasePPOActor):
                 float(ess_for_scaling),
                 float(self.config.ess_scaling.min_ess),
                 float(self.config.ess_scaling.lr_scale),
+                count=None if ess_count is None else int(ess_count),
             )
             for pg, base_lr in zip(self.actor_optimizer.param_groups, base_lrs, strict=True):
                 pg["lr"] = float(base_lr) * lr_scale
@@ -1044,8 +1047,10 @@ class MegatronPPOActor(BasePPOActor):
                 group=mpu.get_pipeline_model_parallel_group(),
             )
             values = tensor.tolist()
-        ess, ess_ratio, ess_clipped, ess_ratio_clipped, _ = values
-        return self._apply_ess_scale_and_step(ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx)
+        ess, ess_ratio, ess_clipped, ess_ratio_clipped, count = values
+        return self._apply_ess_scale_and_step(
+            ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, int(count)
+        )
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def _update_policy_per_traj_packed(self, dataloader: Iterable[DataProto]) -> dict:

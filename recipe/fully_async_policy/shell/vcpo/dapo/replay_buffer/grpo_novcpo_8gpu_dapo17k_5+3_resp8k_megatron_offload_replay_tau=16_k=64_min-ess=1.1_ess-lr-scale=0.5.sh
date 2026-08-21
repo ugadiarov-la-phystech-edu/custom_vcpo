@@ -26,13 +26,14 @@
 #   * update_policy_per_traj=True: every mini-batch's sequence-level IS
 #     ratios against the cached behavior log-probs are DP-all-reduced into
 #     ess_ratio = (sum w)^2 / (B * sum w^2), logged as staleness/ess_ratio
-#     (ESS in effective samples = ess_ratio * B, B = 528 here). CAVEAT: this
-#     mbs=1 path computes ESS in raw IS space (compute_ess_info). The sums
-#     are float64 (Python floats), so a dominant sequence up to log-weight
-#     ~88.7 reads ESS ~= 1 correctly and brakes; but the per-sequence
-#     weight itself is an fp32 torch.exp — a log-weight above ~88.7 becomes
-#     inf, ESS reads NaN, and the brake is silently off (full lr) for that
-#     step. The dynbsz arm's max-shifted log-space ESS has no such window.
+#     (ESS in effective samples = ess_ratio * B, B = 528 here). This mbs=1
+#     path and the dynbsz arm now share the same max-shifted log-space
+#     computation (verl/workers/utils/ess.py), so ESS is exact at any drift
+#     and floored at 1 — the brake multiplier is exactly ess_lr_scale on
+#     degenerate mini-batches, never 0 and never silently off. It used to
+#     read the fp32 torch.exp of the log-IS sum: sums below ~-87 flushed to
+#     0 (ESS 0) and above ~88.7 to inf (ESS NaN), and both ran the step at
+#     FULL lr — observed at steps 345/346/348 of the 2026-08 replay run.
 #   * ess_scaling (min-ESS rule): the optimizer step's LR is multiplied by
 #     the CONSTANT ess_lr_scale for that step only when global ESS <=
 #     min_ess; the effective lr therefore takes exactly two values,
