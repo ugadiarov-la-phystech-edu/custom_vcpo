@@ -94,7 +94,7 @@ TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k
 # AIME-2024 only (data_source=math_dapo) -> val-core/math_dapo/acc/mean@1.
 # The rollout-dapo arm also validated on math500.parquet; that set needs the
 # math500_dapo scorer, which this branch does not carry.
-TEST_FILE=${TEST_FILE:-"/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet"}
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
 
 project_name='vcpo'
 
