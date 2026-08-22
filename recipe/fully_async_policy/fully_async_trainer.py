@@ -43,6 +43,11 @@ from verl.utils.checkpoint.checkpoint_manager import (
 from verl.utils.debug import marked_timer
 
 
+def _format_datetime(epoch_seconds: float) -> str:
+    """Local ISO-8601 with UTC offset, e.g. 2026-08-23T01:10:00+03:00."""
+    return datetime.fromtimestamp(epoch_seconds).astimezone().isoformat(timespec="seconds")
+
+
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
     """
@@ -111,6 +116,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.last_ckpt_version = 0
         # Bookkeeping for cumulative_training_time (wall clock minus validation/checkpointing).
         # first_sample_time and validation time come from the rollouter via ValidateMetrics.
+        # run_start_datetime stamps the start of this process (job launch, including ray setup,
+        # model load and val_before_train); on resume it is replaced by the original run's value
+        # from timing_state.json, so it always answers "when did this run start".
+        self.run_start_datetime = _format_datetime(time.time())
         self.cumulative_save_time = 0.0
         self.rollouter_first_sample_time = None
         self.rollouter_cumulative_validation_time = 0.0
@@ -472,6 +481,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             save_time = self.timing_save_offset
             virtual_training_time = self.virtual_training_time_offset
         timing_state = {
+            "run_start_datetime": self.run_start_datetime,
+            "checkpoint_datetime": _format_datetime(save_start),
             "wall_time_since_first_sample": wall_time,
             "cumulative_validation_time": validation_time,
             "cumulative_save_time": save_time,
@@ -487,6 +498,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             return
         with open(timing_state_path) as f:
             timing_state = json.load(f)
+        # A checkpoint written before this key existed leaves this process's own start in place.
+        self.run_start_datetime = timing_state.get("run_start_datetime", self.run_start_datetime)
         self.timing_wall_offset = timing_state.get("wall_time_since_first_sample", 0.0)
         self.timing_validation_offset = timing_state.get("cumulative_validation_time", 0.0)
         self.timing_save_offset = timing_state.get("cumulative_save_time", 0.0)
@@ -498,7 +511,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         )
         print(
             f"[FullyAsyncTrainer] Restored timing state from {timing_state_path}: "
-            f"cumulative_training_time resumes at {self.virtual_training_time_offset:.1f}s"
+            f"cumulative_training_time resumes at {self.virtual_training_time_offset:.1f}s, "
+            f"run started at {self.run_start_datetime}"
         )
 
     def load_checkpoint(self):
