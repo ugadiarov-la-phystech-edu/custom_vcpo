@@ -50,6 +50,24 @@ class _StubActorWorkerGroup:
         )
 
 
+class _StubActorWorkerGroupWithEss(_StubActorWorkerGroup):
+    """update_actor also returns the structured staleness/ess entry the ESS
+    brake emits: reduce_metrics passes list[dict] values through untouched."""
+
+    def update_actor(self, subset):
+        self.calls.append(subset)
+        return DataProto(
+            meta_info={
+                "metrics": {
+                    "actor/pg_clipfrac": [0.1, 0.3],
+                    "staleness/ess": [
+                        {"minibatch_idx": len(self.calls), "minibatch_ess": 4.0, "ess_scaled_lr": 1e-6}
+                    ],
+                }
+            }
+        )
+
+
 def _make_batch(n_groups=N_GROUPS, n_resp=N_RESP, equal_groups=True):
     if equal_groups:
         uids = np.array([f"g{i // n_resp}" for i in range(n_groups * n_resp)], dtype=object)
@@ -188,3 +206,33 @@ def test_unequal_groups_fall_back_to_whole_batch():
     assert len(calls[0]) == 8  # the full malformed batch, untouched
     assert metrics["actor/ppo_epoch_updates"] == 2  # counted as one whole epoch
     assert metrics["actor/pg_clipfrac"] == pytest.approx(0.2)
+
+
+# ---------------------------------------------------------------------------
+# structured metrics (the ESS brake)
+# ---------------------------------------------------------------------------
+
+
+def test_structured_ess_entries_do_not_crash_the_metric_average():
+    """staleness/ess is a list[dict] that reduce_metrics deliberately does not
+    reduce; a blanket np.mean over every key raised TypeError as soon as
+    actor.ess_scaling.enable=True was combined with async_training.ppo_epochs."""
+    trainer = _make_trainer()
+    trainer.actor_rollout_wg = _StubActorWorkerGroupWithEss()
+    metrics, _ = _run(trainer, _make_batch(), ppo_epochs=1.0)
+
+    assert isinstance(metrics["actor/pg_clipfrac"], float)
+    assert metrics["actor/pg_clipfrac"] == pytest.approx(0.2)
+
+
+def test_structured_ess_entries_survive_as_a_flat_list():
+    """They must still reach process_structured_metrics downstream, one entry
+    per mini-batch update, not be dropped or averaged."""
+    trainer = _make_trainer()
+    trainer.actor_rollout_wg = _StubActorWorkerGroupWithEss()
+    metrics, _ = _run(trainer, _make_batch(), ppo_epochs=1.0)
+
+    entries = metrics["staleness/ess"]
+    assert isinstance(entries, list)
+    assert len(entries) == metrics["actor/ppo_epoch_updates"]
+    assert all(isinstance(e, dict) and "minibatch_ess" in e for e in entries)

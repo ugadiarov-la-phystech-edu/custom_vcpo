@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import time
 import os
+import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -240,6 +241,7 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
     Returns only scalar-safe payload unless current backends are console+wandb.
 
     Scalar Metrics
+        staleness/ess(_clipped) (raw, the quantity min_ess is compared against),
         staleness/ess_ratio(_clipped), actor/ess_scaled_lr
         replay/*_staleness_p50 (from the replay staleness histograms)
 
@@ -270,6 +272,24 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
             for info in ess_entries
             if "ess_scaled_lr" in info and info["ess_scaled_lr"] is not None
         ]
+        # The brake compares the RAW ESS against min_ess, so ess_ratio alone
+        # cannot be converted back to the braked quantity (the sequence count is
+        # not logged either): without this you can see THAT a step braked, via
+        # ess_scaled_lr, but not how close an unbraked one came to firing.
+        ess_raw = [
+            float(info["minibatch_ess"])
+            for info in ess_entries
+            if "minibatch_ess" in info and info["minibatch_ess"] is not None
+        ]
+        ess_raw_clipped = [
+            float(info["minibatch_ess_clipped"])
+            for info in ess_entries
+            if "minibatch_ess_clipped" in info and info["minibatch_ess_clipped"] is not None
+        ]
+        if ess_raw:
+            payload["staleness/ess"] = float(np.mean(ess_raw))
+        if ess_raw_clipped:
+            payload["staleness/ess_clipped"] = float(np.mean(ess_raw_clipped))
         if ess_ratio:
             payload["staleness/ess_ratio"] = float(np.mean(ess_ratio))
         if ess_ratio_clipped:
@@ -370,17 +390,23 @@ class MetricsAggregator:
                 return agg_type
 
         metric_lower = metric_name.lower()
-        if any(keyword in metric_lower for keyword in ["timing_s/"]):
+        if "timing_s/" in metric_lower:
             return "time_sum"
-        if any(keyword in metric_lower for keyword in ["mean", "avg", "average"]):
+        # Match WORDS, not substrings: "replay/minibatch_new_ratio" contains
+        # "min" inside "minibatch" and used to be aggregated with np.min, so the
+        # reuse-rate panels reported the window's worst update instead of its
+        # mean. Splitting on non-letters keeps "staleness_min" -> min while
+        # leaving "minibatch" alone.
+        words = set(re.split(r"[^a-z]+", metric_lower))
+        if words & {"mean", "avg", "average"}:
             return "avg"
-        if any(keyword in metric_lower for keyword in ["max", "maximum"]):
+        if words & {"max", "maximum"}:
             return "max"
-        if any(keyword in metric_lower for keyword in ["min", "minimum"]):
+        if words & {"min", "minimum"}:
             return "min"
-        if any(keyword in metric_lower for keyword in ["sum", "total"]):
+        if words & {"sum", "total"}:
             return "sum"
-        if any(keyword in metric_lower for keyword in ["weighted_avg"]):
+        if "weighted_avg" in metric_lower:
             return "weighted_avg"
 
         return "avg"

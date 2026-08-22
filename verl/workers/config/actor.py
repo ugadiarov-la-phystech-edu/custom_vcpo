@@ -306,6 +306,16 @@ class McoreActorConfig(ActorConfig):
         """Validate FSDP actor configuration parameters."""
         super().__post_init__()
         self.engine = self.megatron
+        # The min-ESS brake lives in dp_actor._ess_scaled_optimizer_step; the
+        # Megatron actor has no ESS code on this branch, so enabling it here
+        # would train at full nominal LR with no warning and no braked steps.
+        if getattr(self.ess_scaling, "enable", False):
+            raise NotImplementedError(
+                "actor.ess_scaling.enable=True is not supported with strategy=megatron on this "
+                "branch: the min-ESS brake is implemented on the FSDP path only "
+                "(verl/workers/actor/dp_actor.py). Use actor.strategy=fsdp2, or set "
+                "actor.ess_scaling.enable=False to train unbraked."
+            )
 
 
 @dataclass

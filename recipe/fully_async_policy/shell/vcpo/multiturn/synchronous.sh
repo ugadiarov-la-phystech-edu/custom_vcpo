@@ -99,7 +99,6 @@ tool_config_path="recipe/fully_async_policy/code_sandbox/sandbox_tool_config.yam
 multi_turn_format="simple-tir"
 
 # Set to True to get per-trajectory gradient statistics
-update_policy_per_traj=False
 
 # ================= Training/Rollout Steps =================
 total_rollout_steps=$((500 * num_minibatches_per_update * updates_per_param_sync * train_prompt_mini_bsz))
@@ -192,7 +191,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.use_rollout_log_probs=${use_rollout_log_probs} \
-    actor_rollout_ref.actor.update_policy_per_traj=${update_policy_per_traj} \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.ref.megatron.context_parallel_size=${train_cp} \

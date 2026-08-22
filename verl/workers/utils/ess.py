@@ -27,14 +27,25 @@ import torch.distributed as dist
 __all__ = ["compute_global_ess_from_log_weights", "compute_min_ess_lr_scale"]
 
 
-def _is_corrupt(log_w: torch.Tensor) -> bool:
+def _is_corrupt(log_w: torch.Tensor, clipped: bool = False) -> bool:
     """True when a log-weight cannot be interpreted as a weight at all.
 
-    NaN means broken upstream log-probs; +inf cannot arise from a finite sum
-    of log-probs, so it means the same. -inf is NOT corrupt — it is exactly a
-    zero weight (a token the policy assigns probability 0), and the max-shift
-    handles it without any special case."""
-    return bool(log_w.numel()) and bool((torch.isnan(log_w) | (log_w == math.inf)).any())
+    NaN means broken upstream log-probs; +inf cannot arise from a finite sum of
+    log-probs, so unclipped it means the same. -inf is NOT corrupt — it is
+    exactly a zero weight (a token the policy assigns probability 0), and the
+    max-shift handles it without any special case.
+
+    The CLIPPED variant is stricter about what counts as unknowable: a +inf
+    exponent is clamped to log(threshold), a finite and perfectly correct
+    clipped weight, so only NaN makes the clipped ESS unmeasurable. Flagging
+    the two variants together would brake every mini-batch containing one
+    -inf rollout log-prob whenever use_clipped=True, even though the clipped
+    quantity the brake reads is well defined."""
+    if not log_w.numel():
+        return False
+    if clipped:
+        return bool(torch.isnan(log_w).any())
+    return bool((torch.isnan(log_w) | (log_w == math.inf)).any())
 
 
 def compute_global_ess_from_log_weights(
@@ -63,17 +74,20 @@ def compute_global_ess_from_log_weights(
 
     When torch.distributed is initialized the maxima and shifted sums are
     all-reduced over ``group`` (None = the world group, the DP group of the
-    FSDP trainer). Two tiny collectives: MAX on 2 doubles, SUM on 6 — the 6th
-    being a corruption flag, so a non-finite log-weight on any rank (broken
-    upstream log-probs, or a -inf rollout log-prob turning the ratio into
-    +inf) makes the ESS NaN globally instead of reading as a healthy batch.
-    The brake fails closed on NaN.
+    FSDP trainer). Two tiny collectives: MAX on 2 doubles, SUM on 7 — the last
+    two being PER-VARIANT corruption flags, so a log-weight that cannot be read
+    as a weight on any rank makes that variant's ESS NaN globally instead of
+    reading as a healthy batch, and the brake fails closed on it. The variants
+    differ in what counts as unreadable: NaN for both, and +inf for the
+    unclipped one only (clipping maps it to log(threshold), a correct finite
+    weight). See _is_corrupt.
 
     Returns (ess, ess_ratio, ess_clipped, ess_ratio_clipped, global_count);
     all zeros when the global batch is empty, NaN ESS when it is corrupt.
     """
     s = torch.as_tensor([float(v) for v in seq_log_is], dtype=torch.float64)
-    if rollout_is_threshold is not None and float(rollout_is_threshold) > 0:
+    clipping_active = rollout_is_threshold is not None and float(rollout_is_threshold) > 0
+    if clipping_active:
         s_clip = torch.clamp(s, max=math.log(float(rollout_is_threshold)))
     else:
         s_clip = s
@@ -81,6 +95,9 @@ def compute_global_ess_from_log_weights(
     finite = torch.isfinite(s)
     finite_clip = torch.isfinite(s_clip)
     corrupt_local = _is_corrupt(s)
+    # Only an ACTIVE clamp makes +inf readable; with clipping disabled the
+    # "clipped" variant is the unclipped one and inherits its stricter rule.
+    corrupt_clip_local = _is_corrupt(s_clip, clipped=True) if clipping_active else corrupt_local
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     neg_inf = float("-inf")
@@ -111,17 +128,26 @@ def compute_global_ess_from_log_weights(
     w_sum, w_sq_sum = _shifted_sums(s[finite], shift)
     wc_sum, wc_sq_sum = _shifted_sums(s_clip[finite_clip], shift_clip)
     sums = torch.tensor(
-        [w_sum, w_sq_sum, wc_sum, wc_sq_sum, float(s.numel()), 1.0 if corrupt_local else 0.0],
+        [
+            w_sum,
+            w_sq_sum,
+            wc_sum,
+            wc_sq_sum,
+            float(s.numel()),
+            1.0 if corrupt_local else 0.0,
+            1.0 if corrupt_clip_local else 0.0,
+        ],
         device=device,
         dtype=torch.float64,
     )
     if dist.is_initialized():
         dist.all_reduce(sums, op=dist.ReduceOp.SUM, group=group)
-    g_sum, g_sq_sum, gc_sum, gc_sq_sum, count, corrupt = sums.tolist()
+    g_sum, g_sq_sum, gc_sum, gc_sq_sum, count, corrupt, corrupt_clip = sums.tolist()
     count = int(count)
     corrupt = corrupt > 0.0
+    corrupt_clip = corrupt_clip > 0.0
 
-    def _ess(sum_w: float, sum_w_sq: float) -> tuple[float, float]:
+    def _ess(sum_w: float, sum_w_sq: float, corrupt: bool = corrupt) -> tuple[float, float]:
         # The rank holding the global max contributes exactly 1 to sum_w_sq,
         # so a positive count implies a positive denominator — no eps needed.
         if count <= 0:
@@ -137,7 +163,7 @@ def compute_global_ess_from_log_weights(
         return ess, ess / count
 
     ess, ess_ratio = _ess(g_sum, g_sq_sum)
-    ess_clipped, ess_ratio_clipped = _ess(gc_sum, gc_sq_sum)
+    ess_clipped, ess_ratio_clipped = _ess(gc_sum, gc_sq_sum, corrupt=corrupt_clip)
     return ess, ess_ratio, ess_clipped, ess_ratio_clipped, count
 
 

@@ -21,7 +21,7 @@ Run: pytest tests/workers/actor/test_ess_lr_scale_on_cpu.py
 
 import pytest
 
-from verl.workers.config.actor import ESSScalingConfig
+from verl.workers.config.actor import ESSScalingConfig, McoreActorConfig
 from verl.workers.utils.ess import compute_min_ess_lr_scale
 
 
@@ -138,3 +138,28 @@ class TestParameters:
         # i.e. ratio 1.1/528 ~= 0.002083 at B = 528), lr_scale = 0.5.
         assert compute_min_ess_lr_scale(1.0, 1.1, 0.5) == 0.5
         assert compute_min_ess_lr_scale(1.2, 1.1, 0.5) == 1.0
+
+
+class TestMegatronRefusesTheBrake:
+    """The brake is implemented in dp_actor._ess_scaled_optimizer_step only;
+    megatron_actor has no ESS code on this branch. Enabling it there would train
+    at full nominal LR with no braked steps and no warning."""
+
+    def test_enabled_brake_is_refused_for_megatron(self):
+        with pytest.raises(NotImplementedError, match="ess_scaling"):
+            McoreActorConfig(
+                rollout_n=1,
+                ppo_micro_batch_size_per_gpu=1,
+                ess_scaling=ESSScalingConfig(enable=True),
+            )
+
+    def test_disabled_brake_is_fine_for_megatron(self):
+        cfg = McoreActorConfig(
+            rollout_n=1,
+            ppo_micro_batch_size_per_gpu=1,
+            ess_scaling=ESSScalingConfig(enable=False),
+        )
+        assert cfg.ess_scaling.enable is False
+
+    def test_default_megatron_config_constructs(self):
+        assert McoreActorConfig(rollout_n=1, ppo_micro_batch_size_per_gpu=1).ess_scaling.enable is False

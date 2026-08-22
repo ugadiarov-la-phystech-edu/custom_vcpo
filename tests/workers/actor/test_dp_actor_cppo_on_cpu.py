@@ -31,6 +31,8 @@ arms:
 Run: pytest tests/workers/actor/test_dp_actor_cppo_on_cpu.py
 """
 
+import math
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -356,6 +358,125 @@ class TestClipRatioCTrap:
         with caplog.at_level("WARNING"):
             actor.update_policy(_make_batch())
         assert not any("clip_ratio_c" in r.message for r in caplog.records)
+
+
+class TestInteractionWithTheEssFixes:
+    """The ESS hardening (fail-closed brake, per-variant corruption flag,
+    sequence-parallel dedup) and CPPO touch the same actor. These pin that they
+    compose: the brake still reads the drift the mask is masking, and neither
+    guard masks the other."""
+
+    @staticmethod
+    def _record_stepped_lrs(actor):
+        stepped = []
+        orig_step = actor.actor_optimizer.step
+
+        def recording_step():
+            stepped.append(float(actor.actor_optimizer.param_groups[0]["lr"]))
+            return orig_step()
+
+        actor.actor_optimizer.step = recording_step
+        return stepped
+
+    def test_degenerate_batch_still_brakes_under_cppo(self):
+        """One sequence dominating the IS weights -> ESS ~ 1 -> lr * lr_scale,
+        unchanged by the sp_rank contribution guard (sp_size == 1 here, so this
+        rank contributes)."""
+        actor = _make_actor(_config(ess=True), policy_logprob=-0.4)
+        stepped = self._record_stepped_lrs(actor)
+        batch = _make_batch(mu_logprob=-2.0)
+        batch.batch["rollout_log_probs"][1:] = -0.4  # rows 1..3 sit on top of pi
+        metrics = actor.update_policy(batch)
+
+        (entry,) = metrics["staleness/ess"]
+        assert entry["minibatch_ess"] <= 1.1
+        assert stepped == [pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)]
+
+    def test_ess_entry_keeps_its_contract_keys_under_cppo(self):
+        actor = _make_actor(_config(ess=True), policy_logprob=-1.99)
+        metrics = actor.update_policy(_make_batch(mu_logprob=-2.0))
+        (entry,) = metrics["staleness/ess"]
+        assert set(entry.keys()) >= {
+            "minibatch_idx",
+            "minibatch_ess",
+            "minibatch_ess_clipped",
+            "minibatch_ess_ratio",
+            "minibatch_ess_ratio_clipped",
+            "ess_scaled_lr",
+        }
+
+    def test_corrupt_measurement_fails_closed_while_the_mask_still_computes(self):
+        """A NaN rollout log-prob makes the sequence log-IS NaN: the brake must
+        fail closed (lr * lr_scale) AND the CPPO mask must still produce its
+        metrics — the two guards are independent."""
+        actor = _make_actor(_config(ess=True), policy_logprob=-0.4)
+        stepped = self._record_stepped_lrs(actor)
+        batch = _make_batch(mu_logprob=-2.0)
+        batch.batch["rollout_log_probs"][0, 0] = float("nan")
+        metrics = actor.update_policy(batch)
+
+        (entry,) = metrics["staleness/ess"]
+        assert math.isnan(entry["minibatch_ess"])
+        assert entry["ess_scaled_lr"] == pytest.approx(NOMINAL_LR * 0.5, rel=1e-6)
+        assert "actor/pg_clipfrac" in metrics  # the mask ran
+        # A NaN rollout log-prob poisons the loss too, so _optimizer_step's
+        # non-finite-grad guard drops the update before the braked LR is used:
+        # defence in depth, and what the brake owes here is the honest NaN
+        # measurement plus a braked (not full) lr on the entry.
+        assert stepped == []
+
+    def test_use_clipped_is_not_braked_by_an_unclipped_only_corruption(self):
+        """A -inf rollout log-prob gives a +inf sequence log-IS: unreadable raw,
+        but clipping maps it to log(threshold), so with use_clipped=True the
+        brake reads a well-defined ESS and must not fire."""
+        cfg = _config()
+        object.__setattr__(cfg, "ess_scaling", ESSScalingConfig(enable=True, min_ess=1.1, lr_scale=0.5,
+                                                                use_clipped=True))
+        actor = _make_actor(cfg, policy_logprob=-1.99)
+        stepped = self._record_stepped_lrs(actor)
+        batch = _make_batch(mu_logprob=-2.0)
+        batch.batch["rollout_log_probs"][0, 0] = float("-inf")
+        metrics = actor.update_policy(batch)
+
+        (entry,) = metrics["staleness/ess"]
+        assert math.isnan(entry["minibatch_ess"]), "the unclipped variant is unmeasurable"
+        assert not math.isnan(entry["minibatch_ess_clipped"]), "the clipped one is well defined"
+        assert stepped == [pytest.approx(NOMINAL_LR, rel=1e-6)], "brake must not fire on it"
+
+
+class TestMegatronGuardsAreIndependent:
+    """Two separate refusals now live on the Megatron path: cppo without the mu
+    anchor, and the ESS brake that has no Megatron implementation. Neither may
+    swallow the other."""
+
+    def test_cppo_refusal_fires_regardless_of_ess(self):
+        from verl.workers.actor.megatron_actor import refuse_cppo_without_mu_anchor
+
+        with pytest.raises(NotImplementedError, match="cppo"):
+            refuse_cppo_without_mu_anchor("cppo", True)
+        refuse_cppo_without_mu_anchor("cppo", False)  # paper regime: allowed
+
+    def test_ess_refusal_fires_for_vanilla_too(self):
+        from verl.workers.config.actor import McoreActorConfig
+
+        with pytest.raises(NotImplementedError, match="ess_scaling"):
+            McoreActorConfig(
+                rollout_n=1,
+                ppo_micro_batch_size_per_gpu=1,
+                policy_loss=PolicyLossConfig(loss_mode="vanilla"),
+                ess_scaling=ESSScalingConfig(enable=True),
+            )
+
+    def test_megatron_cppo_without_the_brake_constructs(self):
+        from verl.workers.config.actor import McoreActorConfig
+
+        cfg = McoreActorConfig(
+            rollout_n=1,
+            ppo_micro_batch_size_per_gpu=1,
+            policy_loss=PolicyLossConfig(loss_mode="cppo", cppo=CPPOConfig()),
+            ess_scaling=ESSScalingConfig(enable=False),
+        )
+        assert cfg.policy_loss.loss_mode == "cppo"
 
 
 class TestConfigSurface:
