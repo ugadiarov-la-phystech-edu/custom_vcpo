@@ -29,6 +29,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime
 from types import SimpleNamespace
 
 import ray.cloudpickle
@@ -37,6 +38,7 @@ from omegaconf import OmegaConf
 from recipe.fully_async_policy.detach_utils import ValidateMetrics
 from recipe.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter as _RollouterActor
 from recipe.fully_async_policy.fully_async_trainer import FullyAsyncTrainer as _TrainerActor
+from recipe.fully_async_policy.fully_async_trainer import _format_datetime
 
 
 def _unwrap_ray_actor_class(actor_cls):
@@ -94,9 +96,12 @@ def _make_rollouter(first_sample_time, test_freq=1, validate_duration=0.03):
     return r
 
 
-def _make_trainer(first_sample_time=None, cumulative_validation_time=0.0, cumulative_save_time=0.0):
+def _make_trainer(
+    first_sample_time=None, cumulative_validation_time=0.0, cumulative_save_time=0.0, run_start_datetime=None
+):
     """Minimal FullyAsyncTrainer with only the attributes under test."""
     t = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
+    t.run_start_datetime = run_start_datetime or _format_datetime(time.time())
     t.rollouter_first_sample_time = first_sample_time
     t.rollouter_cumulative_validation_time = cumulative_validation_time
     t.cumulative_save_time = cumulative_save_time
@@ -462,6 +467,8 @@ def test_timing_state_checkpoint_roundtrip(tmp_path):
 
     state = json.loads((tmp_path / "timing_state.json").read_text())
     assert state == {
+        "run_start_datetime": saver.run_start_datetime,
+        "checkpoint_datetime": _format_datetime(150.0),
         "wall_time_since_first_sample": 50.0,
         "cumulative_validation_time": 5.0,
         "cumulative_save_time": 2.0,
@@ -523,9 +530,15 @@ def test_save_checkpoint_inner_writes_timing_state_next_to_the_checkpoint(tmp_pa
 
     # between steps, the last step ended at virtual 130
     trainer.virtual_free_time = 130.0
+    before = time.time()
     trainer._save_checkpoint_inner()
+    after = time.time()
 
     state = json.loads((step_folder / "timing_state.json").read_text())
+    # the save stamps itself with the real clock, inside the window of the call
+    assert state["run_start_datetime"] == trainer.run_start_datetime
+    checkpoint_time = datetime.fromisoformat(state["checkpoint_datetime"]).timestamp()
+    assert int(before) <= checkpoint_time <= int(after) + 1
     assert state["cumulative_validation_time"] == 5.0
     assert state["cumulative_save_time"] == 2.0
     assert state["cumulative_training_time"] == 30.0  # 130 - 100
@@ -589,6 +602,63 @@ def test_restore_timing_state_old_format_falls_back_to_naive(tmp_path):
     trainer = _make_trainer()
     trainer._restore_timing_state(str(tmp_path))
     assert trainer.virtual_training_time_offset == 43.0
+
+
+def test_timing_state_records_run_start_and_checkpoint_datetimes(tmp_path):
+    """The two absolute stamps: the run's start verbatim, and the save's own instant.
+
+    checkpoint_datetime must come from save_start - the instant the durations above it are
+    snapshotted at - not from "now", or it would drift by the duration of the save itself.
+    """
+    trainer = _make_trainer(first_sample_time=100.0, run_start_datetime="2026-08-23T00:20:00+03:00")
+    trainer._save_timing_state(str(tmp_path), save_start=150.0)
+
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    assert state["run_start_datetime"] == "2026-08-23T00:20:00+03:00"
+    assert state["checkpoint_datetime"] == _format_datetime(150.0)
+
+
+def test_timing_state_datetimes_are_timezone_aware_and_parse_back(tmp_path):
+    """A file written on one machine must be unambiguous when read on another."""
+    trainer = _make_trainer(first_sample_time=100.0)
+    save_start = time.time()
+    trainer._save_timing_state(str(tmp_path), save_start=save_start)
+
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    for key in ("run_start_datetime", "checkpoint_datetime"):
+        parsed = datetime.fromisoformat(state[key])
+        assert parsed.tzinfo is not None, key
+    # written with timespec="seconds", so the instant survives to the second
+    assert datetime.fromisoformat(state["checkpoint_datetime"]).timestamp() == int(save_start)
+
+
+def test_run_start_datetime_survives_resumes(tmp_path):
+    """It answers "when did this run start", so a restart must not reset it."""
+    run1 = _make_trainer(first_sample_time=100.0, run_start_datetime="2026-08-23T00:20:00+03:00")
+    run1._save_timing_state(str(tmp_path), save_start=150.0)
+
+    run2 = _make_trainer(run_start_datetime="2026-08-24T09:00:00+03:00")
+    run2._restore_timing_state(str(tmp_path))
+    assert run2.run_start_datetime == "2026-08-23T00:20:00+03:00"
+
+    # ... and the next checkpoint of the resumed run reports the original start again
+    run2.rollouter_first_sample_time = 1000.0
+    run2._save_timing_state(str(tmp_path), save_start=1100.0)
+    state = json.loads((tmp_path / "timing_state.json").read_text())
+    assert state["run_start_datetime"] == "2026-08-23T00:20:00+03:00"
+    assert state["checkpoint_datetime"] == _format_datetime(1100.0)
+
+
+def test_restore_timing_state_without_the_datetime_keys_keeps_this_process_start(tmp_path):
+    # checkpoints written before these keys existed
+    (tmp_path / "timing_state.json").write_text(
+        json.dumps(
+            {"wall_time_since_first_sample": 50.0, "cumulative_validation_time": 5.0, "cumulative_save_time": 2.0}
+        )
+    )
+    trainer = _make_trainer(run_start_datetime="2026-08-24T09:00:00+03:00")
+    trainer._restore_timing_state(str(tmp_path))
+    assert trainer.run_start_datetime == "2026-08-24T09:00:00+03:00"
 
 
 # ------------------------------------------------- virtual (no-validation) clock
