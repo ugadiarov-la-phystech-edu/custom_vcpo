@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -46,6 +47,10 @@ class RolloutSample:
     param_version_end: list[int]
     rollout_status: dict[str, Any]
 
+    enqueue_time: Optional[float] = None
+    validation_pause_before: float = 0.0
+    checkpoint_pause_before: float = 0.0
+
 
 @dataclass
 class ValidateMetrics:
@@ -55,6 +60,8 @@ class ValidateMetrics:
     metrics: Optional[dict[str, Any]] = None
     global_steps: Optional[int] = None
     param_version: Optional[int] = None
+    first_sample_time: Optional[float] = None
+    cumulative_validation_time: Optional[float] = None
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
@@ -223,6 +230,10 @@ class MetricsAggregator:
                 "fully_async/count/current_param_version",
                 "fully_async/count/dropped_stale_samples",
                 "training/global_step",  # TODO change name to: total_step
+                "fully_async/timing/cumulative_training_time",
+                "fully_async/timing/wall_time_since_first_sample",
+                "fully_async/timing/cumulative_validation_time",
+                "fully_async/timing/cumulative_save_time",
             ],
         }
 
@@ -249,18 +260,17 @@ class MetricsAggregator:
                 return agg_type
 
         metric_lower = metric_name.lower()
-        if any(keyword in metric_lower for keyword in ["timing_s/"]):
+        if "timing_s/" in metric_lower:
             return "time_sum"
-        if any(keyword in metric_lower for keyword in ["mean", "avg", "average"]):
+        words = set(re.split(r"[^a-z]+", metric_lower))
+        if words & {"mean", "avg", "average"}:
             return "avg"
-        if any(keyword in metric_lower for keyword in ["max", "maximum"]):
+        if words & {"max", "maximum"}:
             return "max"
-        if any(keyword in metric_lower for keyword in ["min", "minimum"]):
+        if words & {"min", "minimum"}:
             return "min"
-        if any(keyword in metric_lower for keyword in ["sum", "total"]):
+        if words & {"sum", "total"}:
             return "sum"
-        if any(keyword in metric_lower for keyword in ["weighted_avg"]):
-            return "weighted_avg"
 
         return "avg"
 

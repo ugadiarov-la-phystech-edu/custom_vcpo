@@ -27,6 +27,10 @@ async_training:
   # compute_prox_log_prob
   compute_prox_log_prob: False
 
+  serialize_validation: False
+
+  pause_generation_during_save: False
+
 # Rollout config
 rollout:
 
