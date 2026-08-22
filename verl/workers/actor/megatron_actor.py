@@ -49,10 +49,21 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
 
-__all__ = ["MegatronPPOActor"]
+__all__ = ["MegatronPPOActor", "should_calculate_entropy"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def should_calculate_entropy(config) -> bool:
+    """Whether update_policy computes token entropy.
+
+    Required whenever entropy enters the loss (entropy_coeff != 0), and additionally on request
+    via actor.calculate_entropy so actor/entropy can be logged as a diagnostic at
+    entropy_coeff=0. Note the cost on the non-fused megatron path: the logits are cloned before
+    vocab_parallel_entropy (see forward_step), so enable it deliberately.
+    """
+    return config.entropy_coeff != 0 or bool(config.get("calculate_entropy", False))
 
 
 class MegatronPPOActor(BasePPOActor):
@@ -676,7 +687,7 @@ class MegatronPPOActor(BasePPOActor):
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            calculate_entropy = should_calculate_entropy(self.config)
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:

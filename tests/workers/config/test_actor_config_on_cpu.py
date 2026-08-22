@@ -63,6 +63,58 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(megatron_config.ppo_mini_batch_size, fsdp_config.ppo_mini_batch_size)
         self.assertEqual(megatron_config.clip_ratio, fsdp_config.clip_ratio)
 
+    def test_policy_loss_rollout_correction_survives_instantiation(self):
+        """policy_loss.rollout_correction must reach the worker's dataclass.
+
+        The fully_async_policy recipe does its own old_log_prob handling, so it sets this
+        block directly instead of going through apply_rollout_correction(). Without the
+        field on PolicyLossConfig, omega_conf_to_dataclass raises
+        "unexpected keyword argument 'rollout_correction'" at worker init, and
+        loss_mode='rollout_correction' becomes unusable.
+        """
+        megatron_dict = {
+            "_target_": "verl.workers.config.McoreActorConfig",
+            "strategy": "megatron",
+            "ppo_mini_batch_size": 528,
+            "ppo_micro_batch_size_per_gpu": 1,
+            "policy_loss": {
+                "_target_": "verl.workers.config.PolicyLossConfig",
+                "loss_mode": "rollout_correction",
+                "rollout_correction": {
+                    "rollout_is": "token",
+                    "rollout_is_threshold": 2.0,
+                    "rollout_rs": None,
+                },
+            },
+            "optim": {"_target_": "verl.workers.config.McoreOptimizerConfig", "lr": 1e-6},
+            "rollout_n": 16,
+        }
+
+        config = omega_conf_to_dataclass(megatron_dict)
+
+        self.assertIsInstance(config, McoreActorConfig)
+        self.assertEqual(config.policy_loss.loss_mode, "rollout_correction")
+        # the loss wrapper reads it with .get(), so a mapping is what it must be
+        rollout_correction = config.policy_loss.get("rollout_correction")
+        self.assertEqual(rollout_correction.get("rollout_is"), "token")
+        self.assertEqual(rollout_correction.get("rollout_is_threshold"), 2.0)
+        self.assertIsNone(rollout_correction.get("rollout_rs"))
+        self.assertIsNone(rollout_correction.get("rollout_token_veto_threshold", None))
+
+    def test_policy_loss_rollout_correction_defaults_to_none(self):
+        """Every other script must be unaffected: the field is absent by default."""
+        config = omega_conf_to_dataclass(
+            {
+                "_target_": "verl.workers.config.ActorConfig",
+                "strategy": "megatron",
+                "ppo_micro_batch_size_per_gpu": 1,
+                "optim": {"_target_": "verl.workers.config.OptimizerConfig", "lr": 1e-6},
+                "rollout_n": 1,
+            }
+        )
+        self.assertEqual(config.policy_loss.loss_mode, "vanilla")
+        self.assertIsNone(config.policy_loss.get("rollout_correction"))
+
     def test_actor_config_from_yaml(self):
         """Test creating ActorConfig from YAML file."""
         from hydra import compose, initialize_config_dir

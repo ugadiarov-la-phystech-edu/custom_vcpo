@@ -27,6 +27,21 @@ async_training:
   # compute_prox_log_prob
   compute_prox_log_prob: False
 
+  # Stop-the-world validation: after a sync that triggers validation, the
+  # trainer blocks until the validation sweep completes instead of training
+  # ahead on backlog. With generation already paused, the whole pipeline
+  # freezes — a pure time translation — so the trajectory and
+  # cumulative_training_time match a no-validation run exactly (the stall is
+  # excluded from the clock). Costs the lost overlap: wall time grows by
+  # roughly the validation time per test.
+  serialize_validation: False
+
+  # Stop-the-world checkpoint saves: freeze generation for the entire save
+  # (trainer dist-ckpt + rollouter dataloader state), so saves are also a pure
+  # time translation instead of building a queue surplus. The full pause shifts
+  # sample stamps and is excluded from cumulative_training_time.
+  pause_generation_during_save: False
+
 # Rollout config
 rollout:
 
