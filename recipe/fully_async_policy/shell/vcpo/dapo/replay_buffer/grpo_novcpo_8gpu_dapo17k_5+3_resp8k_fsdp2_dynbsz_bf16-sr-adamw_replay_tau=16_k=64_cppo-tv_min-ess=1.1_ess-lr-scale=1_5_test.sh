@@ -284,7 +284,7 @@ ess_enable=${ess_enable:-True}
 # the threshold is backend-independent, unlike the auto-base (11x apart
 # between the fsdp2 and Megatron arms for near-identical raw ESS traces).
 min_ess=${min_ess:-1.1}
-ess_lr_scale=${ess_lr_scale:-0.5}
+ess_lr_scale=${ess_lr_scale:-1}
 ess_use_clipped=False # ESS from unclipped ratios (paper): the brake must see what truncation hides
 ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
 
