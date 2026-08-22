@@ -102,6 +102,60 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
         get_torch_device().empty_cache()
 
 
+def apply_gpu_memory_cap() -> float | None:
+    """Cap this process's PyTorch allocator at VERL_GPU_MEM_CAP_GB gigabytes.
+
+    Emulating a smaller card (e.g. running an 80 GB H100 recipe on a 143 GB
+    H200) so the memory envelope of a run is representative. Returns the applied
+    fraction, or None when the knob is unset / not applicable.
+
+    Two reasons this lives here rather than in the launch environment:
+
+    * torch has no env-var form of it — PYTORCH_CUDA_ALLOC_CONF rejects
+      `per_process_memory_fraction` ("Unrecognized CachingAllocator option"), so
+      it has to be an API call inside the process;
+    * it must NOT reach the rollout engines. vLLM budgets weights, activations
+      and KV cache as a fraction of the device's TOTAL memory, so a hidden
+      allocator ceiling would leave it planning for memory it cannot get. The
+      rollout side is capped by lowering rollout.gpu_memory_utilization instead
+      (0.9 on an 80 GB card == 0.51 on a 143 GB one). DetachActorWorker is
+      trainer-only, which is what makes this safe — the same argument as
+      set_expandable_segments below.
+
+    Caveat worth knowing when reading the resulting numbers: this bounds the
+    caching allocator, not the hardware. The CUDA context, NCCL buffers and
+    cuBLAS workspaces sit outside it (order 1-2 GB), and fragmentation against a
+    soft cap differs from a real wall, so fitting under the cap is evidence the
+    recipe fits the smaller card, not proof.
+    """
+    cap_gb = os.environ.get("VERL_GPU_MEM_CAP_GB")
+    if not cap_gb:
+        return None
+    cap_bytes = float(cap_gb) * (1024**3)
+    if cap_bytes <= 0:
+        raise ValueError(f"VERL_GPU_MEM_CAP_GB must be positive, got {cap_gb!r}")
+    device = get_torch_device()
+    if not device.is_available():
+        return None
+    total_bytes = device.get_device_properties(device.current_device()).total_memory
+    if cap_bytes >= total_bytes:
+        logger.warning(
+            "VERL_GPU_MEM_CAP_GB=%s is at or above the device's %.1f GiB; leaving the allocator uncapped",
+            cap_gb,
+            total_bytes / 1024**3,
+        )
+        return None
+    fraction = cap_bytes / total_bytes
+    device.set_per_process_memory_fraction(fraction)
+    logger.warning(
+        "Capped the trainer allocator at %.1f GiB of %.1f GiB (fraction %.4f) via VERL_GPU_MEM_CAP_GB",
+        cap_bytes / 1024**3,
+        total_bytes / 1024**3,
+        fraction,
+    )
+    return fraction
+
+
 class DetachActorWorker(DetachNcclSync):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -112,6 +166,9 @@ class DetachActorWorker(DetachNcclSync):
         # expandable segments (vllm/device_allocator/cumem.py), and env vars reach
         # the rollout engine processes too. This worker is trainer-only.
         set_expandable_segments(True)
+        # Optional smaller-card emulation; trainer-process-only for the same
+        # reason as the line above (see apply_gpu_memory_cap).
+        apply_gpu_memory_cap()
 
     def _get_actor_params(self):
         assert self._is_actor
