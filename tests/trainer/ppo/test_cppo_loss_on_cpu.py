@@ -628,6 +628,91 @@ class TestDegenerateSettings:
 # ---------------------------------------------------------------- metrics & config
 
 
+class TestCalibrationDiagnostics:
+    """delta_b has to be chosen from data (the paper calibrates it per model),
+    and the quantity it is thresholded against — the WEIGHTED divergence
+    Z_t = w_t*D_t — is not otherwise observable. These three metrics are the
+    paper's Fig. 7 instrumentation."""
+
+    def test_delta_b_seq_is_the_floor_when_the_calibration_is_off(self):
+        """k = 0 pins delta_b^seq to the floor: the fixed-budget regime the
+        paper uses for post-trained models."""
+        lp, olp, adv, mask = _rand_inputs(0)
+        _, m = _call(lp, olp, adv, mask, _config(delta_b=0.017, delta_b_k=0.0))
+        assert m["actor/cppo_delta_b_seq"] == pytest.approx(0.017, rel=1e-6)
+
+    def test_delta_b_seq_tracks_the_quantile_when_calibrated(self):
+        """With k = 1 and a wide clamp it reports k * quantile(D), i.e. it
+        follows the batch's own drift — the self-scaling behaviour."""
+        lp, olp, adv, mask = _rand_inputs(1)
+        cfg = _config(delta_b=1e-6, delta_b_k=1.0, delta_b_q=0.9, delta_b_max_mult=1e6)
+        _, m = _call(lp, olp, adv, mask, cfg)
+
+        import numpy as np
+
+        d = (lp.detach().exp() - olp.exp()).abs().numpy()
+        expected = float(np.mean([np.quantile(row, 0.9) for row in d]))
+        assert m["actor/cppo_delta_b_seq"] == pytest.approx(expected, rel=1e-5)
+
+    def test_delta_b_seq_honours_the_ceiling(self):
+        cfg = _config(delta_b=0.01, delta_b_k=1000.0, delta_b_max_mult=3.0)
+        lp, olp, adv, mask = _rand_inputs(2)
+        _, m = _call(lp, olp, adv, mask, cfg)
+        assert m["actor/cppo_delta_b_seq"] == pytest.approx(0.03, rel=1e-6)
+
+    def test_weighted_div_mean_matches_a_hand_computed_masked_mean(self):
+        w_min = 0.8
+        mask = torch.zeros(1, 5, dtype=torch.long)
+        mask[0, :4] = 1
+        lp = torch.tensor([[-1.6, -1.6, -1.6, -1.6, 0.0]], requires_grad=True)
+        olp = torch.tensor([[-2.0, -2.0, -2.0, -2.0, 0.0]])
+        adv = torch.ones(1, 5) * mask
+        _, m = _call(lp, olp, adv, mask, _config(w_min=w_min))
+
+        d = abs(math.exp(-1.6) - math.exp(-2.0))
+        # w_t over the row's own 4 valid tokens: 1, 1-0.2/3, 1-0.4/3, 0.8
+        ws = [1.0 - (1.0 - w_min) * t / 3.0 for t in range(4)]
+        expected = sum(w * d for w in ws) / 4
+        assert m["actor/cppo_weighted_div_mean"] == pytest.approx(expected, rel=1e-5)
+
+    def test_budget_mask_frac_is_zero_when_the_budget_cannot_bind(self):
+        lp, olp, adv, mask = _rand_inputs(3)
+        _, m = _call(lp, olp, adv, mask, _config(delta_b=1e6, delta_b_k=0.0))
+        assert m["actor/cppo_budget_mask_frac"] == pytest.approx(0.0)
+
+    def test_budget_mask_frac_accounts_for_the_masking_when_only_the_budget_binds(self):
+        """delta is NOT just the token-level threshold: Eq. 8 also seeds the
+        prefix threshold with it (c_t = min(delta, delta + delta_b*W - S)), so a
+        huge delta makes BOTH clauses vacuous. To isolate the budget, keep delta
+        comfortably above w_t*D_t and let the prefix sum outgrow that slack: with
+        delta_b ~ 0 the running S exceeds delta after delta/(w*D) tokens, and
+        every rejection from there on is the budget's."""
+        T_long = 64
+        mask = torch.ones(1, T_long, dtype=torch.long)
+        lp = torch.full((1, T_long), -1.6, requires_grad=True)   # pi = 0.202
+        olp = torch.full((1, T_long), -2.0)                      # mu = 0.135, D ~ 0.067
+        adv = torch.ones(1, T_long)                              # positive adv, ratio > 1 -> away from mu
+        _, m = _call(lp, olp, adv, mask, _config(delta=0.5, delta_b=1e-9, delta_b_k=0.0))
+
+        # token-level clause can never reject here (w*D <= 0.067 << delta = 0.5)
+        assert m["actor/pg_clipfrac"] > 0.5
+        assert m["actor/cppo_budget_mask_frac"] == pytest.approx(m["actor/pg_clipfrac"], rel=1e-6)
+
+    def test_budget_mask_frac_never_exceeds_the_total_masked_fraction(self):
+        for seed in range(4):
+            lp, olp, adv, mask = _rand_inputs(seed)
+            _, m = _call(lp, olp, adv, mask, _config(delta=0.05, delta_b=0.01, delta_b_k=0.0))
+            assert m["actor/cppo_budget_mask_frac"] <= m["actor/pg_clipfrac"] + 1e-9
+
+    def test_diagnostics_are_finite_on_an_all_padding_row(self):
+        mask = torch.zeros(2, 5, dtype=torch.long)
+        mask[0, :3] = 1
+        lp, olp, adv, _ = _rand_inputs(5, b=2, t=5, mask=mask)
+        _, m = _call(lp, olp, adv, mask, _config())
+        for k in ("actor/cppo_delta_b_seq", "actor/cppo_weighted_div_mean", "actor/cppo_budget_mask_frac"):
+            assert math.isfinite(m[k]), k
+
+
 class TestMetricsAndConfig:
     def test_metrics_keys_and_ranges(self):
         cfg = _config()

@@ -220,7 +220,16 @@ clip_ratio_c=${clip_ratio_c:-20.0}
 cppo_w_min=${cppo_w_min:-0.8}          # position-weight floor, w_t in [w_min, 1]
 cppo_delta_b=${cppo_delta_b:-0.02}     # prefix-average budget floor delta_b_min
 cppo_delta_b_q=${cppo_delta_b_q:-0.9}  # per-seq calibration quantile (paper P90)
-cppo_delta_b_k=${cppo_delta_b_k:-1.0}  # scale on that quantile
+# Scale on that quantile. k>0 makes the budget SELF-SCALING: delta_b^seq tracks
+# the batch's own drift, so it masks almost nothing until the ceiling is hit —
+# which is blind to the slow monotone pi-mu ramp this arm actually collapses
+# from (INSTABILITY_DYNBSZ_MIN-ESS_VS_MBS1_TRIG_DISCUSSION.md). k=0 pins
+# delta_b^seq to the floor (a fixed budget, the paper's post-trained-model
+# regime) and makes cppo_delta_b_q / cppo_delta_b_max_mult inert.
+# Intended sequence: run FIRST with k=1 (masks ~nothing, cannot wreck the run),
+# read actor/cppo_weighted_div_mean over 20-30 updates, then set
+# cppo_delta_b ~ 2-3x that value with cppo_delta_b_k=0 and relaunch.
+cppo_delta_b_k=${cppo_delta_b_k:-1.0}
 # Budget clamp ceiling in units of delta_b: paper Eq. 22 uses 2, the reference
 # implementation tunes it to 5 (the default kept here).
 cppo_delta_b_max_mult=${cppo_delta_b_max_mult:-5.0}

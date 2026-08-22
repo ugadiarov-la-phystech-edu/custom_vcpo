@@ -1206,6 +1206,19 @@ def compute_policy_loss_cppo(
         toward_mu = (advantages * (ratio - 1.0)) <= 0.0
         valid_mask = (toward_mu | feasible).detach().float() * response_mask_f
 
+        # Calibration diagnostics (paper Fig. 7). delta_b cannot be chosen from
+        # data without them: the budget is thresholded against the WEIGHTED
+        # divergence Z_t = w_t*D_t, and the realized per-sequence budget is a
+        # clamped quantile of D_t, neither of which is otherwise observable.
+        delta_b_seq_mean = delta_b_seq.mean()
+        weighted_div_mean = verl_F.masked_mean(Z_t, response_mask_f)
+        # Tokens the PREFIX clause rejected: within the token-level threshold
+        # (w_t*D_t <= delta) yet over the prefix-adjusted one. As a fraction of
+        # response tokens, so it is 0 (not 0/0) when nothing is masked;
+        # Fig. 7's "share of masked tokens" is this divided by pg_clipfrac.
+        budget_rejected = ((Z_t <= delta) & ~feasible & ~toward_mu).float() * response_mask_f
+        budget_mask_frac = verl_F.masked_mean(budget_rejected, response_mask_f)
+
     pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
 
     # Apply extra correction weights if provided (replay pipeline passes None).
@@ -1229,6 +1242,9 @@ def compute_policy_loss_cppo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
         "actor/cppo_toward_mu_frac": toward_mu_frac.detach().item(),
+        "actor/cppo_delta_b_seq": delta_b_seq_mean.detach().item(),
+        "actor/cppo_weighted_div_mean": weighted_div_mean.detach().item(),
+        "actor/cppo_budget_mask_frac": budget_mask_frac.detach().item(),
     }
     return pg_loss, pg_metrics
 
