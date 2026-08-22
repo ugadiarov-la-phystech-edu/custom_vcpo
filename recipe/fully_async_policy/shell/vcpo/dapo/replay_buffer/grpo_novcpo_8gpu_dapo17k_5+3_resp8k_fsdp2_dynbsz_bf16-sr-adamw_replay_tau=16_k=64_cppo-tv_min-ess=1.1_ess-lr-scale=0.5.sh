@@ -119,6 +119,19 @@ export PYTHONUNBUFFERED=1
 # DetachActorWorker enables it in-process (recipe fsdp_workers.py).
 
 # ================= Paths =================
+# Machine-local dataset locations. A host that keeps the parquets somewhere else
+# drops a setup_datasets.sh next to its environment instead of editing this
+# script; sourcing it BEFORE the defaults below lets it override them, while an
+# explicit `TRAIN_FILE=... bash <this script>` still wins (both sides use
+# ${VAR:-...}). Hosts without the file keep the defaults unchanged.
+# Uses an if-block, not `[ -f x ] && source x`: under `set -e` the latter aborts
+# the script on hosts where the file is absent.
+SETUP_DATASETS=${SETUP_DATASETS:-/data/homes/ugadiarov_la/ugadiarov.la/setup_datasets.sh}
+if [ -f "$SETUP_DATASETS" ]; then
+    echo "[paths] sourcing dataset locations from $SETUP_DATASETS"
+    source "$SETUP_DATASETS"
+fi
+
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
 # Two validation sets, reported separately by data_source:
