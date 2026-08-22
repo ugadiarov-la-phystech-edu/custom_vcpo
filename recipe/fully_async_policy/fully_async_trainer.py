@@ -786,12 +786,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         ):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
+            # marked_timer ACCUMULATES into timing_raw, and the post-loop final
+            # save reuses the last iteration's dict, so reading the total here
+            # would re-add that iteration's save. Take this save's delta.
+            save_time_before = timing_raw.get("save_checkpoint", 0.0)
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 self._save_checkpoint()
                 self.last_ckpt_version = self.current_param_version
-            self.cumulative_save_time += timing_raw.get("save_checkpoint", 0.0)
+            this_save_time = timing_raw.get("save_checkpoint", 0.0) - save_time_before
+            self.cumulative_save_time += this_save_time
             # Saving is not training: exclude it from the virtual timeline's busy time.
-            self._step_save_time += timing_raw.get("save_checkpoint", 0.0)
+            self._step_save_time += this_save_time
 
     def _save_checkpoint(self):
         if self.pause_generation_during_save:
@@ -1135,15 +1140,38 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         """Start this step on the virtual (no-validation-no-save) timeline: at
         max(trainer free, batch ready), where the batch is ready when its last
         sample would have arrived without the rollouter's validation and
-        checkpoint-save pauses. Samples restored from an old-format queue
-        snapshot may lack the stamps; fall back to the actual ready time (no
-        pause correction) for them."""
+        checkpoint-save pauses.
+
+        With no usable stamps the batch imposes no constraint, so the step
+        starts when the trainer itself is free. Two ways to get there: a
+        mini-batch composed entirely of REPLAYED groups (the caller passes only
+        the new entries, and in steady state there may be none), or samples
+        restored from an old-format queue snapshot that lack the stamps.
+        Falling back to consumer_end instead would pin the virtual start to the
+        ACTUAL clock, and since actual >= virtual always, that silently discards
+        every validation/save second excluded so far — one all-replay step after
+        a validation sweep would collapse cumulative_training_time onto wall
+        time for the rest of the run."""
         virtual_ready_times = [
             s.enqueue_time - s.validation_pause_before - getattr(s, "checkpoint_pause_before", 0.0)
             for s in queue_samples
             if getattr(s, "enqueue_time", None) is not None
         ]
-        batch_virtual_ready = max(virtual_ready_times) if virtual_ready_times else consumer_end
+        # With save_queue_state=True the first batches after a resume are samples
+        # pickled in the PREVIOUS segment: absolute epoch enqueue times minus that
+        # segment's accumulated pauses, which can land far before this segment's
+        # anchor. rollouter_first_sample_time re-anchors on restart, so an
+        # unclamped ready time makes virtual_now - anchor negative, drops
+        # cumulative_training_time below the restored offset (non-monotone), and
+        # _save_timing_state then bakes that value into timing_state.json. This
+        # segment's virtual timeline cannot start before its own first sample.
+        if self.rollouter_first_sample_time is not None:
+            virtual_ready_times = [max(t, self.rollouter_first_sample_time) for t in virtual_ready_times]
+        if virtual_ready_times:
+            batch_virtual_ready = max(virtual_ready_times)
+        else:
+            # "ready long ago": let virtual_free_time decide the start below.
+            batch_virtual_ready = self.virtual_free_time if self.virtual_free_time is not None else consumer_end
         self._step_actual_start = consumer_end
         self._step_virtual_start = (
             max(self.virtual_free_time, batch_virtual_ready)

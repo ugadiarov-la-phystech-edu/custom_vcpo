@@ -36,7 +36,12 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+from verl.utils.ulysses import (
+    gather_outputs_and_unpad,
+    get_ulysses_sequence_parallel_rank,
+    ulysses_pad,
+    ulysses_pad_and_slice_inputs,
+)
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 from verl.workers.utils.ess import compute_global_ess_from_log_weights, compute_min_ess_lr_scale
@@ -394,8 +399,17 @@ class DataParallelPPOActor(BasePPOActor):
         closed instead of stepping at full lr, while an empty one still steps
         unbraked."""
         ess_cfg = self.config.ess_scaling
+        # The reduction runs over the WORLD group, which is the DP group only
+        # when sequence parallelism is off. Under ulysses every rank of an SP
+        # group holds the SAME sequences (fsdp_workers registers is_collect on
+        # sp_rank == 0), so letting them all contribute would count each
+        # sequence sp_size times: ESS = (k*sum w)^2/(k*sum w^2) = k*ESS_true and
+        # count = k*N. ess_ratio survives that, but the brake thresholds the RAW
+        # ESS against min_ess, so it would only fire below min_ess/sp_size —
+        # silently half-disengaged. Contribute from one rank per SP group.
+        contributes = (not self.use_ulysses_sp) or get_ulysses_sequence_parallel_rank() == 0
         ess, ess_ratio, ess_clipped, ess_ratio_clipped, ess_count = compute_global_ess_from_log_weights(
-            seq_log_is, rollout_is_threshold
+            seq_log_is if contributes else [], rollout_is_threshold
         )
         ess_for_scaling = ess_clipped if ess_cfg.use_clipped else ess
 

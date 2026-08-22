@@ -237,6 +237,25 @@ def test_trainer_accumulates_save_time():
     assert trainer.cumulative_save_time >= first_total + 0.02
 
 
+def test_save_time_is_not_double_counted_when_timing_raw_is_reused():
+    """marked_timer ACCUMULATES into timing_raw, and the post-loop final save
+    reuses the last iteration's dict. Reading the running total instead of this
+    save's delta would add S_prev + S_final to both counters."""
+    trainer = _make_trainer()
+    trainer.config = OmegaConf.create({"trainer": {"save_freq": 1, "esi_redundant_time": 0}})
+    trainer._save_checkpoint = lambda: time.sleep(0.02)
+
+    # a dict that already carries an earlier save from the same iteration
+    timing_raw = {"save_checkpoint": 5.0}
+    trainer.current_param_version = 1
+    trainer._check_save_checkpoint(timing_raw=timing_raw)
+
+    assert trainer.cumulative_save_time < 1.0, "the pre-existing 5.0 must not be re-counted"
+    assert trainer.cumulative_save_time >= 0.02
+    assert trainer._step_save_time < 1.0
+    assert timing_raw["save_checkpoint"] >= 5.02, "the timer itself still accumulates"
+
+
 def test_trainer_save_time_untouched_when_saving_disabled():
     trainer = _make_trainer()
     trainer.config = OmegaConf.create({"trainer": {"save_freq": -1, "esi_redundant_time": 0}})
@@ -611,9 +630,86 @@ def test_open_virtual_step_takes_last_sample_and_handles_missing_stamps():
     trainer._open_virtual_step(35.0, [SimpleNamespace(enqueue_time=33.0, validation_pause_before=4.0)])
     assert trainer._step_virtual_start == 29.0
 
-    # old-format samples without any stamps: fall back to the actual ready time
+    # no usable stamps: the batch imposes no constraint, so the step starts when
+    # the TRAINER is free. Falling back to the actual ready time would pin the
+    # virtual start to the real clock (see test_all_replay_step_does_not_snap...).
     trainer._open_virtual_step(40.0, [SimpleNamespace()])
-    assert trainer._step_virtual_start == 40.0
+    assert trainer._step_virtual_start == 5.0
+
+
+def test_all_replay_step_does_not_snap_the_virtual_clock_to_wall_time():
+    """A mini-batch composed entirely of REPLAYED groups passes no new samples,
+    so _open_virtual_step sees an empty list. It must not restart the virtual
+    timeline at the actual clock: since actual >= virtual always, that would
+    discard every validation/save second excluded so far, and one such step
+    after a validation sweep would collapse cumulative_training_time onto wall
+    time for the rest of the run."""
+    trainer = _make_trainer(first_sample_time=0.0)
+    trainer.virtual_free_time = 20.0  # 20s of virtual work done...
+    consumer_end = 100.0  # ...but 100s of wall clock, the gap being validation
+
+    trainer._open_virtual_step(consumer_end, [])  # all-replay mini-batch
+    assert trainer._step_virtual_start == 20.0, "virtual start must follow the virtual clock"
+    assert trainer._step_actual_start == consumer_end
+
+    # a 5s step advances the VIRTUAL clock by 5s, not to 105
+    trainer._advance_virtual_clock(consumer_end + 5.0)
+    assert abs(trainer.virtual_free_time - 25.0) < 1e-9
+    assert abs(trainer._virtual_now(consumer_end + 5.0) - 25.0) < 1e-9
+
+
+def test_restored_snapshot_stamps_cannot_drag_the_clock_before_this_segment():
+    """save_queue_state=True hands the first post-resume batches samples pickled
+    in the previous segment: absolute enqueue times minus that segment's
+    accumulated pauses. Unclamped, that lands before this segment's anchor,
+    makes virtual_now - anchor negative, and drops cumulative_training_time
+    below the restored offset — which _save_timing_state then persists."""
+    trainer = _make_trainer(first_sample_time=1000.0)
+    trainer.timing_wall_offset = 500.0
+    trainer.virtual_training_time_offset = 400.0
+    trainer.virtual_free_time = None
+
+    # sample enqueued at 990 in the OLD segment, carrying 300s of that segment's
+    # validation pause -> naive ready time 690, i.e. 310s before this anchor
+    stale = _sample(990.0, 300.0)
+    trainer._open_virtual_step(1005.0, [stale])
+    assert trainer._step_virtual_start >= 1000.0
+
+    step_data = {}
+    trainer._add_cumulative_time_metrics(step_data, now=1010.0)
+    assert step_data[TIMING_PREFIX + "cumulative_training_time"] >= 400.0, "must not fall below the restored offset"
+
+
+def test_fresh_segment_stamps_are_not_clamped():
+    """The clamp must not disturb ordinary in-segment stamps."""
+    trainer = _make_trainer(first_sample_time=100.0)
+    trainer.virtual_free_time = None
+    trainer._open_virtual_step(200.0, [_sample(150.0, 10.0)])  # ready at 140 > anchor
+    assert trainer._step_virtual_start == 140.0
+
+
+def test_first_step_without_stamps_still_starts_at_the_actual_clock():
+    """virtual_free_time is None before the first step, so there is nothing to
+    fall back to and the actual arrival is the only available anchor."""
+    trainer = _make_trainer(first_sample_time=0.0)
+    trainer.virtual_free_time = None
+    trainer._open_virtual_step(42.0, [])
+    assert trainer._step_virtual_start == 42.0
+
+
+def test_all_replay_steps_preserve_an_earlier_validation_exclusion():
+    """End to end: one stamped step, a validation gap, then an all-replay step.
+    The excluded validation time must still be missing from the virtual clock."""
+    trainer = _make_trainer(first_sample_time=0.0)
+    trainer._open_virtual_step(10.0, [_sample(10.0, 0.0)])  # ready at 10, no pause
+    trainer._advance_virtual_clock(12.0)  # 2s of work -> virtual 12
+    assert abs(trainer.virtual_free_time - 12.0) < 1e-9
+
+    # 60s of validation happens here: wall clock jumps to 72, virtual does not.
+    trainer._open_virtual_step(72.0, [])  # all-replay mini-batch
+    trainer._advance_virtual_clock(75.0)  # 3s of work
+    assert abs(trainer.virtual_free_time - 15.0) < 1e-9  # 12 + 3, validation excluded
+    assert trainer.virtual_free_time < 75.0
 
 
 def test_rollouter_save_checkpoint_accumulates_pause(tmp_path):

@@ -396,6 +396,8 @@ def _make_replay_trainer(mini_size, requires_mini_batches, available=None, block
     t.virtual_free_time = None
     t._step_virtual_start = None
     t._step_actual_start = None
+    # the segment anchor _open_virtual_step clamps restored-snapshot stamps to
+    t.rollouter_first_sample_time = None
     return t
 
 
@@ -750,6 +752,38 @@ def test_process_structured_metrics_emits_ess_scalars_without_base():
     assert payload["staleness/ess_ratio"] == pytest.approx(0.6)
     assert payload["actor/ess_scaled_lr"] == pytest.approx(1.5e-6)
     assert "staleness/base_ess_ratio" not in payload
+
+
+def test_process_structured_metrics_emits_the_raw_ess_the_brake_thresholds():
+    """compute_min_ess_lr_scale compares the RAW ESS against min_ess, and the
+    sequence count is not logged, so ess_ratio alone cannot be converted back:
+    without this you can see THAT a step braked (ess_scaled_lr) but not how
+    close an unbraked one came to firing."""
+    from recipe.fully_async_policy.detach_utils import process_structured_metrics
+
+    payload = process_structured_metrics(
+        {
+            "staleness/ess": [
+                {"minibatch_ess": 4.0, "minibatch_ess_clipped": 6.0, "minibatch_ess_ratio": 0.5},
+                {"minibatch_ess": 2.0, "minibatch_ess_clipped": 4.0, "minibatch_ess_ratio": 0.3},
+            ]
+        },
+        allow_media=False,
+    )
+    assert payload["staleness/ess"] == pytest.approx(3.0)
+    assert payload["staleness/ess_clipped"] == pytest.approx(5.0)
+    assert payload["staleness/ess_ratio"] == pytest.approx(0.4)
+
+
+def test_process_structured_metrics_tolerates_entries_without_raw_ess():
+    from recipe.fully_async_policy.detach_utils import process_structured_metrics
+
+    payload = process_structured_metrics(
+        {"staleness/ess": [{"minibatch_ess_ratio": 0.5}, {"minibatch_ess": None}]},
+        allow_media=False,
+    )
+    assert "staleness/ess" not in payload
+    assert payload["staleness/ess_ratio"] == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------- tensorboard histograms

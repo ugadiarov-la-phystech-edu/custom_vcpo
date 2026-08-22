@@ -571,7 +571,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         update_metrics[key].append(value)
                     updates_done += 1
         for key, values in update_metrics.items():
-            metrics[key] = float(np.mean(values))
+            # reduce_metrics passes structured entries (e.g. staleness/ess, a
+            # list[dict] the trainer aggregates itself) through untouched, so a
+            # blanket np.mean here raises TypeError as soon as the ESS brake is
+            # enabled. Average the scalars; concatenate the structured lists so
+            # they still reach process_structured_metrics downstream.
+            if all(isinstance(v, (int, float, np.number)) and not isinstance(v, bool) for v in values):
+                metrics[key] = float(np.mean(values))
+            elif all(isinstance(v, list) for v in values):
+                metrics[key] = [entry for value in values for entry in value]
+            else:
+                metrics[key] = values[-1]
         metrics["actor/ppo_epoch_updates"] = updates_done
         metrics["actor/ppo_epochs_effective"] = updates_done / require_batches
 

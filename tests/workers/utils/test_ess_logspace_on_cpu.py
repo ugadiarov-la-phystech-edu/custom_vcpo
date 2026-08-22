@@ -167,12 +167,27 @@ class TestNonFiniteInputs:
     the ESS read a healthy-looking 0.0 -> full nominal lr on the worst batch
     of the run."""
 
-    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
-    def test_corrupt_entry_gives_nan_ess_with_a_real_count(self, bad):
-        ess, ratio, ess_c, ratio_c, n = compute_global_ess_from_log_weights([0.0, -1.0, bad, -2.0], 2.0)
+    def test_nan_entry_gives_nan_ess_for_both_variants(self):
+        ess, ratio, ess_c, ratio_c, n = compute_global_ess_from_log_weights([0.0, -1.0, float("nan"), -2.0], 2.0)
         assert math.isnan(ess) and math.isnan(ratio)
         assert math.isnan(ess_c) and math.isnan(ratio_c)
         assert n == 4  # count still reports the batch size: broken != empty
+
+    def test_infinite_entry_corrupts_only_the_unclipped_variant(self):
+        """+inf is unreadable as a raw weight, but clipping maps it to
+        log(threshold) — a correct finite weight — so the CLIPPED ESS is
+        knowable. Flagging both would brake every mini-batch containing one
+        -inf rollout log-prob whenever use_clipped=True."""
+        ess, ratio, ess_c, ratio_c, n = compute_global_ess_from_log_weights([0.0, -1.0, float("inf"), -2.0], 2.0)
+        assert math.isnan(ess) and math.isnan(ratio)
+        assert math.isfinite(ess_c) and 1.0 <= ess_c <= 4.0
+        assert ratio_c == pytest.approx(ess_c / 4)
+        assert n == 4
+
+    def test_infinite_entry_without_a_threshold_corrupts_both(self):
+        """No clipping -> the clipped variant IS the unclipped one."""
+        ess, _, ess_c, _, _ = compute_global_ess_from_log_weights([0.0, float("inf")], None)
+        assert math.isnan(ess) and math.isnan(ess_c)
 
     def test_corrupt_entry_does_not_read_as_zero(self):
         """The old behaviour, pinned so it cannot come back: a +inf weight
@@ -227,7 +242,7 @@ class TestDistributedPath:
         assert with_dist[4] == 4
 
     @pytest.mark.usefixtures("single_rank_gloo")
-    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    @pytest.mark.parametrize("bad", [float("nan")])
     def test_corruption_survives_the_collectives(self, bad):
         """The corruption flag rides the SUM all-reduce as a 6th element, so
         it cannot be lost the way a NaN in the MAX all-reduce would be
