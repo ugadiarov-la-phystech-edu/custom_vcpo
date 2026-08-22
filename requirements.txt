@@ -5,6 +5,9 @@ datasets
 dill<0.3.9
 hydra-core
 liger-kernel
+# numpy: 1.26.4 is what the working envs run. The ceiling is hard: numba
+# (imported by the vLLM rollout workers) accepts at most NumPy 2.2, and
+# verl itself pins <2.
 numpy<2.0.0
 pandas
 peft
@@ -15,6 +18,9 @@ pre-commit
 ray[default]
 tensordict>=0.8.0,<=0.10.0,!=0.9.0
 torchdata
+# torchao: bf16 stochastic-rounding AdamW (torchao.optim._AdamW), selected
+# via actor.optim.optimizer_impl in the fsdp2 bf16-sr-adamw runs.
+torchao==0.17.0
 transformers<5
 # vllm==0.11.0
 wandb
