@@ -111,7 +111,7 @@ rollout_name="vllm"
 return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-gpu_memory_utilization=0.9
+gpu_memory_utilization=0.8
 enable_chunked_prefill=True
 calculate_log_probs=True
 
