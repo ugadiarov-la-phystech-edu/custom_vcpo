@@ -68,6 +68,36 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # CPPO (arXiv:2606.10968). Only consumed when loss_mode == "cppo". The token-level
+  # divergence threshold delta is read from actor.clip_ratio (same convention as DPPO)
+  # and the truncated-IS cap from actor.clip_ratio_c; these add the position weight and
+  # the cumulative prefix budget.
+  cppo:
+
+    # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.workers.config.CPPOConfig
+
+    # Weight floor of the linear position schedule w_t in [cppo_w_min, 1] (paper default 0.8)
+    cppo_w_min: 0.8
+
+    # Floor delta_b_min of the per-sequence dynamic prefix-average budget (paper Eq. 22):
+    # delta_b = clamp(cppo_delta_b_k * quantile(D_t, cppo_delta_b_q), delta_b, mult * delta_b)
+    cppo_delta_b: 0.02
+
+    # Quantile of the budget calibration; (0.9, 1.0) = the paper's P90 calibration
+    cppo_delta_b_q: 0.9
+
+    # Scale applied to that quantile; e.g. (0.95, 0.5) uses half the 95th percentile
+    cppo_delta_b_k: 1.0
+
+    # Ceiling of the budget clamp, in units of cppo_delta_b. Paper Eq. 22 uses 2; the
+    # reference implementation tunes it to 5, which is the default here.
+    cppo_delta_b_max_mult: 5.0
+
+    # Which T the position schedule spans: "sequence" (each row's own valid length, the
+    # paper's Eq. 9) or "padded" (the padded response width, the reference implementation)
+    cppo_w_len_mode: sequence
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

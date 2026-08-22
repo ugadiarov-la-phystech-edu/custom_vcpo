@@ -64,6 +64,14 @@ actor_rollout_ref:
       clip_cov_ub: 5.0
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
+      cppo:
+        _target_: verl.workers.config.CPPOConfig
+        cppo_w_min: 0.8
+        cppo_delta_b: 0.02
+        cppo_delta_b_q: 0.9
+        cppo_delta_b_k: 1.0
+        cppo_delta_b_max_mult: 5.0
+        cppo_w_len_mode: sequence
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null

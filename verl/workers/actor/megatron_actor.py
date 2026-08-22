@@ -50,7 +50,26 @@ from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
 from verl.workers.actor.entropy_utils import log_entropy_and_apply_to_loss, should_calculate_entropy
 
-__all__ = ["MegatronPPOActor"]
+__all__ = ["MegatronPPOActor", "refuse_cppo_without_mu_anchor"]
+
+
+def refuse_cppo_without_mu_anchor(loss_mode: str, skip_recompute_old_log_prob: bool) -> None:
+    """Refuse the one CPPO configuration that would train something CPPO in name only.
+
+    CPPO measures its divergence D_t between pi and the BEHAVIOR policy mu, but
+    skip_recompute anchors old_log_prob at log_prob.detach(): ratio == 1, D_t == 0, every
+    token feasible, truncated_ratio == 1, and the loss degenerates to the plain token-IS
+    REINFORCE baseline while the run still carries a CPPO tag. The mu substitution is
+    implemented on the FSDP path only (dp_actor.update_policy), so the Megatron path has to
+    say no instead of quietly doing nothing."""
+    if loss_mode == "cppo" and skip_recompute_old_log_prob:
+        raise NotImplementedError(
+            "loss_mode=cppo with skip_recompute_old_log_prob=True is not supported on the "
+            "Megatron path of this branch: the PPO ratio is anchored at 1, so CPPO's mask "
+            "can never bind and the loss degenerates to token-IS REINFORCE. Use the FSDP "
+            "actor (actor.strategy=fsdp2), which substitutes the cached rollout log-probs, "
+            "or run cppo without skip_recompute_old_log_prob (the paper's own regime)."
+        )
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -526,6 +545,7 @@ class MegatronPPOActor(BasePPOActor):
                 loss_agg_mode = self.config.loss_agg_mode
 
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                refuse_cppo_without_mu_anchor(loss_mode, skip_recompute_old_log_prob)
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
 

@@ -26,12 +26,64 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "CPPOConfig",
     "PolicyLossConfig",
     "ESSScalingConfig",
     "ActorConfig",
     "FSDPActorConfig",
     "McoreActorConfig",
 ]
+
+
+@dataclass
+class CPPOConfig(BaseConfig):
+    """Configuration for CPPO (Cumulative Prefix-divergence Policy Optimization, arXiv:2606.10968).
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Only consumed when ``policy_loss.loss_mode == "cppo"``. The token-level divergence threshold
+    delta is read from ``actor.clip_ratio`` (repurposed, same convention as DPPO) and the
+    truncated-IS cap from ``actor.clip_ratio_c``; these fields add the position weight and the
+    cumulative prefix-budget knobs.
+
+    Two of them are places where the reference implementation departs from the paper, so both
+    conventions are reachable from config; see CPPO_PORT_PARAMS_AND_CAVEATS_DISCUSSION.md.
+
+    Args:
+        cppo_w_min (float): Weight floor of the linear position schedule w_t in [w_min, 1] (Eq. 9;
+            paper default 0.8).
+        cppo_delta_b (float): Floor delta_b_min of the per-sequence dynamic prefix budget
+            delta_b = clamp(delta_b_k * quantile(D_t, delta_b_q), delta_b,
+            cppo_delta_b_max_mult * delta_b) (Eq. 22).
+        cppo_delta_b_q (float): Quantile of the budget calibration; (0.9, 1.0) is the paper's P90.
+        cppo_delta_b_k (float): Scale of the budget calibration; e.g. (0.95, 0.5) uses half the
+            95th percentile.
+        cppo_delta_b_max_mult (float): Ceiling of that clamp in units of cppo_delta_b. The paper's
+            Eq. 22 uses 2; the reference implementation tunes it to 5, which is the default.
+        cppo_w_len_mode (str): Which T the position schedule spans: "sequence" (each row's own
+            valid length, the paper's Eq. 9) or "padded" (the padded response width, the reference
+            implementation). With T_padded >> T_seq the schedule barely leaves 1, so "padded"
+            makes the position mechanism inert for responses far shorter than the length cap.
+    """
+
+    cppo_w_min: float = 0.8
+    cppo_delta_b: float = 0.02
+    cppo_delta_b_q: float = 0.9
+    cppo_delta_b_k: float = 1.0
+    cppo_delta_b_max_mult: float = 5.0
+    cppo_w_len_mode: str = "sequence"
+
+    def __post_init__(self):
+        assert 0.0 < self.cppo_w_min <= 1.0, f"cppo_w_min must be in (0, 1]; got {self.cppo_w_min}"
+        assert self.cppo_delta_b >= 0.0, f"cppo_delta_b must be >= 0; got {self.cppo_delta_b}"
+        assert 0.0 <= self.cppo_delta_b_q <= 1.0, f"cppo_delta_b_q must be in [0, 1]; got {self.cppo_delta_b_q}"
+        assert self.cppo_delta_b_k >= 0.0, f"cppo_delta_b_k must be >= 0; got {self.cppo_delta_b_k}"
+        assert self.cppo_delta_b_max_mult >= 1.0, (
+            f"cppo_delta_b_max_mult must be >= 1; got {self.cppo_delta_b_max_mult}"
+        )
+        assert self.cppo_w_len_mode in ("sequence", "padded"), (
+            f"cppo_w_len_mode must be 'sequence' or 'padded'; got {self.cppo_w_len_mode!r}"
+        )
 
 
 @dataclass
@@ -47,6 +99,7 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        cppo (CPPOConfig): Configuration for the CPPO loss (only used when loss_mode == "cppo").
     """
 
     loss_mode: str = "vanilla"
@@ -55,6 +108,7 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    cppo: CPPOConfig = field(default_factory=CPPOConfig)
 
 
 @dataclass

@@ -530,6 +530,16 @@ class DataParallelPPOActor(BasePPOActor):
                 rollout_is_threshold = corr_cfg.get("rollout_is_threshold", None)
 
         seq_adv_post_scale = bool(getattr(self.config, "seq_adv_post_scale", False))
+        if seq_adv_post_scale and self.config.policy_loss.get("loss_mode", "vanilla") == "cppo":
+            raise NotImplementedError(
+                "loss_mode=cppo is incompatible with seq_adv_post_scale=True: the post-scale path "
+                "calls the loss with UNIT advantages and rescales afterwards, which collapses CPPO's "
+                "advantage-sign clause A_t*(rho_t - 1) <= 0 to rho_t <= 1 for every sequence and so "
+                "keeps exactly the wrong tokens on negative-advantage rows. Set "
+                "actor.seq_adv_post_scale=False: CPPO's surrogate is linear in the advantage and the "
+                "advantage is sequence-constant, so under seq-mean-token-mean the post-scale is an "
+                "identity apart from that sign selection."
+            )
         if seq_adv_post_scale and (self.config.entropy_coeff != 0 or self.config.use_kl_loss):
             raise NotImplementedError(
                 "seq_adv_post_scale supports pure policy-gradient losses only "
@@ -678,6 +688,31 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
+                    old_log_prob_for_loss = old_log_prob
+                    if loss_mode == "cppo" and skip_recompute_old_log_prob:
+                        # CPPO's mask and truncated ratio measure drift against the BEHAVIOR
+                        # policy, so the loss must see mu (the cached rollout log-probs), not the
+                        # ratio-anchored log_prob.detach() above: with that anchor ratio == 1 and
+                        # D_t == 0, so the mask would never bind. The loss's own truncated ratio
+                        # replaces the TOKEN-level IS weights, so they are not applied on top. The
+                        # detached old_log_prob still feeds the ESS/IS metrics.
+                        assert model_inputs.get("rollout_log_probs", None) is not None, (
+                            "loss_mode=cppo with skip_recompute_old_log_prob=True requires "
+                            "rollout_log_probs in the batch (behavior-policy anchor)"
+                        )
+                        corr_cfg_for_cppo = rollout_corr_config or {}
+                        assert corr_cfg_for_cppo.get("rollout_rs", None) is None, (
+                            "loss_mode=cppo does not support rollout_rs rejection: rejected tokens "
+                            "punch holes in response_mask, dropping exactly the highest-divergence "
+                            "tokens from the prefix budget and its quantile calibration"
+                        )
+                        assert corr_cfg_for_cppo.get("rollout_is", "token") in (None, "token"), (
+                            "loss_mode=cppo subsumes only TOKEN-level IS weights via its truncated "
+                            "ratio; sequence-level rollout_is would be silently dropped"
+                        )
+                        old_log_prob_for_loss = model_inputs["rollout_log_probs"]
+                        rollout_is_weights = None
+
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
@@ -696,7 +731,7 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                     else:
                         pg_loss, pg_metrics = policy_loss_fn(
-                            old_log_prob=old_log_prob,
+                            old_log_prob=old_log_prob_for_loss,
                             log_prob=log_prob,
                             advantages=advantages,
                             response_mask=response_mask,
