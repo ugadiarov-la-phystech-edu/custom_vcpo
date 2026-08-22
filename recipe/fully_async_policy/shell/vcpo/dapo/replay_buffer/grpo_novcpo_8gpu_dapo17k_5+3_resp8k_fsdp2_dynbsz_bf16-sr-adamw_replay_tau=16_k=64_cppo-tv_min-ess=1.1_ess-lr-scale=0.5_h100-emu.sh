@@ -264,8 +264,26 @@ cppo_delta_b_q=${cppo_delta_b_q:-0.9}  # per-seq calibration quantile (paper P90
 # delta_b^seq to the floor (a fixed budget, the paper's post-trained-model
 # regime) and makes cppo_delta_b_q / cppo_delta_b_max_mult inert.
 # Intended sequence: run FIRST with k=1 (masks ~nothing, cannot wreck the run),
-# read actor/cppo_weighted_div_mean over 20-30 updates, then set
-# cppo_delta_b ~ 2-3x that value with cppo_delta_b_k=0 and relaunch.
+# then READ THE EXCEEDANCE GRID and pin the budget:
+#
+#   actor/cppo_seq_sw_gt_<x> = share of sequences whose own prefix-average
+#   weighted divergence S_T/W_T exceeds x, for x in
+#   {0.005, 0.0075, 0.01, 0.015, 0.02, 0.03} (CPPO_SEQ_SW_GRID in core_algos).
+#   S_T/W_T is exactly what delta_b is compared against per sequence, so the
+#   grid entry sitting near 0.10 over a window of updates is the value that
+#   masks ~10% of sequences, i.e. ~5% of tokens (the toward-mu clause keeps
+#   about half the tokens of a masked sequence). Set cppo_delta_b to it and
+#   cppo_delta_b_k=0.
+#
+# Do NOT calibrate off actor/cppo_weighted_div_mean directly: it is a
+# token-pooled mean of Z_t = w_t*D_t, so it is (a) in Z units rather than
+# delta_b's -- they differ by mean(w) = (1+w_min)/2 = 0.9 -- and (b) a centre
+# with no spread, while the mask rate is decided by the SHARE of sequences on
+# the wrong side. Measured on the 41-update h100-emu run, delta_b behaves as a
+# switch, not a dial: the transition from 0% to ~50% masked spans a delta_b
+# band of width delta/(0.9*T) ~ 2.5e-5 at T=6600. Re-read the grid every ~50
+# updates -- the drift is not stationary (that run's S/W rose 0.0074 -> 0.0123
+# over 41 updates), so a pinned budget tightens as training proceeds.
 cppo_delta_b_k=${cppo_delta_b_k:-1.0}
 # Budget clamp ceiling in units of delta_b: paper Eq. 22 uses 2, the reference
 # implementation tunes it to 5 (the default kept here).

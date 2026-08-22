@@ -1006,6 +1006,13 @@ def compute_policy_loss_vanilla(
 _CPPO_CLIP_RATIO_C_WARNED = False
 
 
+# Grid the per-sequence prefix-average divergence S_T/W_T is reported against
+# (actor/cppo_seq_sw_gt_*). It brackets the range cppo_delta_b is ever set to:
+# the paper's post-trained 0.015 and Base 0.02 sit inside it, with a decade of
+# room either side. See compute_policy_loss_cppo for how to read it.
+CPPO_SEQ_SW_GRID = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03)
+
+
 def _warn_once_cppo_clip_ratio_c(value: float) -> None:
     """CPPO repurposes clip_ratio_c as its truncated-IS cap (paper: 20.0), but the repo
     default is the dual-clip constant 3.0, so an un-overridden script silently trains a
@@ -1219,6 +1226,39 @@ def compute_policy_loss_cppo(
         budget_rejected = ((Z_t <= delta) & ~feasible & ~toward_mu).float() * response_mask_f
         budget_mask_frac = verl_F.masked_mean(budget_rejected, response_mask_f)
 
+        # Per-sequence prefix-average weighted divergence S_T/W_T -- the exact
+        # scalar delta_b is compared against. Over a full response the delta
+        # intercept of Eq. 8 amortizes to delta/T (2.5e-5 at T=6600), so a
+        # sequence trips the budget when its OWN S_T/W_T exceeds delta_b, and the
+        # batch's mask rate is the share of sequences on the wrong side of it.
+        # Neither existing diagnostic reveals that share: cppo_weighted_div_mean
+        # pools all tokens into one number (the centre, not the spread), and
+        # cppo_delta_b_seq is the auto-rule's own output, which scales with the
+        # drift it is supposed to bound.
+        #
+        # Reported as EXCEEDANCE FRACTIONS on a fixed grid rather than quantiles.
+        # A micro-batch holds only a handful of long responses and the metric
+        # layer averages over micro-batches and DP ranks: a mean of per-micro-batch
+        # quantiles is a biased estimator of the batch quantile, a mean of
+        # indicators is the fraction itself. (Micro-batches carry unequal row
+        # counts under dynamic bsz, so the average is unweighted across them --
+        # a second-order effect on a grid this coarse.)
+        #
+        # To pick cppo_delta_b: read the grid entry sitting near 0.10 over a
+        # window of updates. That masks ~10% of sequences, i.e. ~5% of tokens,
+        # since the toward-mu clause keeps roughly half the tokens of a masked
+        # sequence. Then set cppo_delta_b_k=0 to pin the budget there.
+        seq_w = W_cum[:, -1]
+        seq_sw = S_cum[:, -1] / seq_w.clamp_min(torch.finfo(seq_w.dtype).tiny)
+        # A row with no response tokens has W_T = 0 and no divergence to report;
+        # it must not count as a sequence below the grid.
+        valid_seq = (seq_w > 0).float()
+        n_valid = valid_seq.sum().clamp_min(1.0)
+        seq_sw_mean = (seq_sw * valid_seq).sum() / n_valid
+        grid = torch.as_tensor(CPPO_SEQ_SW_GRID, device=seq_sw.device, dtype=seq_sw.dtype)
+        # (G, B) -> (G,), one sync for the whole grid instead of one per entry.
+        seq_sw_exceed = ((seq_sw.unsqueeze(0) > grid.unsqueeze(-1)).float() * valid_seq).sum(-1) / n_valid
+
     pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
 
     # Apply extra correction weights if provided (replay pipeline passes None).
@@ -1245,7 +1285,13 @@ def compute_policy_loss_cppo(
         "actor/cppo_delta_b_seq": delta_b_seq_mean.detach().item(),
         "actor/cppo_weighted_div_mean": weighted_div_mean.detach().item(),
         "actor/cppo_budget_mask_frac": budget_mask_frac.detach().item(),
+        "actor/cppo_seq_sw_mean": seq_sw_mean.detach().item(),
     }
+    # actor/cppo_seq_sw_gt_<threshold>: share of sequences whose own S_T/W_T is
+    # above that threshold, i.e. the share cppo_delta_b would put on the wrong
+    # side of the budget if it were pinned there.
+    for threshold, share in zip(CPPO_SEQ_SW_GRID, seq_sw_exceed.detach().tolist(), strict=True):
+        pg_metrics[f"actor/cppo_seq_sw_gt_{threshold:g}"] = share
     return pg_loss, pg_metrics
 
 

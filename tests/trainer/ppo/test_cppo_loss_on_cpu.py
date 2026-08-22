@@ -42,7 +42,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from verl.trainer.ppo.core_algos import compute_policy_loss_cppo, get_policy_loss_fn
+from verl.trainer.ppo.core_algos import CPPO_SEQ_SW_GRID, compute_policy_loss_cppo, get_policy_loss_fn
 from verl.workers.config.actor import CPPOConfig, PolicyLossConfig
 
 B, T = 3, 6
@@ -290,11 +290,7 @@ class TestWeightLengthModes:
         """The mirror image of the previous test: under 'padded' the very same response
         is masked differently depending only on how wide the micro-batch happens to be.
         Swept over the threshold so the claim does not hinge on one hand-picked delta."""
-        flipped = [
-            d / 100.0
-            for d in range(1, 60)
-            if not torch.equal(*self._padded_masks_at(d / 100.0))
-        ]
+        flipped = [d / 100.0 for d in range(1, 60) if not torch.equal(*self._padded_masks_at(d / 100.0))]
         assert flipped, "expected some delta where padding width alone changes the mask"
 
     def test_first_token_always_carries_full_weight(self):
@@ -470,9 +466,7 @@ class TestMaskSemantics:
         full_ref = _reference_mask(lp, olp, adv, mask, cfg)
         solo_ref = _reference_mask(lp[:1], olp[:1], adv[:1], mask[:1], cfg)
         assert torch.equal(full_ref[:1], solo_ref)
-        loss_solo, _ = _call(
-            lp[:1].detach().requires_grad_(True), olp[:1], adv[:1], mask[:1], cfg
-        )
+        loss_solo, _ = _call(lp[:1].detach().requires_grad_(True), olp[:1], adv[:1], mask[:1], cfg)
         ref_solo = _reference_loss(lp[:1], olp[:1], adv[:1], mask[:1], cfg)
         assert torch.allclose(loss_solo, ref_solo, rtol=1e-6, atol=1e-8)
 
@@ -596,7 +590,7 @@ class TestDegenerateSettings:
         d = (torch.exp(lp.detach()) - torch.exp(olp)).abs()
         ratio = torch.exp(torch.clamp(lp.detach() - olp, -20.0, 20.0))
         toward = (adv * (ratio - 1.0)) <= 0
-        uniform = ((toward | (d <= 0.12)).float() * mask.float())
+        uniform = (toward | (d <= 0.12)).float() * mask.float()
         assert torch.equal(ref, uniform)
         loss, _ = _call(lp, olp, adv, mask, cfg)
         assert torch.allclose(loss, _reference_loss(lp, olp, adv, mask, cfg), rtol=1e-6, atol=1e-8)
@@ -689,9 +683,9 @@ class TestCalibrationDiagnostics:
         every rejection from there on is the budget's."""
         T_long = 64
         mask = torch.ones(1, T_long, dtype=torch.long)
-        lp = torch.full((1, T_long), -1.6, requires_grad=True)   # pi = 0.202
-        olp = torch.full((1, T_long), -2.0)                      # mu = 0.135, D ~ 0.067
-        adv = torch.ones(1, T_long)                              # positive adv, ratio > 1 -> away from mu
+        lp = torch.full((1, T_long), -1.6, requires_grad=True)  # pi = 0.202
+        olp = torch.full((1, T_long), -2.0)  # mu = 0.135, D ~ 0.067
+        adv = torch.ones(1, T_long)  # positive adv, ratio > 1 -> away from mu
         _, m = _call(lp, olp, adv, mask, _config(delta=0.5, delta_b=1e-9, delta_b_k=0.0))
 
         # token-level clause can never reject here (w*D <= 0.067 << delta = 0.5)
@@ -711,6 +705,164 @@ class TestCalibrationDiagnostics:
         _, m = _call(lp, olp, adv, mask, _config())
         for k in ("actor/cppo_delta_b_seq", "actor/cppo_weighted_div_mean", "actor/cppo_budget_mask_frac"):
             assert math.isfinite(m[k]), k
+
+
+def _seq_sw(log_prob, old_log_prob, response_mask, cfg):
+    """Per-sequence S_T/W_T, computed independently of the implementation."""
+    w = _w_t(cfg, response_mask)
+    d = (log_prob.detach().exp() - old_log_prob.exp()).abs() * response_mask.float()
+    s = (w * d).sum(-1)
+    wsum = w.sum(-1)
+    return torch.where(wsum > 0, s / wsum.clamp_min(1e-30), torch.zeros_like(s)), wsum
+
+
+class TestSeqSWExceedance:
+    """actor/cppo_seq_sw_gt_*: the share of sequences whose own prefix-average
+    weighted divergence S_T/W_T sits above each grid threshold.
+
+    This is the quantity cppo_delta_b is compared against per sequence, so the
+    grid entry near 0.10 is the value that would put ~10% of sequences on the
+    wrong side of the budget. It must be a MEASUREMENT: independent of delta_b
+    itself, exact under averaging across micro-batches, and blind to padding."""
+
+    def test_grid_is_reported_in_full(self):
+        lp, olp, adv, mask = _rand_inputs(0)
+        _, m = _call(lp, olp, adv, mask, _config())
+        for threshold in CPPO_SEQ_SW_GRID:
+            key = f"actor/cppo_seq_sw_gt_{threshold:g}"
+            assert key in m, f"{key} missing from {sorted(m)}"
+            assert isinstance(m[key], float)
+        assert isinstance(m["actor/cppo_seq_sw_mean"], float)
+
+    def test_matches_an_independent_computation(self):
+        cfg = _config()
+        lp, olp, adv, mask = _rand_inputs(3, b=8, t=32)
+        _, m = _call(lp, olp, adv, mask, cfg)
+        sw, _ = _seq_sw(lp, olp, mask, cfg)
+        assert m["actor/cppo_seq_sw_mean"] == pytest.approx(float(sw.mean()), rel=1e-5)
+        for threshold in CPPO_SEQ_SW_GRID:
+            expected = float((sw > threshold).float().mean())
+            assert m[f"actor/cppo_seq_sw_gt_{threshold:g}"] == pytest.approx(expected, abs=1e-6)
+
+    def test_all_or_nothing_bounds(self):
+        """A batch far below the grid reports 0 everywhere; far above, 1."""
+        b, t = 4, 16
+        mask = torch.ones(b, t, dtype=torch.long)
+        adv = torch.randn(b, 1).expand(b, t).contiguous()
+
+        tiny = torch.full((b, t), -2.0)
+        _, m_lo = _call((tiny + 1e-9).clone().requires_grad_(True), tiny, adv, mask, _config())
+        assert all(m_lo[f"actor/cppo_seq_sw_gt_{g:g}"] == 0.0 for g in CPPO_SEQ_SW_GRID)
+
+        far = torch.log(torch.full((b, t), 0.9))
+        _, m_hi = _call(far.clone().requires_grad_(True), tiny, adv, mask, _config())
+        assert all(m_hi[f"actor/cppo_seq_sw_gt_{g:g}"] == 1.0 for g in CPPO_SEQ_SW_GRID)
+
+    def test_exceedance_is_monotone_in_the_threshold(self):
+        lp, olp, adv, mask = _rand_inputs(4, b=16, t=24)
+        _, m = _call(lp, olp, adv, mask, _config())
+        shares = [m[f"actor/cppo_seq_sw_gt_{g:g}"] for g in CPPO_SEQ_SW_GRID]
+        assert shares == sorted(shares, reverse=True)
+
+    def test_independent_of_delta_b_and_its_calibration(self):
+        """It measures the drift; it must not move when the budget moves --
+        otherwise it could not be used to CHOOSE the budget."""
+        lp, olp, adv, mask = _rand_inputs(5, b=8, t=32)
+        keys = [f"actor/cppo_seq_sw_gt_{g:g}" for g in CPPO_SEQ_SW_GRID] + ["actor/cppo_seq_sw_mean"]
+        _, base = _call(lp, olp, adv, mask, _config(delta_b=0.02, delta_b_k=1.0))
+        for cfg in (
+            _config(delta_b=1e-6, delta_b_k=0.0),
+            _config(delta_b=10.0, delta_b_k=5.0),
+            _config(delta=0.9, clip_ratio_c=3.0),
+        ):
+            _, other = _call(lp, olp, adv, mask, cfg)
+            for k in keys:
+                assert other[k] == pytest.approx(base[k], rel=1e-6), k
+
+    def test_averages_exactly_across_micro_batches(self):
+        """The property that motivates exceedances over quantiles: with equal
+        row counts, the mean of per-micro-batch shares IS the full-batch share.
+        A mean of per-micro-batch quantiles would not be."""
+        cfg = _config()
+        lp, olp, adv, mask = _rand_inputs(6, b=12, t=20)
+        _, full = _call(lp, olp, adv, mask, cfg)
+        parts = []
+        for lo in (0, 4, 8):
+            sl = slice(lo, lo + 4)
+            _, m = _call(lp[sl].detach().clone().requires_grad_(True), olp[sl], adv[sl], mask[sl], cfg)
+            parts.append(m)
+        for threshold in CPPO_SEQ_SW_GRID:
+            key = f"actor/cppo_seq_sw_gt_{threshold:g}"
+            averaged = sum(p[key] for p in parts) / len(parts)
+            assert averaged == pytest.approx(full[key], abs=1e-6), key
+
+    def test_padding_does_not_dilute_the_measurement(self):
+        """Padded positions carry w_t = 0, so a padded batch must report what
+        the unpadded one does -- for the same rows."""
+        cfg = _config()
+        b, t_valid, t_pad = 5, 12, 20
+        lp_full, olp_full, adv_full, _ = _rand_inputs(7, b=b, t=t_pad)
+        mask = torch.zeros(b, t_pad, dtype=torch.long)
+        mask[:, :t_valid] = 1
+        _, padded = _call(lp_full, olp_full, adv_full * mask, mask, cfg)
+
+        lp = lp_full.detach()[:, :t_valid].clone().requires_grad_(True)
+        _, tight = _call(
+            lp, olp_full[:, :t_valid], adv_full[:, :t_valid], torch.ones(b, t_valid, dtype=torch.long), cfg
+        )
+        for threshold in CPPO_SEQ_SW_GRID:
+            key = f"actor/cppo_seq_sw_gt_{threshold:g}"
+            assert padded[key] == pytest.approx(tight[key], abs=1e-6), key
+        assert padded["actor/cppo_seq_sw_mean"] == pytest.approx(tight["actor/cppo_seq_sw_mean"], rel=1e-5)
+
+    def test_all_padding_rows_are_excluded_not_counted_as_low_drift(self):
+        """A row with no response tokens has no S/W to report. Counting it as
+        'below the grid' would understate the drifting share."""
+        cfg = _config()
+        b, t = 4, 10
+        lp_all, olp_all, adv_all, _ = _rand_inputs(8, b=b, t=t)
+        mask = torch.ones(b, t, dtype=torch.long)
+        mask[-1] = 0  # last row entirely padding
+        _, m = _call(lp_all, olp_all, adv_all * mask, mask, cfg)
+
+        sw, wsum = _seq_sw(lp_all, olp_all, mask, cfg)
+        live = sw[wsum > 0]
+        assert len(live) == b - 1
+        for threshold in CPPO_SEQ_SW_GRID:
+            expected = float((live > threshold).float().mean())
+            assert m[f"actor/cppo_seq_sw_gt_{threshold:g}"] == pytest.approx(expected, abs=1e-6)
+        assert not math.isnan(m["actor/cppo_seq_sw_mean"])
+
+    def test_units_match_the_budget_it_calibrates(self):
+        """S/W is in delta_b's units, NOT cppo_weighted_div_mean's: the two
+        differ by mean(w) = (1 + w_min)/2. Getting this wrong is a systematic
+        error in the chosen delta_b."""
+        cfg = _config(w_min=0.8)
+        lp, olp, adv, mask = _rand_inputs(9, b=8, t=64)
+        _, m = _call(lp, olp, adv, mask, cfg)
+        ratio = m["actor/cppo_seq_sw_mean"] / m["actor/cppo_weighted_div_mean"]
+        assert ratio == pytest.approx(1 / 0.9, rel=0.02)
+
+    def test_a_sequence_above_its_budget_is_the_one_that_gets_masked(self):
+        """The link that makes the metric actionable: pin delta_b between two
+        rows' S/W and only the row above it loses tokens."""
+        b, t = 2, 400
+        mask = torch.ones(b, t, dtype=torch.long)
+        adv = torch.ones(b, t)
+        olp = torch.full((b, t), math.log(0.2))
+        probs = torch.full((b, t), 0.2)
+        probs[0] += 0.004  # quiet row
+        probs[1] += 0.040  # drifting row
+        lp = probs.log().clone().requires_grad_(True)
+
+        cfg = _config(delta_b=0.02, delta_b_k=0.0)  # between the two rows' S/W
+        _, m = _call(lp, olp, adv, mask, cfg)
+        assert m["actor/cppo_seq_sw_gt_0.02"] == pytest.approx(0.5)
+        assert m["actor/cppo_budget_mask_frac"] > 0.0
+        # ...and with the budget above both rows, nothing is masked at all.
+        _, loose = _call(lp, olp, adv, mask, _config(delta_b=0.2, delta_b_k=0.0))
+        assert loose["actor/cppo_seq_sw_gt_0.03"] == pytest.approx(0.5)
+        assert loose["actor/cppo_budget_mask_frac"] == 0.0
 
 
 class TestMetricsAndConfig:
