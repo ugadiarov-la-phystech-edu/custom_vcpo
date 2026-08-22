@@ -115,6 +115,53 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(config.policy_loss.loss_mode, "vanilla")
         self.assertIsNone(config.policy_loss.get("rollout_correction"))
 
+    def test_checkpoint_load_contents_mirror_a_save_contents_override(self):
+        """The baseline scripts override only save_contents; load_contents must follow.
+
+        actor.yaml sets `load_contents: ${.save_contents}`, which is what lets a single CLI
+        override keep the two lists from drifting apart.
+        """
+        from hydra import compose, initialize_config_dir
+
+        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+            cfg = compose(
+                config_name="actor",
+                overrides=[
+                    "strategy=megatron",
+                    "ppo_micro_batch_size_per_gpu=1",
+                    "checkpoint.save_contents=[hf_model]",
+                ],
+            )
+        config = omega_conf_to_dataclass(cfg)
+        self.assertEqual(list(config.checkpoint.save_contents), ["hf_model"])
+        self.assertEqual(list(config.checkpoint.load_contents), ["hf_model"])
+
+    def test_checkpoint_load_contents_can_be_overridden_separately(self):
+        from hydra import compose, initialize_config_dir
+
+        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+            cfg = compose(
+                config_name="actor",
+                overrides=[
+                    "strategy=megatron",
+                    "ppo_micro_batch_size_per_gpu=1",
+                    "checkpoint.save_contents=[hf_model]",
+                    "checkpoint.load_contents=[model,extra]",
+                ],
+            )
+        config = omega_conf_to_dataclass(cfg)
+        self.assertEqual(list(config.checkpoint.save_contents), ["hf_model"])
+        self.assertEqual(list(config.checkpoint.load_contents), ["model", "extra"])
+
+    def test_checkpoint_contents_default_to_a_resumable_checkpoint(self):
+        from hydra import compose, initialize_config_dir
+
+        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+            cfg = compose(config_name="actor", overrides=["strategy=megatron", "ppo_micro_batch_size_per_gpu=1"])
+        config = omega_conf_to_dataclass(cfg)
+        self.assertEqual(list(config.checkpoint.save_contents), ["model", "optimizer", "extra"])
+        self.assertEqual(list(config.checkpoint.load_contents), ["model", "optimizer", "extra"])
+
     def test_actor_config_from_yaml(self):
         """Test creating ActorConfig from YAML file."""
         from hydra import compose, initialize_config_dir

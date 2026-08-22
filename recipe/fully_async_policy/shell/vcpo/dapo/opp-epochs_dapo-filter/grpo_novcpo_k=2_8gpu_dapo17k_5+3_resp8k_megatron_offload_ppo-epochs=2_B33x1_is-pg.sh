@@ -52,6 +52,16 @@
 #   * serialize_validation / pause_generation_during_save: stop-the-world validation
 #     and saves, excluded from fully_async/timing/cumulative_training_time.
 #
+# CHECKPOINTS (save_contents=['hf_model'], max_actor_ckpt_to_keep=null, resume_mode=disable):
+#   * each save writes global_step_N/actor/huggingface/ - config, tokenizer and bf16
+#     safetensors - directly loadable by vLLM / from_pretrained, no merge step. No
+#     optimizer state, no sharded dist_ckpt/ directory at all.
+#   * nothing is rotated away: ~16.4 GB per save for Qwen3-8B, ~200 saves over the
+#     full run is ~3.3 TB. Raise save_freq at launch if the disk is tighter.
+#   * the run is NOT resumable: 'hf_model' is written but never read back, so
+#     load_contents would restore nothing. resume_mode=disable makes that explicit,
+#     and the trainer raises rather than resuming from such a checkpoint.
+#
 # ACCEPTED DIVERGENCES from the 'rollout-dapo' script (dropped, not emulated):
 #   * math500 validation set -> the math500_dapo scorer is not in this branch's
 #     reward registry, so validation is AIME-2024 only.
@@ -200,7 +210,16 @@ epochs=10000000
 # here, so 10 = every 330 groups.
 test_freq=${test_freq:-10}
 save_freq=${save_freq:-10}
-max_actor_ckpt_to_keep=1 # keep only the most recent checkpoint
+# Weights only, in huggingface format: no optimizer state (fp32 master + 2 adam moments is ~6x
+# the bf16 weights on the megatron distributed optimizer, and every save here is stop-the-world)
+# and no merge step before offline eval - global_step_N/actor/huggingface/ loads in vLLM as is.
+# ~16.4 GB per save for Qwen3-8B, and nothing is rotated away: ~200 saves over the run is ~3.3 TB,
+# so raise save_freq at launch if the disk is tighter than that.
+save_contents=${save_contents:-"['hf_model']"}
+max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null} # keep every checkpoint
+# Mandatory, not cosmetic: load_contents mirrors save_contents, and 'hf_model' is written but never
+# read back, so a resume would restore nothing. The trainer refuses that combination outright.
+resume_mode=${resume_mode:-disable}
 
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO-noVCPO is-pg k-${staleness_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
@@ -326,6 +345,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.val_before_train=${val_before_train} \
     trainer.save_freq=${save_freq} \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
+    trainer.resume_mode=${resume_mode} \
+    actor_rollout_ref.actor.checkpoint.save_contents="${save_contents}" \
     trainer.rollout_data_dir="${log_dir}" \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
