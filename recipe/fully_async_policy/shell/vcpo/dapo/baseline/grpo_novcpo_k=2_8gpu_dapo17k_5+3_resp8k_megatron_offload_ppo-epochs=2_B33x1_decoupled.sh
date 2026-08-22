@@ -86,6 +86,8 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export WANDB_MODE=disabled
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
+export PYTHONUNBUFFERED=1
+
 # ================= Paths =================
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
