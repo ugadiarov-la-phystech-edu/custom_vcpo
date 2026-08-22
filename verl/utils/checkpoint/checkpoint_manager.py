@@ -98,6 +98,14 @@ class BaseCheckpointManager:
         return "hf_model" in self.checkpoint_save_contents
 
     @property
+    def should_save_hf_metadata(self) -> bool:
+        return self.should_save_model or self.should_save_hf_model
+
+    @property
+    def should_save_dist_checkpoint(self) -> bool:
+        return self.should_save_model or self.should_save_optimizer or self.should_save_extra
+
+    @property
     def should_load_model(self) -> bool:
         """
         Returns True if 'model' is in checkpoint_load_contents, indicating the model state should be loaded.
@@ -236,3 +244,19 @@ def should_save_ckpt_esi(max_steps_duration: float, save_ckpt_duration: float = 
         return time_difference < timedelta(minutes=threshold_minutes)
     else:
         return False
+
+
+def restores_model_weights(load_contents) -> bool:
+    if load_contents is None:
+        return True
+    return "model" in load_contents
+
+
+def resync_optimizer_main_params(optimizer, *, loaded_model: bool, loaded_optimizer: bool) -> bool:
+    if not loaded_model or loaded_optimizer or optimizer is None:
+        return False
+    reload_model_params = getattr(optimizer, "reload_model_params", None)
+    if reload_model_params is None:
+        return False
+    reload_model_params()
+    return True

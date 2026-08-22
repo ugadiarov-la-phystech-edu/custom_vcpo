@@ -98,7 +98,9 @@ total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
 test_freq=${test_freq:-10}
 save_freq=${save_freq:-10}
-max_actor_ckpt_to_keep=1
+save_contents=${save_contents:-"['hf_model']"}
+max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null}
+resume_mode=${resume_mode:-disable}
 
 exp_name=${exp_name:-"GRPO-noVCPO decoupled k-${staleness_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
@@ -219,6 +221,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.val_before_train=${val_before_train} \
     trainer.save_freq=${save_freq} \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
+    trainer.resume_mode=${resume_mode} \
+    actor_rollout_ref.actor.checkpoint.save_contents="${save_contents}" \
     trainer.rollout_data_dir="${log_dir}" \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
