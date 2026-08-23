@@ -63,7 +63,9 @@
 #      rollout would then score -1, the group-relative advantage would be identically 0, and
 #      nothing would learn - a failure that looks exactly like a healthy run that is not
 #      improving. So the rollout dumps are scanned for the score distribution and the
-#      [INVALID] rate, and a uniformly -1 batch is reported as a FAILURE.
+#      [INVALID] rate. The FAILURE condition is the [INVALID] rate, not the sign of the
+#      rewards: at ~12 rollouts over AIME-difficulty problems an all -1 batch is ordinary
+#      (measured 2026-08-23: 12/12 wrong, every extraction correct), so that is a warning.
 #
 # Usage:  bash smoke_test_orz7b_2+3.sh
 # Env:    MODEL_PATH, TRAIN_FILE, TEST_FILE, n_resp_per_prompt, test_freq, save_freq, ...
@@ -214,13 +216,23 @@ if preds:
     print(f"[INVALID]  : {invalid}/{len(preds)}")
     print(f"sample preds     : {preds[:8]}")
 
+# What can actually be concluded at this sample size. The run produces ~12 rollouts over a
+# handful of AIME-difficulty problems, so "every sample scored -1" is ORDINARY - measured
+# 2026-08-23, 12/12 wrong with every ground truth recovered from the parquet and every
+# extraction correct. It is therefore a WARNING, not a failure: it cannot distinguish a broken
+# scorer from a model that simply got hard problems wrong.
+#
+# What IS diagnostic is whether extraction worked at all, and that is independent of accuracy:
+# stock math_dapo returned [INVALID] on 12/12 of those same responses while this scorer
+# recovered a clean number every time. So the hard gate is the [INVALID] rate and the presence
+# of <answer>, not the sign of the rewards.
 failures = []
-if "pred" not in (rows[0] if rows else {}):
+if rows and "pred" not in rows[0]:
     failures.append("no 'pred' field in the dumps: the custom reward function did not run")
-if len(scores) == 1 and next(iter(scores)) is not None and next(iter(scores)) < 0:
-    failures.append("every sample scored -1: the advantage is identically 0 and nothing can learn")
 if preds and invalid == len(preds):
     failures.append("every prediction is [INVALID]: extraction is broken")
+if preds and invalid > 0.5 * len(preds):
+    failures.append(f"{invalid}/{len(preds)} predictions are [INVALID]: extraction is mostly failing")
 if tagged == 0:
     failures.append("no response contained <answer>: ORZ's chat template did not apply")
 
@@ -228,5 +240,10 @@ if failures:
     for f in failures:
         print(f"FAIL: {f}")
     sys.exit(1)
-print("OK: answers were extracted and the reward is not degenerate")
+
+if len(scores) == 1 and next(iter(scores)) is not None and next(iter(scores)) < 0:
+    print("WARN: every sample scored -1. At this sample size that is ordinary - these are")
+    print("      AIME-difficulty problems and a 12-rollout smoke tells you nothing about")
+    print("      accuracy. Extraction is what this check verifies, and it worked.")
+print("OK: answers were extracted from ORZ's <answer> blocks")
 PY
