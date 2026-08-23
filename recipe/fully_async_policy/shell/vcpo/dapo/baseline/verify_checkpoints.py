@@ -39,7 +39,30 @@ TIMING_KEYS = (
     "cumulative_save_time",
     "cumulative_training_time",
 )
-TOKENIZER_FILES = ("tokenizer_config.json", "tokenizer.json")
+# A checkpoint needs the tokenizer config plus at least one vocabulary artifact. Which artifact
+# depends on the model: fast tokenizers ship tokenizer.json, slow/sentencepiece ones (openPangu's
+# PanguTokenizer, most Llama-family originals) ship tokenizer.model and no tokenizer.json at all.
+TOKENIZER_CONFIG = "tokenizer_config.json"
+VOCAB_FILES = ("tokenizer.json", "tokenizer.model", "vocab.json", "vocab.txt", "spiece.model")
+
+# Buffers transformers recomputes at load time from the config and deliberately does NOT save.
+# A base checkpoint exported by an older transformers may still contain them (openPangu ships 34
+# rotary_emb.inv_freq, one per layer), so comparing raw key sets reports them as "missing" from a
+# perfectly good save.
+NON_PERSISTENT_BUFFER_SUFFIXES = ("rotary_emb.inv_freq", "masked_bias", "attention.bias")
+
+
+def tokenizer_files_present(files):
+    """Returns (ok, missing-description) for the tokenizer artifacts in a checkpoint directory."""
+    if TOKENIZER_CONFIG not in files:
+        return False, TOKENIZER_CONFIG
+    if not any(v in files for v in VOCAB_FILES):
+        return False, f"one of {list(VOCAB_FILES)}"
+    return True, ""
+
+
+def is_non_persistent_buffer(key):
+    return key.endswith(NON_PERSISTENT_BUFFER_SUFFIXES)
 
 
 class Report:
@@ -91,8 +114,8 @@ def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
 
     files = set(os.listdir(hf_dir))
     report.check("config.json" in files, f"{name}: config.json written")
-    missing_tokenizer = [f for f in TOKENIZER_FILES if f not in files]
-    report.check(not missing_tokenizer, f"{name}: tokenizer written (missing: {missing_tokenizer})")
+    tokenizer_ok, tokenizer_missing = tokenizer_files_present(files)
+    report.check(tokenizer_ok, f"{name}: tokenizer written (missing: {tokenizer_missing})")
     report.check(
         any(f.endswith(".safetensors") for f in files),
         f"{name}: weights written (files: {sorted(files)})",
@@ -121,7 +144,10 @@ def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
         report.check("model.safetensors.index.json" in files, f"{name}: sharded weights have an index")
 
     if base_state is not None:
-        missing = sorted(set(base_state) - set(state))
+        missing = sorted(k for k in set(base_state) - set(state) if not is_non_persistent_buffer(k))
+        skipped = sorted(k for k in set(base_state) - set(state) if is_non_persistent_buffer(k))
+        if skipped:
+            report.check(True, f"{name}: {len(skipped)} non-persistent buffers not saved, as expected")
         extra = sorted(set(state) - set(base_state))
         report.check(not missing, f"{name}: no parameter missing vs the base model (missing: {missing[:5]})")
         report.check(not extra, f"{name}: no unexpected parameter vs the base model (extra: {extra[:5]})")

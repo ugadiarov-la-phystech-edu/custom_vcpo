@@ -221,10 +221,17 @@ rollout_name="vllm"
 return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-# 0.8, not 0.9: on the FSDP worker path the vLLM engine process sits ~7-10 GB
-# above the configured pool target, and 0.9 OOMs at sampler warmup / weight sync
-# (fork smoke campaign, 2026-07-30). The megatron path runs ~4 GB over.
-gpu_memory_utilization=0.8
+# 0.75, lower than the Qwen FSDP2 arms' 0.8, and load-bearing: on the FSDP worker path
+# the vLLM engine process sits ~7-10 GB above the configured pool target, AND this arm
+# broadcasts fp32 weights during sync_rollout_weights (fsdp_config.model_dtype defaults to
+# fp32, so the exact-numerics recipe is preserved) - the embedding alone is
+# 153376 x 4096 x 4 B = 2.5 GB per rollout GPU, twice the bf16 figure. At 0.8 the first
+# weight sync died on remote_smoke (2026-08-23) with NCCL unable to CUDA-calloc 10 MB for
+# its communicator: "NCCL WARN Cuda failure 'out of memory'" inside
+# collective.broadcast(group_name="actor_rollout"). Raising it back is how you get that
+# failure again; the cheaper alternative (model_dtype=bf16) would turn this into the 6+2
+# arm's numerics, which is not what this arm is for.
+gpu_memory_utilization=${gpu_memory_utilization:-0.75}
 # vLLM v1 warms the sampler with max_num_seqs dummy requests AFTER filling the KV
 # pool, so the transient scales with it; 512 is far above the ~50-60 concurrent
 # sequences these engines actually run at this length.

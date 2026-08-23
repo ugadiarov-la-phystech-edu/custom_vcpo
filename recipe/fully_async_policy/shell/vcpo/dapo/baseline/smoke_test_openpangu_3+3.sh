@@ -13,13 +13,13 @@
 #   * n_resp_per_prompt=2 instead of 16 (the requested speed lever) and mini_bsz 3 instead
 #     of 33: 3*2 = 6 sequences, divisible by trainer DP=3.
 #   * max_response_length stays at the arm's 8192, so generation is exercised at the
-#     real length. This is the dominant cost: with validation on the full 960-row
-#     aime-2024 after each of the 2 steps, expect the two validation sweeps to take
-#     longer than the training itself.
+#     real length. Together with the deduplicated validation file below, a step and its
+#     validation are then comparable in cost (~110 s of training per step, measured).
 #   * VALIDATION ON AIME-2024 ONLY, EVERY STEP (test_freq=1) and NO validation before
 #     training (val_before_train=False), so the two validations that run are both of a
-#     trained model. Note this is the full 960-row file at 8192 tokens - point TEST_FILE
-#     at a subset, or lower max_response_length, if you need it faster.
+#     trained model. It uses aime-2024_smoke.parquet - the same problems with the 32x
+#     duplication removed, 30 rows instead of 960 - because at 8192 tokens the full file
+#     dominates the runtime (a 20-minute sweep per step, measured 2026-08-23).
 #   * A CHECKPOINT EVERY STEP (save_freq=1) -> exactly 2 checkpoints. Unlike the 8-GPU
 #     smoke test there is no third one: the trainer's end-of-fit block only forces a final
 #     sync when `param_version % test_freq != 0 or local_trigger_step > 1`, and at
@@ -73,7 +73,12 @@ esac
 MODEL_PATH=${MODEL_PATH:-"/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
 # AIME-2024 only, as a single-element list: the arm validates on 2024+2025 by default.
-TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet']"}
+# The _smoke file is aime-2024 with its 32x duplication removed - 30 distinct problems
+# instead of 960 rows, all ground truths agreeing within each duplicate group (checked
+# before it was written). Validation is the dominant cost of this test at 8192 tokens, and
+# this makes it 32x cheaper. The price is that val-core/math_dapo/acc is now mean@1 over 30
+# problems: fine for a plumbing check, far too noisy to compare arms with.
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024_smoke.parquet']"}
 
 # no spaces or slashes: the arm's log dir is logs/${exp_name//\//_}
 exp_name=${exp_name:-"SMOKE-openpangu7b-3+3"}

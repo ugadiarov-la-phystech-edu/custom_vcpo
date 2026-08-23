@@ -183,7 +183,9 @@ class TestOpenPanguSmoke3plus3(unittest.TestCase):
         val_files = cfg.data.val_files
         if isinstance(val_files, str):
             val_files = [val_files]
-        self.assertEqual([os.path.basename(f) for f in val_files], ["aime-2024.parquet"])
+        # the deduplicated copy: same 30 AIME-2024 problems, without the 32x duplication that
+        # made a validation sweep the dominant cost of this test
+        self.assertEqual([os.path.basename(f) for f in val_files], ["aime-2024_smoke.parquet"])
 
     def test_checkpoint_every_step(self):
         self.assertEqual(self.cfg.trainer.save_freq, 1)
