@@ -259,6 +259,30 @@ def compute_advantage(
     return data
 
 
+def json_default(value):
+    """Fallback encoder for values json cannot serialize on its own.
+
+    Reward functions routinely hand back numpy scalars - `acc` from
+    verl/utils/reward_score/math_dapo.py is a numpy bool, and the reward managers forward
+    the scorer's dict verbatim - which json.dumps rejects ("Object of type bool_ is not JSON
+    serializable"), killing the run at the first rollout dump. Unwrap anything with .item()
+    (numpy scalars, 0-d tensors), list anything array-like, and fall back to str() so a dump
+    can never take the training down.
+    """
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except (ValueError, TypeError, RuntimeError):
+            pass  # multi-element array/tensor: fall through to tolist/str below
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    if isinstance(value, set | frozenset):
+        return sorted(value)
+    return str(value)
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -448,7 +472,7 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=json_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")

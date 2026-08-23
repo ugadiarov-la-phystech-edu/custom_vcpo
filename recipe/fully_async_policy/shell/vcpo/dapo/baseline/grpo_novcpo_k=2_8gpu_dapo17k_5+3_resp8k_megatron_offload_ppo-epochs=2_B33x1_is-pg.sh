@@ -119,7 +119,7 @@ calculate_log_probs=True
 
 # ================= Sequence Lengths =================
 max_prompt_length=2048
-max_response_length=8192
+max_response_length=${max_response_length:-8192}
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 # ================= Megatron Parallelism =================
@@ -133,7 +133,7 @@ precision_dtype="bfloat16"
 # ================= Batch Sizes =================
 train_prompt_bsz=0
 gen_prompt_bsz=1
-train_prompt_mini_bsz=33 # 33*16=528 seqs; must divide by trainer DP=3 (528/3=176)
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; must divide by trainer DP=3 (528/3=176)
 micro_bsz_per_gpu=1
 use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
@@ -149,7 +149,7 @@ use_kl_loss=False
 kl_loss_coef=0.0
 use_kl_in_reward=False
 kl_coef=0.0
-entropy_coeff=0
+entropy_coeff=${entropy_coeff:-0}
 # Log actor/entropy even with entropy_coeff=0 (honoured via should_calculate_entropy
 # in verl/workers/actor/megatron_actor.py). This arm has no old-log-prob forward, so
 # it is the only source of entropy here -- see the memory note in the header.
@@ -157,7 +157,7 @@ calculate_entropy=True
 grad_clip=1.0
 
 # ================= Optimizer =================
-lr=1e-6
+lr=${lr:-1e-6}
 lr_warmup_steps=0
 weight_decay=0.1
 

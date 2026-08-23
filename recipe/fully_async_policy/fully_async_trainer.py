@@ -369,15 +369,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             # step's timing_raw for the post-loop save: take the delta so a save is
             # never counted twice.
             save_time_before = timing_raw.get("save_checkpoint", 0.0)
+            # The instant the pipeline freezes - before the rollouter pause RPC, which is
+            # part of the frozen window. The snapshot written into timing_state.json and the
+            # save duration subtracted from the virtual clock must cover the SAME interval,
+            # or the stored cumulative_training_time can come out slightly ahead of where the
+            # clock lands afterwards (and a later checkpoint then reads lower than an earlier
+            # one).
+            freeze_start = time.time()
             with marked_timer("save_checkpoint", timing_raw, color="green"):
-                self._save_checkpoint()
+                self._save_checkpoint(freeze_start=freeze_start)
                 self.last_ckpt_version = self.current_param_version
             this_save_time = timing_raw.get("save_checkpoint", 0.0) - save_time_before
             self.cumulative_save_time += this_save_time
             # Saving is not training: exclude it from the virtual timeline's busy time.
             self._step_save_time += this_save_time
 
-    def _save_checkpoint(self):
+    def _save_checkpoint(self, freeze_start: float = None):
         if self.pause_generation_during_save:
             # Stop-the-world save: freeze generation for the entire save (the
             # long actor dist-ckpt below, not just the rollouter's dataloader
@@ -386,13 +393,15 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             # full pause into cumulative_checkpoint_pause at resume.
             ray.get(self.param_synchronizer.pause_rollouter_for_save.remote())
         try:
-            self._save_checkpoint_inner()
+            self._save_checkpoint_inner(freeze_start)
         finally:
             if self.pause_generation_during_save:
                 ray.get(self.param_synchronizer.resume_rollouter_after_save.remote())
 
-    def _save_checkpoint_inner(self):
-        save_start = time.time()
+    def _save_checkpoint_inner(self, freeze_start: float = None):
+        # freeze_start is when the pipeline stopped (see _check_save_checkpoint); falling back
+        # to now() only matters for callers outside the timed bracket.
+        save_start = time.time() if freeze_start is None else freeze_start
         # Warning: Currently, to align the training process and metrics of colocate,
         # we use current_param_version instead of global step.
         # This can be logically aligned with the original self.global_steps of colocate
@@ -716,7 +725,14 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         checkpoint save, whose duration _virtual_now excludes)."""
         if self._step_virtual_start is None:
             return
-        self.virtual_free_time = self._virtual_now(time.time() if now is None else now)
+        virtual_now = self._virtual_now(time.time() if now is None else now)
+        # The clock is a timeline: it never runs backwards. Closing a step right after a
+        # checkpoint save subtracts the measured save duration from an elapsed window that
+        # ends a few milliseconds later, which can otherwise nudge the total down and make
+        # cumulative_training_time non-monotone across checkpoints.
+        if self.virtual_free_time is not None:
+            virtual_now = max(self.virtual_free_time, virtual_now)
+        self.virtual_free_time = virtual_now
         self._step_virtual_start = None
         self._step_actual_start = None
 

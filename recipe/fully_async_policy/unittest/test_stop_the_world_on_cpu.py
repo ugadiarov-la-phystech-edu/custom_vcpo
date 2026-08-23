@@ -420,7 +420,7 @@ def _make_save_trainer(pause_generation_during_save, inner):
 def test_save_bracket_orders_pause_inner_resume(monkeypatch):
     monkeypatch.setattr(fat_module, "ray", _FakeRay)
     calls = []
-    trainer = _make_save_trainer(True, inner=lambda: calls.append("inner"))
+    trainer = _make_save_trainer(True, inner=lambda *_: calls.append("inner"))
     trainer.param_synchronizer = _StubSaveSynchronizer(calls)
     trainer._save_checkpoint()
     assert calls == ["pause", "inner", "resume"]
@@ -430,7 +430,7 @@ def test_save_bracket_resumes_on_failure(monkeypatch):
     monkeypatch.setattr(fat_module, "ray", _FakeRay)
     calls = []
 
-    def failing_inner():
+    def failing_inner(*_):
         calls.append("inner")
         raise RuntimeError("disk full")
 
@@ -448,7 +448,7 @@ def test_save_bracket_resumes_on_failure(monkeypatch):
 def test_save_bracket_disabled_calls_inner_only(monkeypatch):
     monkeypatch.setattr(fat_module, "ray", _FakeRay)
     calls = []
-    trainer = _make_save_trainer(False, inner=lambda: calls.append("inner"))
+    trainer = _make_save_trainer(False, inner=lambda *_: calls.append("inner"))
     trainer.param_synchronizer = _StubSaveSynchronizer(calls)
     trainer._save_checkpoint()
     assert calls == ["inner"]
@@ -470,7 +470,7 @@ def test_check_save_checkpoint_drives_the_bracket_and_accounts_the_frozen_window
     trainer.max_steps_duration = 0
     trainer.config = OmegaConf.create({"trainer": {"save_freq": 1, "esi_redundant_time": 0}})
 
-    def inner():
+    def inner(*_):
         calls.append("inner")
         time.sleep(0.05)
 
