@@ -8,7 +8,7 @@
 #SBATCH --error=./slurm/%A_%x.err
 #SBATCH --job-name=grpo-novcpo
 
-# grpo_novcpo_k=2_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh
+# grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh
 #
 # ARM A of the pair that reproduces the same-named arm of branch 'rollout-dapo' on
 # this (pristine-verl + cumulative_training_time) branch. Both arms share every
@@ -48,7 +48,8 @@
 #     async_training.ppo_epochs=2; here actor_rollout_ref.actor.ppo_epochs=2 does the
 #     same, because megatron_workers.py scales ppo_mini_batch_size by rollout.n
 #     (33*16=528 = the whole pull), so make_iterator(epochs=2) runs the same 2 steps.
-#   * staleness_threshold=2, total_rollout_steps=66000 explicit, test_freq=save_freq=10.
+#   * staleness_threshold=1 (see the k=1 note below; the source arm ran k=2),
+#     total_rollout_steps=66000 explicit, test_freq=save_freq=10.
 #   * serialize_validation / pause_generation_during_save: stop-the-world validation
 #     and saves, excluded from fully_async/timing/cumulative_training_time.
 #
@@ -65,8 +66,9 @@
 # ACCEPTED DIVERGENCES from the 'rollout-dapo' script (dropped, not emulated):
 #   * math500 validation set -> the math500_dapo scorer is not in this branch's
 #     reward registry, so validation is AIME-2024 only.
-#   * +async_training.bsz_per_dp_rank=33 -> not ported: max_concurrent_samples stays
-#     min(5 servers * 16, 99) = 80 instead of 99 (the full staleness budget).
+#   * +async_training.bsz_per_dp_rank=33 -> not ported. At k=1 this no longer costs
+#     anything: max_concurrent_samples = min(5 servers * 16, 66) = 66, i.e. the full
+#     staleness budget. (At k=2 the 80-sample server cap bound it below the 99 allowed.)
 #   * algorithm.rollout_correction.log_probs_pearson_corr -> not ported; the same
 #     policy-vs-rollout pair is already covered by rollout_corr/* (KL, ESS).
 #   * async_training.{dynamic_filtering,opportunistic_epochs} -> both were OFF in the
@@ -180,10 +182,11 @@ policy_loss_mode="rollout_correction"
 compute_prox_log_prob=False
 
 # ================= Async Training =================
-# k=2 matches the VCPO baseline's staleness gating: the rollouter is licensed
-# to generate up to (2+1) trainer batches ahead — at B-33x1 that is 99
-# in-flight/queued groups.
-staleness_threshold=${staleness_threshold:-2.0}
+# k=1: the rollouter is licensed to generate up to (1+1) trainer batches ahead
+# — at B-33x1 that is 66 in-flight/queued groups (max_required_samples =
+# 33 * (k+1) * trigger_parameter_sync_step). Tighter than the VCPO baseline's k=2:
+# samples are at most one parameter version stale when the trainer consumes them.
+staleness_threshold=${staleness_threshold:-1.0}
 updates_per_param_sync=1
 num_minibatches_per_update=1 # require_batches=1: ONE 33-group mini-batch per trainer step (B-33x1)
 partial_rollout=True

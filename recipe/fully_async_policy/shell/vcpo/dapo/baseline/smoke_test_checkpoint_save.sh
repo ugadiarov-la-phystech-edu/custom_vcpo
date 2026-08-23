@@ -4,7 +4,7 @@
 #
 # Fastest possible end-to-end exercise of the is-pg baseline arm, for checking
 # that CHECKPOINTS ARE SAVED CORRECTLY. It runs the real script
-#   grpo_novcpo_k=2_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh
+#   grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh
 # with everything expensive turned down, so there is no second copy of the
 # configuration to drift out of sync - only the knobs below differ:
 #
@@ -52,7 +52,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${HERE}/../../../../../.." && pwd)"
 cd -- "${REPO_ROOT}"
 
-ARM_SCRIPT=${ARM_SCRIPT:-"${HERE}/grpo_novcpo_k=2_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh"}
+ARM_SCRIPT=${ARM_SCRIPT:-"${HERE}/grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh"}
 [[ -f "${ARM_SCRIPT}" ]] || { echo "no such arm script: ${ARM_SCRIPT}" >&2; exit 2; }
 # keep the tag to [A-Za-z0-9-]: it becomes a hydra override value and a directory name
 arm_tag=$(basename -- "${ARM_SCRIPT}" .sh)
