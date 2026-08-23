@@ -38,6 +38,7 @@ BASELINE = os.path.join(REPO_ROOT, "recipe/fully_async_policy/shell/vcpo/dapo/ba
 
 OPENPANGU = "grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_fsdp2_openpangu7b_ppo-epochs=2_B33x1_is-pg.sh"
 QWEN_FSDP2 = "grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_fsdp2_ppo-epochs=2_B33x1_is-pg.sh"
+SMOKE_3P3 = "smoke_test_openpangu_3+3.sh"
 
 # Architectures shipped inside transformers itself; anything else may carry custom code. Local
 # directories count as custom on purpose: the openPangu checkpoint is re-aliased to Llama but its
@@ -47,14 +48,19 @@ NATIVE_MODEL_PREFIXES = ("Qwen/", "meta-llama/", "mistralai/", "deepseek-ai/")
 _COMPOSED = {}
 
 
-def compose(script_name):
-    """Run the script with hydra's --cfg job --resolve and parse the config it would launch with."""
+def compose(script_name, **env_overrides):
+    """Run the script with hydra's --cfg job --resolve and parse the config it would launch with.
+
+    Data paths are stubbed so the composition does not need the parquets - but only where the test
+    is not about them: the smoke wrapper picks its own validation file, so TEST_FILE must not be
+    injected there or the test would assert on its own stub.
+    """
     if script_name in _COMPOSED:
         return _COMPOSED[script_name]
     path = os.path.join(BASELINE, script_name)
     if not os.path.exists(path):
         raise unittest.SkipTest(f"{script_name} not found")
-    env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet")
+    env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", **env_overrides)
     with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
         proc = subprocess.run(
             ["bash", path, "--cfg", "job", "--resolve"],
@@ -82,7 +88,7 @@ class TestOpenPanguArmConfig(unittest.TestCase):
     def setUpClass(cls):
         if sys.platform.startswith("win"):
             raise unittest.SkipTest("bash-only")
-        cls.cfg = compose(OPENPANGU)
+        cls.cfg = compose(OPENPANGU, TEST_FILE="/tmp/test.parquet")
 
     def test_points_at_a_realiased_local_checkpoint(self):
         """Not the hub id: transformers 4.57.6 cannot import openPangu's remote modeling code."""
@@ -96,7 +102,7 @@ class TestOpenPanguArmConfig(unittest.TestCase):
 
     def test_keeps_the_arm_identical_to_the_qwen_fsdp2_twin(self):
         """Only the model may differ; everything defining the experiment must match."""
-        qwen = compose(QWEN_FSDP2)
+        qwen = compose(QWEN_FSDP2, TEST_FILE="/tmp/test.parquet")
         for path in (
             "actor_rollout_ref.actor.strategy",
             "actor_rollout_ref.actor.ppo_mini_batch_size",
@@ -134,11 +140,74 @@ class TestOpenPanguArmConfig(unittest.TestCase):
         self.assertGreaterEqual(self.cfg.data.max_prompt_length, 1024)
 
 
+class TestOpenPanguSmoke3plus3(unittest.TestCase):
+    """The 3+3 smoke test: two cheap steps, validated and checkpointed at every one.
+
+    It runs the real arm with env overrides, so what matters is that the overrides survive
+    composition - a typo in one of them turns a 20-minute check into a multi-hour run, or into one
+    that never validates.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform.startswith("win"):
+            raise unittest.SkipTest("bash-only")
+        cls.cfg = compose(SMOKE_3P3)
+
+    def test_layout_is_three_plus_three(self):
+        self.assertEqual(self.cfg.rollout.n_gpus_per_node, 3)
+        self.assertEqual(self.cfg.trainer.n_gpus_per_node, 3)
+
+    def test_it_runs_exactly_two_trainer_steps(self):
+        cfg = self.cfg
+        per_step = cfg.actor_rollout_ref.actor.ppo_mini_batch_size * cfg.async_training.require_batches
+        self.assertEqual(cfg.rollout.total_rollout_steps, 2 * per_step)
+
+    def test_batch_divides_across_the_trainer_gpus(self):
+        cfg = self.cfg
+        seqs = cfg.actor_rollout_ref.actor.ppo_mini_batch_size * cfg.actor_rollout_ref.rollout.n
+        self.assertEqual(seqs % cfg.trainer.n_gpus_per_node, 0, f"{seqs} seqs over 3 GPUs")
+
+    def test_rollouts_are_cheap(self):
+        """n is the speed lever. The response length is deliberately the arm's own 8192 - generation
+        is exercised at the real length - but it must never exceed it, or the smoke test would be
+        heavier than the run it stands in for."""
+        self.assertLess(self.cfg.actor_rollout_ref.rollout.n, 16)
+        arm = compose(OPENPANGU, TEST_FILE="/tmp/test.parquet")
+        self.assertLessEqual(self.cfg.data.max_response_length, arm.data.max_response_length)
+
+    def test_validation_is_aime_2024_only_every_step_and_not_before_training(self):
+        cfg = self.cfg
+        self.assertIs(cfg.trainer.val_before_train, False)
+        self.assertEqual(cfg.rollout.test_freq, 1)
+        val_files = cfg.data.val_files
+        if isinstance(val_files, str):
+            val_files = [val_files]
+        self.assertEqual([os.path.basename(f) for f in val_files], ["aime-2024.parquet"])
+
+    def test_checkpoint_every_step(self):
+        self.assertEqual(self.cfg.trainer.save_freq, 1)
+        self.assertEqual(list(self.cfg.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
+
+    def test_gradient_cannot_be_identically_zero(self):
+        """At a 512-token cap every answer is truncated, so all rewards in a group tie and the GRPO
+        advantage is 0. Without an entropy term the weights cannot move and "the checkpoints differ"
+        would be unverifiable."""
+        self.assertGreater(self.cfg.actor_rollout_ref.actor.entropy_coeff, 0)
+        self.assertGreater(self.cfg.actor_rollout_ref.actor.optim.lr, 1e-6)
+
+    def test_it_still_exercises_the_openpangu_path(self):
+        """The point of the smoke test: the custom tokenizer and the re-aliased checkpoint."""
+        self.assertIs(self.cfg.actor_rollout_ref.model.trust_remote_code, True)
+        self.assertIs(self.cfg.data.trust_remote_code, True)
+        self.assertIn("openPangu", self.cfg.actor_rollout_ref.model.path)
+
+
 class TestQwenArmNeedsNoRemoteCode(unittest.TestCase):
     """The converse, so the invariant is about custom-code models rather than about one script."""
 
     def test_native_model_does_not_enable_remote_code(self):
-        cfg = compose(QWEN_FSDP2)
+        cfg = compose(QWEN_FSDP2, TEST_FILE="/tmp/test.parquet")
         path = cfg.actor_rollout_ref.model.path
         if needs_remote_code(path):
             self.skipTest(f"{path} is not a natively-supported architecture")

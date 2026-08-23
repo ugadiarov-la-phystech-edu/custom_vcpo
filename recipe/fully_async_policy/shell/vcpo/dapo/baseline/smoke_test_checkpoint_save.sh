@@ -78,7 +78,7 @@ import pandas as pd
 
 src, dst = sys.argv[1], sys.argv[2]
 pd.read_parquet(src).head(2).to_parquet(dst)
-print(f"[smoke] wrote {dst} from {src}")
+print(f"[smoke] wrote {dst} from {src}", file=sys.stderr)
 PY
 
 # 6 prompts fed -> required_samples = mini_bsz * require_batches = 3 -> 2 trainer steps
@@ -98,7 +98,7 @@ export exp_name
 
 start_time=$(date +%s)
 bash "${ARM_SCRIPT}" "$@"
-echo "[smoke] training finished in $(( $(date +%s) - start_time ))s"
+echo "[smoke] training finished in $(( $(date +%s) - start_time ))s" >&2
 
 CKPTS_DIR="logs/${exp_name//\//_}"
 set +x
