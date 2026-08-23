@@ -111,7 +111,7 @@ def verify_checkpoint(step_dir, report, base_state=None):
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(hf_dir)
+        tokenizer = AutoTokenizer.from_pretrained(hf_dir, trust_remote_code=True)
         report.check(tokenizer.vocab_size > 0, f"{name}: AutoTokenizer.from_pretrained works")
     except Exception as exc:  # noqa: BLE001
         report.check(False, f"{name}: AutoTokenizer.from_pretrained failed: {exc}")
