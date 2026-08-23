@@ -341,7 +341,7 @@ def test_save_checkpoint_does_not_pause_generation_on_this_branch(tmp_path):
 def test_trainer_accumulates_save_time():
     trainer = _make_trainer()
     trainer.config = OmegaConf.create({"trainer": {"save_freq": 1, "esi_redundant_time": 0}})
-    trainer._save_checkpoint = lambda: time.sleep(0.02)
+    trainer._save_checkpoint = lambda **_: time.sleep(0.02)
 
     trainer.current_param_version = 1
     trainer._check_save_checkpoint(timing_raw={})
@@ -358,7 +358,7 @@ def test_trainer_save_time_counts_each_save_once_on_shared_timing_raw():
     # timing_raw for the post-loop save: only the delta may be counted.
     trainer = _make_trainer()
     trainer.config = OmegaConf.create({"trainer": {"save_freq": 1, "esi_redundant_time": 0}})
-    trainer._save_checkpoint = lambda: time.sleep(0.02)
+    trainer._save_checkpoint = lambda **_: time.sleep(0.02)
     timing_raw = {}
 
     trainer.current_param_version = 1
@@ -377,7 +377,7 @@ def test_trainer_save_time_counts_each_save_once_on_shared_timing_raw():
 def test_check_save_checkpoint_also_feeds_the_step_save_exclusion():
     trainer = _make_trainer()
     trainer.config = OmegaConf.create({"trainer": {"save_freq": 1, "esi_redundant_time": 0}})
-    trainer._save_checkpoint = lambda: time.sleep(0.02)
+    trainer._save_checkpoint = lambda **_: time.sleep(0.02)
     trainer.current_param_version = 1
     trainer._check_save_checkpoint(timing_raw={})
     assert trainer._step_save_time >= 0.02
@@ -389,7 +389,7 @@ def test_check_save_checkpoint_keeps_the_save_out_of_the_virtual_clock():
     advance the virtual clock, even though it advances the wall clock."""
     trainer = _make_trainer(first_sample_time=0.0)
     trainer.config = OmegaConf.create({"trainer": {"save_freq": 1, "esi_redundant_time": 0}})
-    trainer._save_checkpoint = lambda: time.sleep(0.1)
+    trainer._save_checkpoint = lambda **_: time.sleep(0.1)
     trainer.current_param_version = 1
 
     start = time.time()
@@ -659,6 +659,85 @@ def test_restore_timing_state_without_the_datetime_keys_keeps_this_process_start
     trainer = _make_trainer(run_start_datetime="2026-08-24T09:00:00+03:00")
     trainer._restore_timing_state(str(tmp_path))
     assert trainer.run_start_datetime == "2026-08-24T09:00:00+03:00"
+
+
+def test_saved_clock_matches_where_the_clock_lands_after_the_save(tmp_path, monkeypatch):
+    """The number written into timing_state.json must not sit ahead of the virtual clock.
+
+    The snapshot is taken when the pipeline freezes and the close-out subtracts the whole
+    frozen window; if the snapshot instead used a timestamp taken AFTER the rollouter pause
+    RPC (as it did), it counted the pause as training time that the close-out then removed -
+    so a later checkpoint could report a smaller cumulative_training_time than an earlier one.
+    """
+    import recipe.fully_async_policy.fully_async_trainer as fat_module
+
+    class _FakeRay:
+        @staticmethod
+        def get(ref):
+            return ref() if callable(ref) else ref
+
+    monkeypatch.setattr(fat_module, "ray", _FakeRay)
+
+    trainer = _make_trainer(first_sample_time=time.time() - 60.0)
+    trainer.current_param_version = 1
+    trainer.use_critic = False
+    trainer.pause_generation_during_save = True
+    trainer.config = OmegaConf.create(
+        {
+            "trainer": {
+                "save_freq": 1,
+                "esi_redundant_time": 0,
+                "default_local_dir": str(tmp_path),
+                "default_hdfs_dir": None,
+                "max_actor_ckpt_to_keep": None,
+                "max_critic_ckpt_to_keep": None,
+            }
+        }
+    )
+    trainer.actor_rollout_wg = SimpleNamespace(save_checkpoint=lambda *a, **kw: None)
+    trainer.param_synchronizer = SimpleNamespace(
+        pause_rollouter_for_save=SimpleNamespace(remote=lambda: lambda: time.sleep(0.05)),
+        resume_rollouter_after_save=SimpleNamespace(remote=lambda: lambda: None),
+        rollouter_save_checkpoint=SimpleNamespace(remote=lambda folder: lambda: os.makedirs(folder, exist_ok=True)),
+    )
+    # a step is open, as it is when _check_save_checkpoint runs inside fit()
+    trainer._step_virtual_start = trainer.virtual_free_time = 20.0
+    trainer._step_actual_start = time.time() - 10.0
+
+    trainer._check_save_checkpoint({})
+    saved = json.loads((tmp_path / "global_step_1" / "timing_state.json").read_text())
+    trainer._advance_virtual_clock()
+
+    landed = trainer.virtual_free_time - trainer.rollouter_first_sample_time
+    assert saved["cumulative_training_time"] <= landed + 1e-6, (
+        f"saved {saved['cumulative_training_time']} is ahead of the clock at {landed}"
+    )
+    # the snapshot deliberately predates the save it is written during, so the pause shows up
+    # in the trainer's running total rather than in the file it just wrote
+    assert saved["cumulative_save_time"] == 0.0
+    assert trainer.cumulative_save_time >= 0.05, "the pause belongs to the save, not to training"
+
+
+def test_virtual_clock_never_runs_backwards(tmp_path):
+    """Closing a step just after a save subtracts the save duration from a window that ends
+    a little later; the total must not dip below where the previous step left it, or a
+    cumulative_training_time series would tick backwards between checkpoints."""
+    trainer = _make_trainer(first_sample_time=100.0)
+    trainer.virtual_free_time = 130.0
+    # a step that, measured naively, would close slightly EARLIER than the previous close
+    trainer._step_virtual_start = 129.0
+    trainer._step_actual_start = 200.0
+    trainer._step_save_time = 5.0
+    trainer._advance_virtual_clock(now=204.0)  # 129 + (204-200) - 5 = 128.0 < 130.0
+    assert trainer.virtual_free_time == 130.0
+
+    # a genuine advance is untouched
+    trainer._step_virtual_start = 130.0
+    trainer._step_actual_start = 300.0
+    trainer._step_save_time = 0.0
+    trainer._step_wait_valid_time = 0.0
+    trainer._advance_virtual_clock(now=310.0)
+    assert trainer.virtual_free_time == 140.0
 
 
 # ------------------------------------------------- virtual (no-validation) clock

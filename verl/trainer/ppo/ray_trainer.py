@@ -259,6 +259,21 @@ def compute_advantage(
     return data
 
 
+def json_default(value):
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except (ValueError, TypeError, RuntimeError):
+            pass
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    if isinstance(value, set | frozenset):
+        return sorted(value)
+    return str(value)
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -448,7 +463,7 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=json_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")

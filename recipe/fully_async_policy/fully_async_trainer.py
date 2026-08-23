@@ -342,24 +342,25 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
             save_time_before = timing_raw.get("save_checkpoint", 0.0)
+            freeze_start = time.time()
             with marked_timer("save_checkpoint", timing_raw, color="green"):
-                self._save_checkpoint()
+                self._save_checkpoint(freeze_start=freeze_start)
                 self.last_ckpt_version = self.current_param_version
             this_save_time = timing_raw.get("save_checkpoint", 0.0) - save_time_before
             self.cumulative_save_time += this_save_time
             self._step_save_time += this_save_time
 
-    def _save_checkpoint(self):
+    def _save_checkpoint(self, freeze_start: float = None):
         if self.pause_generation_during_save:
             ray.get(self.param_synchronizer.pause_rollouter_for_save.remote())
         try:
-            self._save_checkpoint_inner()
+            self._save_checkpoint_inner(freeze_start)
         finally:
             if self.pause_generation_during_save:
                 ray.get(self.param_synchronizer.resume_rollouter_after_save.remote())
 
-    def _save_checkpoint_inner(self):
-        save_start = time.time()
+    def _save_checkpoint_inner(self, freeze_start: float = None):
+        save_start = time.time() if freeze_start is None else freeze_start
         # Warning: Currently, to align the training process and metrics of colocate,
         # we use current_param_version instead of global step.
         # This can be logically aligned with the original self.global_steps of colocate
@@ -639,7 +640,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
     def _advance_virtual_clock(self, now: float = None):
         if self._step_virtual_start is None:
             return
-        self.virtual_free_time = self._virtual_now(time.time() if now is None else now)
+        virtual_now = self._virtual_now(time.time() if now is None else now)
+        if self.virtual_free_time is not None:
+            virtual_now = max(self.virtual_free_time, virtual_now)
+        self.virtual_free_time = virtual_now
         self._step_virtual_start = None
         self._step_actual_start = None
 
