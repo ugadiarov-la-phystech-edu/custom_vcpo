@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=128
+#SBATCH --exclusive
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --output=./slurm/%A_%x.out
+#SBATCH --error=./slurm/%A_%x.err
+#SBATCH --job-name=grpo-novcpo-replay-ess-fsdp2
+
+# openPangu-Embedded-7B variant of
+# grpo_novcpo_8gpu_dapo17k_5+3_resp8k_fsdp2_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh.
+# The arm is UNCHANGED - same replay buffer, ESS brake, seq_adv_post_scale, batch
+# shape, schedule, FSDP2 recipe and validation sets - only the model and what it
+# needs are different. Keep both curves comparable by changing nothing else here.
+#
+# THE MODEL. MODEL_PATH points at a LOCAL, RE-ALIASED checkpoint. openPangu ships as
+# a trust_remote_code PanguEmbeddedForCausalLM whose modeling_openpangu_dense.py
+# imports LossKwargs, removed in transformers >= 4.54 (this env runs 4.57.6), so
+# AutoModelForCausalLM cannot build it; vLLM 0.11.0 has no PanguEmbeddedForCausalLM
+# either. The generated modeling file is a `modular` derivative of Llama whose
+# math-carrying functions are byte-for-byte Llama - the only substantive difference
+# is Pangu folding attention bias into a single `bias` flag - so
+# scripts/realias_openpangu_to_llama.py rewrites config.json to LlamaForCausalLM /
+# model_type=llama with attention_bias=true, mlp_bias=false and no auto_map. Weight
+# names need no remapping; transformers and vLLM then use their native Llama.
+#
+# VERIFIED ON THE REAL CHECKPOINT (CPU probes + a 2-step smoke on remote_smoke,
+# 2026-08-23):
+#   * chat template renders [unused9]系统：[unused10][unused9]用户：...[unused9]助手：
+#     with SLOW THINK AS THE DEFAULT (no /no_think or /auto_think suffix injected),
+#     and add_generation_prompt=True only appends - what the agent loop assumes.
+#   * eos = [unused10] = 45892 < len(tokenizer) = 153376, so verl's vLLM logit mask
+#     (which zeroes logits[..., len(tokenizer):]) cannot make EOS unsamplable. In the
+#     smoke, responses averaged 4309 tokens with clip_ratio 0.0 - the model stops on
+#     its own eos, it does not run to the length cap.
+#   * prompt token lengths under THIS tokenizer: dapo-math-17k 75/135/500,
+#     aime-2024 106/158/261, aime-2025 91/172/795 (min/median/max) - nothing
+#     approaches max_prompt_length=2048, so filter_overlong_prompts drops no rows.
+#   * ANSWER EXTRACTION needs no special handling: math_dapo takes solution_str[-300:]
+#     and the LAST (?i)Answer\s*:\s*(...) match, and a decoy "Answer: 7" inside
+#     [unused16]...[unused17] LOSES to the final "Answer: 42" because the DAPO prompt
+#     puts the answer on the last line. Both validation sets dispatch here
+#     (reward_score/__init__.py: math_dapo plus data_source.startswith("aime")).
+#     THE ONE LIVE RISK: a verbose epilogue AFTER the answer falls outside the
+#     300-char window and scores -1.0 with pred='[INVALID]', same as \boxed{} with no
+#     Answer: line. WATCH THE [INVALID] RATE in the first validation.
+#   * ~8.0B params (34 layers, hidden 4096, FFN 12800, vocab 153376), i.e. the same
+#     shape budget as Qwen3-8B: the ~52-57 GiB trainer peak and the validation gates
+#     below carry over unchanged. hf_model checkpoints are fp32, ~32 GB each at
+#     save_freq=20.
+#
+# FSDP2 PORT of the TRIGGERED ESS-braked replay arm
+# (grpo_novcpo_..._megatron_offload_replay_tau=16_k=64_ess-sqrt_base=auto_trig=0.33333.sh).
+# Every algorithmic knob is identical to the Megatron arm: trainer-side replay
+# buffer (tau=16, eviction k=64, rmb=1, sync after every update, DAPO
+# insertion gate, frozen advantages / behavior log-probs), token-IS 2.0
+# against cached behavior log-probs, ESS brake sqrt/base=auto/trigger=1/3,
+# B=33 prompts x 16 responses, lr 1e-6 constant, 8K responses. Only the
+# training backend changes:
+#   * strategy=fsdp2 on 3 trainer GPUs: params/grads/optimizer fully sharded
+#     over dp=3 -> fp32 masters+moments fit ON GPU (~52-57 GiB total) — NO
+#     CPU offload, NO bf16-master deviation, NO precision-aware workaround.
+#     Higher optimizer fidelity than the Megatron HDO recipe.
+#   * actor.seq_adv_post_scale=True: the dp_actor computes the clipped policy
+#     loss with UNIT advantages and applies each sequence's constant advantage
+#     as a post-clip scale — the exact loss semantics of the Megatron
+#     per-traj path (clip branch selected as if A=1). Without this flag the
+#     FSDP loss would pick the other clip branch for negative advantages and
+#     the arms would not be comparable.
+#   * The ESS brake attaches to the ordinary mini-batch update (dp_actor
+#     port): per-sequence IS ratios vs the cached behavior log-probs, ESS
+#     all-reduced over the world group, LR scaled by sqrt(ess_ratio/base)
+#     below the trigger, staleness/ess metrics identical to the Megatron arm.
+#     (This branch is FSDP2-only: the Megatron per-traj/OPOB machinery and its
+#     update_policy_per_traj / grad_baselining knobs were removed.)
+#   * micro_bsz_per_gpu=1, use_dynamic_bsz=False: not required by the FSDP
+#     path (no per-traj isolation), kept for exact 1/len(minibatch) parity
+#     weighting and closest compute pattern to the Megatron arm. Dynamic bsz
+#     is a later perf knob (parity weighting stays exact under it).
+#   * activation recompute -> model.enable_gradient_checkpointing=True, plus
+#     entropy chunking + checkpointing (dp_actor.yaml defaults them to False).
+#   * grad clipping is actor.grad_clip; the Megatron-only optim.clip_grad was
+#     dropped - dp_actor clips with the ACTOR field and never reads that one.
+# Comparison caveats vs the Megatron arm: numerics are curve-comparable, not
+# step-comparable (different reduction order, fp32 vs bf16 masters);
+# checkpoints are NOT interchangeable between backends.
+# Validation gates (in order): peak trainer memory ~52-57 GiB and no OOM
+# through a param sync (FSDP all-gather spike); auto-base captured on update
+# 1 (replay/ess_base); brake rate ~30% with the bimodal ESS-quotient
+# distribution of the Megatron arm; early val curve ~0.35@20 / ~0.42@40.
+
+# MIN-ESS UPDATE (2026-08-19): this script was converted from the
+# ess-sqrt_base=auto_trig=0.33333 trigger arm when the brake was reformulated
+# — the auto-captured on-policy base was a one-mini-batch lottery draw (CV 63%
+# across seeds on this backend) and is replaced by the backend-independent
+# min-ESS floor rule (see the Min-ESS LR brake section below). Header text
+# below may still describe the old trigger geometry where it narrates past
+# runs; the ESS block and overrides are authoritative.
+
+set -xeuo pipefail
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export RAY_DISABLE_IMPORT_WARNING=1
+export VLLM_USE_V1=1
+export RAY_ADDRESS="local"
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+export WANDB_MODE=disabled
+export VLLM_USE_FLASHINFER_SAMPLER=0
+# Unbuffered worker stdout: Ray block-buffers prints otherwise, lagging the
+# live log by minutes exactly when print volume is lowest (startup/stalls)
+export PYTHONUNBUFFERED=1
+# NOTE: do NOT export PYTORCH_CUDA_ALLOC_CONF=expandable_segments here —
+# vLLM's sleep-mode allocator asserts against it; the trainer-only
+# DetachActorWorker enables it in-process (recipe fsdp_workers.py).
+
+# ================= Paths =================
+# Ray workers deserialize the trust_remote_code tokenizer BY REFERENCE, as
+# transformers_modules.<hash>.tokenization_openpangu.PanguTokenizer. That dynamic
+# package only lands on sys.path in a process that has itself loaded remote code:
+# the driver has (fully_async_main.py builds the tokenizer and passes it to the
+# actors), the actors have not - so FullyAsyncRollouter.__init__ dies unpickling its
+# own constructor arguments with "ModuleNotFoundError: No module named
+# 'transformers_modules'", before any GPU work and with nothing pointing at the
+# tokenizer. Verified on remote_smoke 2026-08-23 (reproduced with a 20-line ray
+# script, fixed by exactly this). Ray workers inherit this environment.
+HF_MODULES_CACHE=${HF_MODULES_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}/modules}
+case ":${PYTHONPATH:-}:" in
+    *":${HF_MODULES_CACHE}:"*) ;;  # already present
+    *) export PYTHONPATH="${HF_MODULES_CACHE}${PYTHONPATH:+:${PYTHONPATH}}" ;;
+esac
+
+# A LOCAL, RE-ALIASED checkpoint, not the hub id - see THE MODEL in the header.
+# Build it with: python scripts/realias_openpangu_to_llama.py --out <MODEL_PATH>
+MODEL_PATH=${MODEL_PATH:-"/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"}
+# Still required after the re-alias: only the MODELING entries left config.json's
+# auto_map, so the TOKENIZER is still PanguTokenizer from tokenization_openpangu.py.
+# The two keys are independent and nothing links them - data.trust_remote_code feeds
+# the dataset-side tokenizer (fully_async_main.py), actor_rollout_ref.model.
+# trust_remote_code feeds HFModelConfig (agent-loop tokenizer, weight load, vLLM).
+trust_remote_code=${trust_remote_code:-True}
+TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
+# Two validation sets, reported separately by data_source:
+#   aime-2024.parquet (data_source=math_dapo) -> val-core/math_dapo/acc/mean@1
+#   aime-2025.parquet (data_source=aime2025_dapo) -> val-core/aime2025_dapo/acc/mean@1
+# aime-2025 is built from MathArena/aime_2025 in the exact aime-2024 format
+# (30 problems x 32 copies, same DAPO prompt template and "Answer:"-line
+# scorer via the aime* dispatch), so both metrics measure the same objective;
+# the distinct data_source stamp keeps the 2025 curve separate.
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+
+project_name='vcpo'
+
+# ================= GPU Layout =================
+NNODES=${NNODES:-1}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+n_gpus_rollout=${n_gpus_rollout:-5}
+n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
+
+# ================= Rollout =================
+rollout_mode="async"
+rollout_name="vllm"
+return_raw_chat="True"
+gen_tp=1
+n_resp_per_prompt=${n_resp_per_prompt:-16}
+# 0.75 here, where the Qwen twin uses 0.8, and it is load-bearing. Two costs stack
+# on the rollout GPUs: the FSDP2 sync-side model is resident before vLLM starts
+# (~11 GB, smoke run 2026-08-17), and this arm broadcasts fp32 weights during
+# sync_rollout_weights (fsdp_config.model_dtype defaults to fp32, which is the
+# arm's exact-numerics recipe) - openPangu's embedding alone is
+# 153376 x 4096 x 4 B = 2.5 GB per rollout GPU, twice the bf16 figure. At 0.8 the
+# first weight sync died on remote_smoke (2026-08-23) with NCCL unable to
+# CUDA-calloc 10 MB for its communicator ("NCCL WARN Cuda failure 'out of memory'"
+# inside collective.broadcast, group_name=actor_rollout). 0.75 ran clean through
+# two steps, two validations and two checkpoints.
+gpu_memory_utilization=${gpu_memory_utilization:-0.75}
+max_num_seqs=512
+enable_chunked_prefill=True
+calculate_log_probs=True
+
+# ================= Sequence Lengths =================
+max_prompt_length=${max_prompt_length:-2048}
+max_response_length=${max_response_length:-8192}
+max_num_batched_tokens=$((max_prompt_length + max_response_length))
+
+# ================= FSDP2 Trainer =================
+# -1 = shard over the whole worker group (trainer: all 3 GPUs — full
+# sharding, same as fsdp_size=3 there). Do NOT set a positive value here: the
+# actor fsdp_config also reaches the 5-GPU ROLLOUT worker group, where
+# world_size=5 is not divisible by 3 — create_device_mesh then builds a 2D
+# mesh covering only 3 of 5 ranks and get_init_weight_context_manager crashes
+# on mesh.get_coordinate()=None (smoke run 2026-08-17).
+fsdp_size=${fsdp_size:--1}
+sp_size=1                                  # no ulysses sequence parallel
+# Both are the engine defaults; stated explicitly so the recipe reads completely and
+# so changing either is a visible edit rather than a silent inherit.
+offload_policy=False                       # FSDP2 CPUOffloadPolicy: everything stays on GPU
+reshard_after_forward=True
+# calculate_entropy=True makes the actor build full-vocab logits intermediates in the
+# training backward; chunking + recompute keep them off the peak. Both default to False
+# in dp_actor.yaml. At 1 sequence per micro-batch the exposure is bounded by
+# max_prompt+max_response (10240), so this is headroom rather than a fix here - but it is
+# free at entropy_coeff=0, and it is what the dynbsz sibling depends on at 20480.
+entropy_from_logits_with_chunking=True
+entropy_checkpointing=True
+use_remove_padding=True
+precision_dtype="bfloat16"
+
+# ================= Batch Sizes =================
+train_prompt_bsz=0
+gen_prompt_bsz=1
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3 (528/3=176)
+micro_bsz_per_gpu=1 # exact parity weighting with the Megatron per-traj arm (not a hard requirement on FSDP)
+use_dynamic_bsz=False
+log_prob_micro_bsz_per_gpu=1
+
+bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}} # Rollout Bsz
+
+# ================= Algorithm =================
+adv_estimator=grpo
+loss_agg_mode="seq-mean-token-mean"
+clip_ratio=0.2
+clip_ratio_low=0.2
+clip_ratio_high=0.2
+clip_ratio_c=3.0
+use_kl_loss=False
+kl_loss_coef=0.0
+use_kl_in_reward=False
+kl_coef=0.0
+entropy_coeff=0
+calculate_entropy=True # log actor/entropy even with entropy_coeff=0
+grad_clip=1.0
+
+# ================= Optimizer =================
+lr=1e-6
+lr_warmup_steps=0
+weight_decay=0.1
+
+# ================= Min-ESS LR brake (dp_actor) =================
+# The ESS brake lives in the standard mini-batch update; seq_adv_post_scale
+# reproduces the Megatron arm's per-traj loss semantics (see header).
+seq_adv_post_scale=True
+ess_enable=${ess_enable:-True}
+# Min-ESS rule (replaces the auto-captured-base + trigger + sqrt logic): a
+# mini-batch whose global ESS carries <= min_ess effective samples steps at
+# lr * ess_lr_scale; above it the update runs at full nominal lr. Equivalent
+# to ess_ratio <= min_ess/B (B = 528 here). The log-space ESS floors ESS at
+# exactly 1, so degenerate (single-dominant-sequence) mini-batches always
+# brake — at ess_lr_scale, never 0. No measured reference, no base capture:
+# the threshold is backend-independent, unlike the auto-base (11x apart
+# between the fsdp2 and Megatron arms for near-identical raw ESS traces).
+min_ess=${min_ess:-1.1}
+ess_lr_scale=${ess_lr_scale:-0.5}
+ess_use_clipped=False # ESS from unclipped ratios (paper): the brake must see what truncation hides
+ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
+
+# ================= IS / Rollout Correction =================
+# Token-level truncated IS with PPO-clip loss against the *cached* behavior
+# log-probs (frozen at insertion). use_policy_gradient=False is the
+# equivalent of loss_type=ppo_clip.
+rollout_is="token"
+rollout_is_threshold="2.0"
+rollout_rs=null
+rollout_rs_threshold=null
+bypass_mode=False
+use_policy_gradient=False
+# Log training/rollout_actor_probs_pearson_corr (exp of policy vs rollout
+# log-probs over response tokens) from the deferred correction path
+log_probs_pearson_corr=${log_probs_pearson_corr:-True}
+
+skip_recompute_old_log_prob=True # REQUIRED by replay mode (cached behavior log-probs)
+compute_prox_log_prob=False
+
+# ================= Async Training =================
+staleness_threshold=${staleness_threshold:-64.0}
+updates_per_param_sync=1     # REQUIRED by replay mode: sync after every update
+num_minibatches_per_update=1 # REQUIRED by replay mode: one mini-batch per update
+partial_rollout=True
+use_rollout_log_probs=True
+
+# ================= Replay buffer =================
+replay_enable=${replay_enable:-True}
+replay_tau=${replay_tau:-16}
+replay_staleness_threshold=${replay_staleness_threshold:-64}
+replay_requires_mini_batches=${replay_requires_mini_batches:-1}
+replay_sampling_seed=${replay_sampling_seed:-1234}
+replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
+
+# ================= Elastic mechanisms OFF / stop-the-world accounting =================
+dynamic_filtering_enable=False
+min_buffered_batches=1.0
+opportunistic_enable=False
+opportunistic_max_extra_epochs=0
+serialize_validation=${serialize_validation:-True}
+pause_generation_during_save=${pause_generation_during_save:-True}
+save_queue_state=False # no queue snapshots in checkpoints: resume is disabled
+
+# ================= Training/Rollout Steps =================
+total_rollout_steps=${total_rollout_steps:-66000}
+epochs=10000000
+test_freq=${test_freq:-20}
+save_freq=${save_freq:-20}
+# Keep EVERY checkpoint (null disables the keep-N pruning) for offline
+# evaluation across training. Checkpoints hold ONLY a ready-to-serve HF
+# model ('hf_model', global_step_N/actor/huggingface — load it directly with
+# vLLM/transformers for eval, no merge step): no optimizer, no sharded
+# weights. hf_model has NO load path in the checkpoint manager, so these
+# checkpoints CANNOT be resumed from — resume_mode=disable below makes that
+# explicit (every launch starts fresh) instead of letting auto-resume
+# silently restore step counters and replay state around base weights.
+# All resume-state persistence is switched off too (pure dead weight under
+# resume_mode=disable): replay_buffer.save_state=False drops replay_buffer.pt
+# (~7-12 GB) and save_queue_state=False drops the queue snapshots (and skips
+# the generation pause the queue snapshot needs). Per checkpoint only the
+# ~16 GB bf16 hf model, the tiny data.pt and timing_state.json are written.
+max_actor_ckpt_to_keep=null
+ckpt_save_contents="['hf_model']"
+resume_mode=disable
+
+# ================= Logging =================
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} fsdp2-noofl B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name_safe=${exp_name//\//_}
+log_dir="logs/${exp_name_safe}"
+CKPTS_DIR="${log_dir}"
+mkdir -p -- "${log_dir}"
+export TENSORBOARD_DIR="${log_dir}/tensorboard"
+
+trainer_logger="['console','tensorboard']"
+log_val_generations=0
+val_before_train=${val_before_train:-True}
+
+# ================= Run =================
+python -m recipe.fully_async_policy.fully_async_main \
+    data.train_files="${TRAIN_FILE}" \
+    data.val_files="${TEST_FILE}" \
+    data.prompt_key=prompt \
+    data.truncation='left' \
+    data.max_prompt_length=${max_prompt_length} \
+    data.max_response_length=${max_response_length} \
+    data.train_batch_size=${train_prompt_bsz} \
+    data.gen_batch_size=${gen_prompt_bsz} \
+    data.return_raw_chat=${return_raw_chat} \
+    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts_workers=8 \
+    actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
+    algorithm.adv_estimator=${adv_estimator} \
+    algorithm.use_kl_in_reward=${use_kl_in_reward} \
+    algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
+    algorithm.rollout_correction.rollout_rs=${rollout_rs} \
+    algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold} \
+    algorithm.rollout_correction.bypass_mode=${bypass_mode} \
+    algorithm.rollout_correction.use_policy_gradient=${use_policy_gradient} \
+    algorithm.rollout_correction.log_probs_pearson_corr=${log_probs_pearson_corr} \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    critic.strategy=fsdp2 \
+    actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
+    actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
+    actor_rollout_ref.actor.clip_ratio=${clip_ratio} \
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
+    actor_rollout_ref.actor.clip_ratio_c=${clip_ratio_c} \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.trust_remote_code=${trust_remote_code} \
+    data.trust_remote_code=${trust_remote_code} \
+    actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.hybrid_engine=False \
+    actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
+    actor_rollout_ref.actor.grad_clip=${grad_clip} \
+    actor_rollout_ref.actor.seq_adv_post_scale=${seq_adv_post_scale} \
+    actor_rollout_ref.actor.ess_scaling.enable=${ess_enable} \
+    actor_rollout_ref.actor.ess_scaling.min_ess=${min_ess} \
+    actor_rollout_ref.actor.ess_scaling.lr_scale=${ess_lr_scale} \
+    actor_rollout_ref.actor.ess_scaling.use_clipped=${ess_use_clipped} \
+    actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=${offload_policy} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.reshard_after_forward=${reshard_after_forward} \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
+    actor_rollout_ref.actor.optim.lr=${lr} \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=${lr_warmup_steps} \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
+    actor_rollout_ref.actor.optim.weight_decay=${weight_decay} \
+    actor_rollout_ref.actor.entropy_from_logits_with_chunking=${entropy_from_logits_with_chunking} \
+    actor_rollout_ref.actor.entropy_checkpointing=${entropy_checkpointing} \
+    actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
+    actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
+    actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+    actor_rollout_ref.actor.use_rollout_log_probs=${use_rollout_log_probs} \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
+    actor_rollout_ref.rollout.name=${rollout_name} \
+    actor_rollout_ref.rollout.mode=${rollout_mode} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
+    actor_rollout_ref.rollout.max_num_seqs=${max_num_seqs} \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
+    actor_rollout_ref.rollout.dtype=${precision_dtype} \
+    actor_rollout_ref.rollout.enable_chunked_prefill=${enable_chunked_prefill} \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
+    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.rollout.top_k=-1 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.8 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
+    actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.n=${val_n:-1} \
+    actor_rollout_ref.rollout.calculate_log_probs=${calculate_log_probs} \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
+    trainer.logger=${trainer_logger} \
+    trainer.project_name="${project_name}" \
+    trainer.experiment_name="${exp_name}" \
+    trainer.val_before_train=${val_before_train} \
+    trainer.save_freq=${save_freq} \
+    trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
+    "actor_rollout_ref.actor.checkpoint.save_contents=${ckpt_save_contents}" \
+    trainer.resume_mode=${resume_mode} \
+    trainer.rollout_data_dir="${log_dir}" \
+    trainer.log_val_generations=${log_val_generations} \
+    trainer.default_local_dir="${CKPTS_DIR}" \
+    trainer.nnodes="${NNODES}" \
+    trainer.n_gpus_per_node="${n_gpus_training}" \
+    rollout.nnodes="${NNODES}" \
+    rollout.n_gpus_per_node="${n_gpus_rollout}" \
+    rollout.total_rollout_steps="${total_rollout_steps}" \
+    rollout.total_epochs="${epochs}" \
+    rollout.test_freq="${test_freq}" \
+    async_training.staleness_threshold="${staleness_threshold}" \
+    async_training.trigger_parameter_sync_step="${updates_per_param_sync}" \
+    async_training.require_batches="${num_minibatches_per_update}" \
+    async_training.partial_rollout="${partial_rollout}" \
+    async_training.compute_prox_log_prob="${compute_prox_log_prob}" \
+    async_training.use_rollout_log_probs="${use_rollout_log_probs}" \
+    async_training.skip_recompute_old_log_prob="${skip_recompute_old_log_prob}" \
+    async_training.dynamic_filtering.enable="${dynamic_filtering_enable}" \
+    async_training.dynamic_filtering.min_buffered_batches="${min_buffered_batches}" \
+    async_training.opportunistic_epochs.enable="${opportunistic_enable}" \
+    async_training.opportunistic_epochs.max_extra_epochs="${opportunistic_max_extra_epochs}" \
+    async_training.ppo_epochs=null \
+    async_training.serialize_validation="${serialize_validation}" \
+    async_training.pause_generation_during_save="${pause_generation_during_save}" \
+    async_training.save_queue_state="${save_queue_state}" \
+    async_training.replay_buffer.enable="${replay_enable}" \
+    async_training.replay_buffer.tau="${replay_tau}" \
+    async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \
+    async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
+    async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
+    async_training.replay_buffer.save_state="${replay_save_state}" \
+    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
