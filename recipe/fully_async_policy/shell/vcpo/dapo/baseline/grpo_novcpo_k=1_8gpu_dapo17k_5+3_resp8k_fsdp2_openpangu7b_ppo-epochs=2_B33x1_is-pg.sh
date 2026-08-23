@@ -20,6 +20,12 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 
 export PYTHONUNBUFFERED=1
 
+HF_MODULES_CACHE=${HF_MODULES_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}/modules}
+case ":${PYTHONPATH:-}:" in
+    *":${HF_MODULES_CACHE}:"*) ;;
+    *) export PYTHONPATH="${HF_MODULES_CACHE}${PYTHONPATH:+:${PYTHONPATH}}" ;;
+esac
+
 MODEL_PATH=${MODEL_PATH:-"/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"}
 trust_remote_code=${trust_remote_code:-True}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}

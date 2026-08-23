@@ -156,6 +156,45 @@ class TestOpenPanguCheckpointContract(unittest.TestCase):
                 self.tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False),
             )
 
+    # ---------------------------------------------------------------- ray transport
+
+    def test_ray_actors_can_receive_the_tokenizer(self):
+        """The failure that killed the first smoke run, both directions.
+
+        Ray pickles this tokenizer BY REFERENCE (transformers_modules.<hash>....PanguTokenizer);
+        that dynamic package is only importable in a process that has loaded remote code, so an
+        actor dies while unpickling its own constructor arguments unless HF_MODULES_CACHE is on
+        PYTHONPATH - which is exactly what the openPangu scripts export.
+        """
+        import subprocess
+        import sys
+
+        from transformers.utils import HF_MODULES_CACHE
+
+        program = (
+            "import ray\n"
+            "from transformers import AutoTokenizer\n"
+            "@ray.remote(num_cpus=1)\n"
+            "class C:\n"
+            "    def __init__(self, tok): self.n = type(tok).__name__\n"
+            "    def n_(self): return self.n\n"
+            "ray.init(address='local', num_cpus=2, include_dashboard=False, log_to_driver=False)\n"
+            f"tok = AutoTokenizer.from_pretrained({MODEL_PATH!r}, trust_remote_code=True)\n"
+            "print('GOT', ray.get(C.remote(tok).n_.remote()))\n"
+            "ray.shutdown()\n"
+        )
+
+        def run(pythonpath):
+            env = dict(os.environ, PYTHONPATH=pythonpath)
+            return subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, env=env, timeout=900)
+
+        without = run("")
+        self.assertNotIn("GOT PanguTokenizer", without.stdout, "expected the actor to die without the fix")
+        self.assertIn("transformers_modules", without.stdout + without.stderr)
+
+        with_fix = run(HF_MODULES_CACHE)
+        self.assertIn("GOT PanguTokenizer", with_fix.stdout, with_fix.stderr[-400:])
+
     # ---------------------------------------------------------------- the datasets
 
     def test_every_prompt_fits_under_max_prompt_length(self):
