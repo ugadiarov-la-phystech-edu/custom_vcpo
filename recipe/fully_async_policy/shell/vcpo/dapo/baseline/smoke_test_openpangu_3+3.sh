@@ -56,6 +56,20 @@ cd -- "${REPO_ROOT}"
 ARM_SCRIPT=${ARM_SCRIPT:-"${HERE}/grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_fsdp2_openpangu7b_ppo-epochs=2_B33x1_is-pg.sh"}
 [[ -f "${ARM_SCRIPT}" ]] || { echo "no such arm script: ${ARM_SCRIPT}" >&2; exit 2; }
 
+# Ray workers deserialize the trust_remote_code tokenizer BY REFERENCE, as
+# transformers_modules.<hash>.tokenization_openpangu.PanguTokenizer. That dynamic package
+# only lands on sys.path in a process that has itself loaded remote code: the driver has,
+# the actors have not, so FullyAsyncRollouter.__init__ dies unpickling its own constructor
+# arguments with "ModuleNotFoundError: No module named 'transformers_modules'" - before any
+# GPU work, and with no hint that the tokenizer is at fault (verified on remote_smoke,
+# 2026-08-23; reproduced with a 20-line ray script and fixed by exactly this line). Ray
+# workers inherit this environment, which makes the reference resolvable everywhere.
+HF_MODULES_CACHE=${HF_MODULES_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}/modules}
+case ":${PYTHONPATH:-}:" in
+    *":${HF_MODULES_CACHE}:"*) ;;  # already there (e.g. the wrapper set it)
+    *) export PYTHONPATH="${HF_MODULES_CACHE}${PYTHONPATH:+:${PYTHONPATH}}" ;;
+esac
+
 MODEL_PATH=${MODEL_PATH:-"/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
 # AIME-2024 only, as a single-element list: the arm validates on 2024+2025 by default.

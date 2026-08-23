@@ -181,6 +181,20 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 export PYTHONUNBUFFERED=1
 
 # ================= Paths =================
+# Ray workers deserialize the trust_remote_code tokenizer BY REFERENCE, as
+# transformers_modules.<hash>.tokenization_openpangu.PanguTokenizer. That dynamic package
+# only lands on sys.path in a process that has itself loaded remote code: the driver has,
+# the actors have not, so FullyAsyncRollouter.__init__ dies unpickling its own constructor
+# arguments with "ModuleNotFoundError: No module named 'transformers_modules'" - before any
+# GPU work, and with no hint that the tokenizer is at fault (verified on remote_smoke,
+# 2026-08-23; reproduced with a 20-line ray script and fixed by exactly this line). Ray
+# workers inherit this environment, which makes the reference resolvable everywhere.
+HF_MODULES_CACHE=${HF_MODULES_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}/modules}
+case ":${PYTHONPATH:-}:" in
+    *":${HF_MODULES_CACHE}:"*) ;;  # already there (e.g. the wrapper set it)
+    *) export PYTHONPATH="${HF_MODULES_CACHE}${PYTHONPATH:+:${PYTHONPATH}}" ;;
+esac
+
 # A LOCAL, RE-ALIASED copy - not the hub id. See THE MODEL in the header and
 # scripts/realias_openpangu_to_llama.py.
 MODEL_PATH=${MODEL_PATH:-"/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"}

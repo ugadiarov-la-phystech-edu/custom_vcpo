@@ -203,6 +203,47 @@ class TestOpenPanguSmoke3plus3(unittest.TestCase):
         self.assertIn("openPangu", self.cfg.actor_rollout_ref.model.path)
 
 
+class TestOpenPanguScriptsExportTheHfModulesCache(unittest.TestCase):
+    """Both openPangu scripts must put HF_MODULES_CACHE on PYTHONPATH before launching.
+
+    Ray serializes the trust_remote_code tokenizer BY REFERENCE
+    (transformers_modules.<hash>.tokenization_openpangu.PanguTokenizer) into the rollouter actor's
+    constructor arguments. That dynamic package is only on sys.path in a process that has itself
+    loaded remote code - the driver, not the actors - so without this the run dies at actor creation
+    with "ModuleNotFoundError: No module named 'transformers_modules'", before touching a GPU and
+    with nothing in the message pointing at the tokenizer. Cost one dead run on remote_smoke.
+
+    Asserted on the script text because the export is an environment effect: it is invisible to
+    hydra composition. The mechanism itself is covered by
+    tests/models/test_openpangu_tokenizer_contract_on_cpu.py.
+    """
+
+    def _read(self, name):
+        path = os.path.join(BASELINE, name)
+        if not os.path.exists(path):
+            self.skipTest(f"{name} not found")
+        with open(path) as f:
+            return f.read()
+
+    def test_both_scripts_prepend_the_hf_modules_cache(self):
+        for name in (OPENPANGU, SMOKE_3P3):
+            with self.subTest(script=name):
+                text = self._read(name)
+                self.assertIn("HF_MODULES_CACHE", text)
+                self.assertIn('export PYTHONPATH="${HF_MODULES_CACHE}', text)
+
+    def test_the_export_is_idempotent_and_survives_an_empty_pythonpath(self):
+        """Two guards worth having: the wrapper runs the arm, so the block runs twice, and an
+        unset PYTHONPATH must not become a bare ':' (which would put the CWD on sys.path)."""
+        text = self._read(OPENPANGU)
+        self.assertIn('case ":${PYTHONPATH:-}:" in', text, "the block must skip when already present")
+        self.assertIn("${PYTHONPATH:+:${PYTHONPATH}}", text, "must not emit a trailing colon")
+
+    def test_qwen_arms_do_not_need_it(self):
+        """Native architectures load no remote code, so nothing references transformers_modules."""
+        self.assertNotIn("HF_MODULES_CACHE", self._read(QWEN_FSDP2))
+
+
 class TestQwenArmNeedsNoRemoteCode(unittest.TestCase):
     """The converse, so the invariant is about custom-code models rather than about one script."""
 
