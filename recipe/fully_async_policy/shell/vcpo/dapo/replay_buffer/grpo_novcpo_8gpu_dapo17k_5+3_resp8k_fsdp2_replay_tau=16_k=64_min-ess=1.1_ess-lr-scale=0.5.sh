@@ -36,7 +36,10 @@
 #     path (no per-traj isolation), kept for exact 1/len(minibatch) parity
 #     weighting and closest compute pattern to the Megatron arm. Dynamic bsz
 #     is a later perf knob (parity weighting stays exact under it).
-#   * activation recompute -> model.enable_gradient_checkpointing=True.
+#   * activation recompute -> model.enable_gradient_checkpointing=True, plus
+#     entropy chunking + checkpointing (dp_actor.yaml defaults them to False).
+#   * grad clipping is actor.grad_clip; the Megatron-only optim.clip_grad was
+#     dropped - dp_actor clips with the ACTOR field and never reads that one.
 # Comparison caveats vs the Megatron arm: numerics are curve-comparable, not
 # step-comparable (different reduction order, fp32 vs bf16 masters);
 # checkpoints are NOT interchangeable between backends.
@@ -118,6 +121,17 @@ max_num_batched_tokens=$((max_prompt_length + max_response_length))
 # on mesh.get_coordinate()=None (smoke run 2026-08-17).
 fsdp_size=${fsdp_size:--1}
 sp_size=1                                  # no ulysses sequence parallel
+# Both are the engine defaults; stated explicitly so the recipe reads completely and
+# so changing either is a visible edit rather than a silent inherit.
+offload_policy=False                       # FSDP2 CPUOffloadPolicy: everything stays on GPU
+reshard_after_forward=True
+# calculate_entropy=True makes the actor build full-vocab logits intermediates in the
+# training backward; chunking + recompute keep them off the peak. Both default to False
+# in dp_actor.yaml. At 1 sequence per micro-batch the exposure is bounded by
+# max_prompt+max_response (10240), so this is headroom rather than a fix here - but it is
+# free at entropy_coeff=0, and it is what the dynbsz sibling depends on at 20480.
+entropy_from_logits_with_chunking=True
+entropy_checkpointing=True
 use_remove_padding=True
 precision_dtype="bfloat16"
 
@@ -289,15 +303,19 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ess_scaling.min_ess=${min_ess} \
     actor_rollout_ref.actor.ess_scaling.lr_scale=${ess_lr_scale} \
     actor_rollout_ref.actor.ess_scaling.use_clipped=${ess_use_clipped} \
+    actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=${offload_policy} \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.reshard_after_forward=${reshard_after_forward} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.optim.lr=${lr} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=${lr_warmup_steps} \
     actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
     actor_rollout_ref.actor.optim.weight_decay=${weight_decay} \
-    actor_rollout_ref.actor.optim.clip_grad=${grad_clip} \
+    actor_rollout_ref.actor.entropy_from_logits_with_chunking=${entropy_from_logits_with_chunking} \
+    actor_rollout_ref.actor.entropy_checkpointing=${entropy_checkpointing} \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
