@@ -69,7 +69,7 @@ kl_loss_coef=0.0
 use_kl_in_reward=False
 kl_coef=0.0
 entropy_coeff=${entropy_coeff:-0}
-calculate_entropy=True
+calculate_entropy=False
 grad_clip=1.0
 
 lr=${lr:-1e-6}
@@ -80,17 +80,16 @@ rollout_is="token"
 rollout_is_threshold="2.0"
 rollout_rs=null
 rollout_rs_threshold=null
-bypass_mode=True
-use_policy_gradient=True
-policy_loss_mode="rollout_correction"
+bypass_mode=False
+use_policy_gradient=False
 
 compute_prox_log_prob=False
 
-staleness_threshold=${staleness_threshold:-2.0}
+staleness_threshold=${staleness_threshold:-1.0}
 updates_per_param_sync=1
 num_minibatches_per_update=1
 partial_rollout=True
-use_rollout_log_probs=True
+use_rollout_log_probs=False
 
 ppo_epochs=${ppo_epochs:-2}
 
@@ -105,7 +104,7 @@ save_contents=${save_contents:-"['hf_model']"}
 max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null}
 resume_mode=${resume_mode:-disable}
 
-exp_name=${exp_name:-"GRPO-noVCPO is-pg k-${staleness_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO decoupled k-${staleness_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -157,8 +156,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
     actor_rollout_ref.actor.ppo_epochs=${ppo_epochs} \
-    actor_rollout_ref.actor.policy_loss.loss_mode=${policy_loss_mode} \
-    "+actor_rollout_ref.actor.policy_loss.rollout_correction={rollout_is:${rollout_is},rollout_is_threshold:${rollout_is_threshold},rollout_rs:${rollout_rs},rollout_rs_threshold:${rollout_rs_threshold}}" \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \

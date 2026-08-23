@@ -6,7 +6,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${HERE}/../../../../../.." && pwd)"
 cd -- "${REPO_ROOT}"
 
-ARM_SCRIPT=${ARM_SCRIPT:-"${HERE}/grpo_novcpo_k=2_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh"}
+ARM_SCRIPT=${ARM_SCRIPT:-"${HERE}/grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh"}
 [[ -f "${ARM_SCRIPT}" ]] || { echo "no such arm script: ${ARM_SCRIPT}" >&2; exit 2; }
 arm_tag=$(basename -- "${ARM_SCRIPT}" .sh)
 arm_tag=${arm_tag//[^A-Za-z0-9-]/-}
