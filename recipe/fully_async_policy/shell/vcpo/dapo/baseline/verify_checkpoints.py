@@ -132,7 +132,10 @@ def verify_checkpoint(step_dir, report, base_state=None):
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(hf_dir)
+        # trust_remote_code: openPangu keeps a custom tokenizer class after the config re-alias
+        # (tokenizer_config.json carries its own auto_map), and save_pretrained copies the module
+        # into the checkpoint - without the flag this fails on a perfectly good checkpoint.
+        tokenizer = AutoTokenizer.from_pretrained(hf_dir, trust_remote_code=True)
         report.check(tokenizer.vocab_size > 0, f"{name}: AutoTokenizer.from_pretrained works")
     except Exception as exc:  # noqa: BLE001
         report.check(False, f"{name}: AutoTokenizer.from_pretrained failed: {exc}")
