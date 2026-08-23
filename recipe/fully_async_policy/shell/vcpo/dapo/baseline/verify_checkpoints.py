@@ -62,7 +62,7 @@ def _first_tensor(hf_dir, key):
     return None
 
 
-def verify_checkpoint(step_dir, report, base_state=None):
+def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
     name = os.path.basename(step_dir)
     hf_dir = os.path.join(step_dir, "actor", "huggingface")
 
@@ -90,7 +90,9 @@ def verify_checkpoint(step_dir, report, base_state=None):
     state, shards = _safetensors_state(hf_dir)
     report.check(bool(state), f"{name}: safetensors readable ({len(state)} tensors in {len(shards)} shard(s))")
     dtypes = {dtype for dtype, _ in state.values()}
-    report.check(dtypes == {"BF16"}, f"{name}: all tensors bf16 (found {sorted(dtypes)})")
+    report.check(len(dtypes) == 1, f"{name}: one dtype across all tensors (found {sorted(dtypes)})")
+    if expect_dtype:
+        report.check(dtypes == {expect_dtype}, f"{name}: all tensors {expect_dtype} (found {sorted(dtypes)})")
     if len(shards) > 1:
         report.check("model.safetensors.index.json" in files, f"{name}: sharded weights have an index")
 
@@ -138,6 +140,12 @@ def main():
     parser.add_argument("ckpt_dir", help="trainer.default_local_dir of the run")
     parser.add_argument("--expect", type=int, default=None, help="expected number of checkpoints")
     parser.add_argument("--base-model", default=None, help="base model to compare parameter names/shapes against")
+    parser.add_argument(
+        "--dtype",
+        default="BF16",
+        help="expected weight dtype: BF16 (megatron / bf16 FSDP arms), F32 (FSDP at model_dtype=fp32), "
+        'or "any" to only require that one dtype is used throughout',
+    )
     args = parser.parse_args()
 
     report = Report()
@@ -162,7 +170,12 @@ def main():
 
     timings = []
     for step in steps:
-        timing = verify_checkpoint(os.path.join(args.ckpt_dir, step), report, base_state=base_state)
+        timing = verify_checkpoint(
+            os.path.join(args.ckpt_dir, step),
+            report,
+            base_state=base_state,
+            expect_dtype=None if args.dtype.lower() == "any" else args.dtype.upper(),
+        )
         timings.append((step, timing))
 
     complete = [(s, t) for s, t in timings if t]
