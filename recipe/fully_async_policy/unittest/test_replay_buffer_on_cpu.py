@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Unit tests for the replay-buffer training mode:
-- ReplayBuffer: score formula, add/evict/rescore, is_new lifecycle, mini-batch
-  composition (all-unseen-oldest-first priority + score-weighted fill),
+- ReplayBuffer: score formula, add/evict/rescore, one-shot freshness, mini-batch
+  composition (one-shot fresh priority, newest first + score-weighted fill),
   checkpoint round-trip incl. RNG state
 - Rollouter insertion gate: frozen GRPO advantages match
   compute_grpo_outcome_advantage, group_version stamping, all-correct /
@@ -26,7 +26,6 @@ Run: pytest recipe/fully_async_policy/unittest/test_replay_buffer_on_cpu.py
 """
 
 import asyncio
-import math
 import time
 from types import SimpleNamespace
 
@@ -78,30 +77,42 @@ def test_add_stamps_entry_fields():
     buf = _make_buffer(tau=4.0)
     e0 = buf.add(_sample(group_version=6), current_version=10)
     e1 = buf.add(_sample(group_version=10), current_version=10)
-    assert e0.is_new and e1.is_new
+    assert e0.times_trained == 0 and e1.times_trained == 0
     assert (e0.insert_seq, e1.insert_seq) == (0, 1)
     assert e0.group_version == 6
     assert e0.score == pytest.approx(staleness_score(4, 4.0))
     assert e1.score == pytest.approx(1.0)
     assert buf.total_added == 2
-    assert buf.size() == 2 and buf.new_count() == 2
+    assert buf.size() == 2 and buf.untrained_count() == 2
+    assert buf.pending_fresh == [e0, e1]
 
 
-# ---------------------------------------------------------------- evict / rescore / mark_used
+# ---------------------------------------------------------------- evict / rescore / mark_trained
 
 
 def test_evict_boundary_and_unseen_counting():
     buf = _make_buffer(staleness_threshold=2)
     at_threshold = buf.add(_sample(group_version=8), current_version=8)  # staleness 2 at v=10
-    over_used = buf.add(_sample(group_version=7), current_version=8)  # staleness 3 at v=10
-    buf.add(_sample(group_version=6), current_version=8)  # over_new: staleness 4 at v=10
+    over_trained = buf.add(_sample(group_version=7), current_version=8)  # staleness 3 at v=10
+    buf.add(_sample(group_version=6), current_version=8)  # over_untrained: staleness 4 at v=10
     fresh = buf.add(_sample(group_version=10), current_version=10)
-    buf.mark_used([over_used])
+    buf.mark_trained([over_trained])
     evicted, evicted_unseen = buf.evict(current_version=10)
-    assert (evicted, evicted_unseen) == (2, 1)  # over_used + over_new; only over_new unseen
+    assert (evicted, evicted_unseen) == (2, 1)  # over_trained + over_untrained; only the latter unseen
     remaining = {e.insert_seq for e in buf.entries}
     assert remaining == {at_threshold.insert_seq, fresh.insert_seq}
     assert buf.evicted_total == 2 and buf.evicted_unseen_total == 1
+
+
+def test_evict_purges_pending_fresh():
+    buf = _make_buffer(staleness_threshold=2)
+    stale_pending = buf.add(_sample(group_version=0), current_version=0)  # staleness 10 at v=10
+    kept_pending = buf.add(_sample(group_version=10), current_version=10)
+    buf.evict(current_version=10)
+    assert buf.pending_fresh == [kept_pending]
+    assert stale_pending not in buf.entries
+    selected, info = buf.compose_minibatch(1, current_version=10)
+    assert selected == [kept_pending] and info["n_new"] == 1
 
 
 def test_recompute_scores_tracks_current_version():
@@ -114,42 +125,87 @@ def test_recompute_scores_tracks_current_version():
     assert entry.score == pytest.approx(0.25)
 
 
-def test_mark_used_flips_is_new_but_keeps_entry():
+def test_mark_trained_increments_and_keeps_entry():
     buf = _make_buffer()
     entry = buf.add(_sample(), current_version=0)
-    buf.mark_used([entry])
-    assert not entry.is_new
-    assert buf.size() == 1 and buf.new_count() == 0
+    buf.mark_trained([entry])
+    buf.mark_trained([entry])
+    assert entry.times_trained == 2
+    assert buf.size() == 1 and buf.untrained_count() == 0
 
 
 # ---------------------------------------------------------------- composition
 
 
-def test_compose_all_new_priority_oldest_inserted_first():
+def test_compose_fresh_priority_newest_arrived_first():
     buf = _make_buffer()
     entries = [buf.add(_sample(group_version=i), current_version=5) for i in range(5)]
     selected, info = buf.compose_minibatch(3, current_version=5)
-    assert [e.insert_seq for e in selected] == [0, 1, 2]
+    assert [e.insert_seq for e in selected] == [4, 3, 2]
     assert info["n_new"] == 3 and info["n_replayed"] == 0
-    assert info["staleness"] == [e.staleness(5) for e in entries[:3]]
+    assert info["staleness"] == [e.staleness(5) for e in entries[4:1:-1]]
+    # freshness is one-shot: the pending list is cleared wholesale
+    assert buf.pending_fresh == []
 
 
-def test_compose_fills_with_used_groups_without_duplicates():
+def test_compose_fresh_overflow_goes_to_replay_pool():
     buf = _make_buffer()
-    used = [buf.add(_sample(group_version=0), current_version=0) for _ in range(4)]
-    buf.mark_used(used)
+    entries = [buf.add(_sample(group_version=5), current_version=5) for _ in range(7)]
+    selected, info = buf.compose_minibatch(5, current_version=5)
+    # the 5 newest-arrived fresh groups fill the mini-batch...
+    assert selected == entries[:1:-1] and info["n_new"] == 5
+    # ...the overflow (the window's 2 earliest arrivals) stays buffered as
+    # plain replay candidates
+    assert buf.pending_fresh == []
+    assert entries[0] in buf.entries and entries[1] in buf.entries
+    # next composition with no new arrivals is pure replay
+    selected2, info2 = buf.compose_minibatch(5, current_version=5)
+    assert info2["n_new"] == 0 and info2["n_replayed"] == 5
+
+
+def test_freshness_is_one_shot():
+    buf = _make_buffer(tau=1.0, staleness_threshold=100)
+    weak_overflow = buf.add(_sample(group_version=0), current_version=10)  # score 2^-10
+    strong = buf.add(_sample(group_version=10), current_version=10)  # score 1
+    selected, info = buf.compose_minibatch(1, current_version=10)
+    # weak_overflow (the earlier arrival) is fresh overflow: unselected,
+    # never trained, freshness spent
+    assert selected == [strong] and info["n_new"] == 1
+    picks = 0
+    for trial in range(100):
+        buf.rng = np.random.default_rng(trial)
+        fresh = buf.add(_sample(group_version=10), current_version=10)
+        selected, info = buf.compose_minibatch(2, current_version=10)
+        # only this round's arrival counts as fresh...
+        assert info["n_new"] == 1 and selected[0] is fresh
+        picks += int(weak_overflow in selected)
+        buf.entries.remove(fresh)
+    # ...and the never-trained overflow holds no priority: it competes on its
+    # ~2^-10 weight against strong's 1.0 (the old is_new rule would have
+    # selected it deterministically every round)
+    assert weak_overflow.times_trained == 0
+    assert picks < 10
+
+
+def test_compose_mixes_fresh_and_weighted_replay_without_duplicates():
+    buf = _make_buffer()
+    old_entries = [buf.add(_sample(group_version=0), current_version=0) for _ in range(4)]
+    buf.compose_minibatch(4, current_version=0)  # consume their freshness
+    buf.mark_trained(old_entries)
     new = [buf.add(_sample(group_version=3), current_version=3) for _ in range(2)]
     selected, info = buf.compose_minibatch(4, current_version=3)
     assert info["n_new"] == 2 and info["n_replayed"] == 2
-    assert selected[:2] == new
+    assert selected[:2] == new[::-1]  # fresh-first, newest-arrived first
     assert len({id(e) for e in selected}) == 4  # no duplicates
-    assert all(not e.is_new for e in selected[2:])
+    assert all(e in old_entries for e in selected[2:])
 
 
 def test_compose_pure_replay_when_no_new_groups():
     buf = _make_buffer()
-    used = [buf.add(_sample(), current_version=0) for _ in range(3)]
-    buf.mark_used(used)
+    buf.add(_sample(), current_version=0)
+    buf.add(_sample(), current_version=0)
+    buf.add(_sample(), current_version=0)
+    buf.compose_minibatch(3, current_version=0)  # consume freshness
     selected, info = buf.compose_minibatch(2, current_version=0)
     assert info["n_new"] == 0 and info["n_replayed"] == 2
     assert len({id(e) for e in selected}) == 2
@@ -159,7 +215,8 @@ def test_compose_is_seed_deterministic():
     def build():
         buf = _make_buffer(seed=42)
         used = [buf.add(_sample(group_version=i), current_version=6) for i in range(6)]
-        buf.mark_used(used)
+        buf.compose_minibatch(6, current_version=6)  # consume freshness
+        buf.mark_trained(used)
         return buf
 
     sel_a, _ = build().compose_minibatch(3, current_version=6)
@@ -171,9 +228,10 @@ def test_compose_sampling_prefers_high_scores():
     picks = {0: 0, 1: 0}
     for trial in range(200):
         buf = _make_buffer(tau=1.0, staleness_threshold=100, seed=trial)
-        fresh = buf.add(_sample(group_version=10), current_version=10)  # staleness 0, score 1
+        recent = buf.add(_sample(group_version=10), current_version=10)  # staleness 0, score 1
         stale = buf.add(_sample(group_version=0), current_version=10)  # staleness 10, score 2^-10
-        buf.mark_used([fresh, stale])
+        buf.compose_minibatch(2, current_version=10)  # consume freshness
+        buf.mark_trained([recent, stale])
         selected, _ = buf.compose_minibatch(1, current_version=10)
         picks[selected[0].insert_seq] += 1
     assert picks[0] > 190  # ~1000:1 odds per draw
@@ -182,7 +240,8 @@ def test_compose_sampling_prefers_high_scores():
 def test_compose_uniform_fallback_when_scores_underflow():
     buf = _make_buffer(tau=1.0, staleness_threshold=10**6)
     used = [buf.add(_sample(group_version=0), current_version=0) for _ in range(3)]
-    buf.mark_used(used)
+    buf.compose_minibatch(3, current_version=0)  # consume freshness
+    buf.mark_trained(used)
     buf.recompute_scores(current_version=5000)  # 2^-5000 underflows to 0.0
     assert all(e.score == 0.0 for e in buf.entries)
     selected, info = buf.compose_minibatch(2, current_version=5000)
@@ -196,39 +255,54 @@ def test_compose_raises_below_mini_size():
         buf.compose_minibatch(2, current_version=0)
 
 
-def test_take_oldest_new_order_and_underflow():
-    buf = _make_buffer()
-    first = buf.add(_sample(), current_version=0)
-    used = buf.add(_sample(), current_version=0)
-    buf.mark_used([used])
-    second = buf.add(_sample(), current_version=0)
-    assert buf.take_oldest_new(2) == [first, second]
-    with pytest.raises(ValueError):
-        buf.take_oldest_new(3)
-
-
 # ---------------------------------------------------------------- checkpoint round-trip
 
 
 def test_state_dict_roundtrip_restores_entries_counters_and_rng():
     buf = _make_buffer(seed=7)
-    used = [buf.add(_sample(group_version=i), current_version=8) for i in range(8)]
-    buf.mark_used(used[:6])
+    entries = [buf.add(_sample(group_version=i), current_version=8) for i in range(8)]
+    buf.compose_minibatch(6, current_version=8)  # 6 fresh consumed, 2 overflow
+    buf.mark_trained(entries[:6])
+    buf.add(_sample(group_version=8), current_version=8)  # pending at save time
     buf.evict(current_version=8)
     state = ray.cloudpickle.loads(ray.cloudpickle.dumps(buf.state_dict()))
 
     restored = _make_buffer(seed=999)  # seed overwritten by the restored RNG state
     restored.load_state_dict(state)
     assert restored.size() == buf.size()
-    assert restored.new_count() == buf.new_count()
+    assert restored.untrained_count() == buf.untrained_count()
     assert restored.total_added == buf.total_added
     assert restored.evicted_total == buf.evicted_total
     assert [e.insert_seq for e in restored.entries] == [e.insert_seq for e in buf.entries]
     assert [e.score for e in restored.entries] == [e.score for e in buf.entries]
-    # identical RNG continuation: the next weighted draw matches
-    sel_orig, _ = buf.compose_minibatch(4, current_version=8)
-    sel_rest, _ = restored.compose_minibatch(4, current_version=8)
+    assert [e.times_trained for e in restored.entries] == [e.times_trained for e in buf.entries]
+    assert [e.insert_seq for e in restored.pending_fresh] == [e.insert_seq for e in buf.pending_fresh]
+    # identical RNG continuation and identical fresh set: the next draw matches
+    sel_orig, info_orig = buf.compose_minibatch(4, current_version=8)
+    sel_rest, info_rest = restored.compose_minibatch(4, current_version=8)
     assert [e.insert_seq for e in sel_orig] == [e.insert_seq for e in sel_rest]
+    assert info_orig["n_new"] == info_rest["n_new"] == 1
+
+
+def test_load_state_dict_tolerates_legacy_is_new_payload():
+    # Pre-freshness checkpoints carried is_new per entry and no pending_seqs.
+    state = {
+        "next_insert_seq": 2,
+        "total_added": 2,
+        "evicted_total": 0,
+        "evicted_unseen_total": 0,
+        "rng_state": None,
+        "entries": [
+            {"sample": _sample(0), "group_version": 0, "is_new": True, "score": 1.0, "insert_seq": 0},
+            {"sample": _sample(0), "group_version": 0, "is_new": False, "score": 1.0, "insert_seq": 1},
+        ],
+    }
+    buf = _make_buffer()
+    buf.load_state_dict(state)
+    assert buf.pending_fresh == []  # legacy unseen backlog gets no fresh priority
+    assert [e.times_trained for e in buf.entries] == [0, 1]  # waste counter keeps meaning
+    selected, info = buf.compose_minibatch(2, current_version=0)
+    assert info["n_new"] == 0
 
 
 # ---------------------------------------------------------------- rollouter insertion gate
@@ -288,9 +362,7 @@ def test_insertion_gate_classifies_and_counts_groups():
         ([1.0, -1.0, 1.0], True),  # mixed -> kept
         (None, False),  # unscorable -> dropped
     ]:
-        rollouter._score_group = lambda rs, rewards=rewards: (
-            torch.tensor(rewards) if rewards is not None else None
-        )
+        rollouter._score_group = lambda rs, rewards=rewards: torch.tensor(rewards) if rewards is not None else None
         outcomes.append(rollouter._prepare_replay_group(_group_sample([0, 0, 0])))
     assert outcomes == [False, False, True, False]
     assert rollouter.groups_completed_total == 4
@@ -365,9 +437,7 @@ class _QueueStub:
     sequence for the blocking get_sample calls (empty script -> sentinel)."""
 
     def __init__(self, available=None, blocking=None):
-        self.available = [
-            ray.cloudpickle.dumps(s) if s is not None else None for s in (available or [])
-        ]
+        self.available = [ray.cloudpickle.dumps(s) if s is not None else None for s in (available or [])]
         self.blocking = [ray.cloudpickle.dumps(s) if s is not None else None for s in (blocking or [])]
         self.blocking_calls = 0
 
@@ -389,7 +459,6 @@ def _make_replay_trainer(
     t.replay_buffer = ReplayBuffer(tau=4.0, staleness_threshold=100, seed=0)
     t.replay_updates_done = 0
     t.replay_requires_mini_batches = float(requires_mini_batches)
-    t.replay_warmup_updates = math.ceil(requires_mini_batches)
     t.required_samples = mini_size
     t.rollout_done = False
     t.current_param_version = 0
@@ -405,27 +474,20 @@ def _make_replay_trainer(
     return t
 
 
-def test_warmup_consumes_fresh_chunks_oldest_first_then_steady_state():
+def test_first_update_is_all_fresh_then_steady_state():
     s = [_sample(group_version=v) for v in range(5)]
-    trainer = _make_replay_trainer(
-        mini_size=2, requires_mini_batches=2, available=[s[0]], blocking=[s[1], s[2], s[3]]
-    )
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=2, available=[s[0]], blocking=[s[1], s[2], s[3]])
 
-    # warm-up update 1: drain gives s0, one blocking wait pulls s1
+    # update 1: drain gives s0; watermark 4 forces 3 blocking pulls; the
+    # all-pending buffer makes the first mini-batch all-fresh, newest first
     entries, info = trainer._acquire_replay_minibatch()
-    assert [e.sample.group_version for e in entries] == [0, 1]
+    assert trainer.message_queue_client.blocking_calls == 3
+    assert [e.sample.group_version for e in entries] == [3, 2]
     assert info["n_new"] == 2
-    trainer.replay_buffer.mark_used(entries)
-    trainer.replay_updates_done = 1
+    trainer.replay_buffer.mark_trained(entries)
 
-    # warm-up update 2: needs a fresh unseen mini-batch (s2, s3)
-    entries, info = trainer._acquire_replay_minibatch()
-    assert [e.sample.group_version for e in entries] == [2, 3]
-    assert info["n_new"] == 2
-    trainer.replay_buffer.mark_used(entries)
-    trainer.replay_updates_done = 2
-
-    # steady state: buffer holds 4 >= watermark 4 -> composes without blocking
+    # update 2: no new arrivals, buffer holds 4 >= watermark -> pure replay,
+    # and the s0/s1 overflow of update 1 carries no fresh priority
     calls_before = trainer.message_queue_client.blocking_calls
     entries, info = trainer._acquire_replay_minibatch()
     assert trainer.message_queue_client.blocking_calls == calls_before
@@ -434,16 +496,13 @@ def test_warmup_consumes_fresh_chunks_oldest_first_then_steady_state():
 
 def test_steady_state_pauses_until_watermark():
     s = [_sample(group_version=v) for v in range(4)]
-    trainer = _make_replay_trainer(
-        mini_size=2, requires_mini_batches=2, available=[s[0]], blocking=[s[1], s[2], s[3]]
-    )
-    trainer.replay_updates_done = 5  # past warm-up
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=2, available=[s[0]], blocking=[s[1], s[2], s[3]])
     entries, info = trainer._acquire_replay_minibatch()
     # drain gave 1 group; watermark 4 forced 3 blocking pulls
     assert trainer.message_queue_client.blocking_calls == 3
     assert trainer.replay_buffer.size() == 4
-    assert info["n_new"] == 2  # mini_size caps the all-new priority set
-    assert [e.sample.group_version for e in entries] == [0, 1]
+    assert info["n_new"] == 2  # mini_size caps the fresh set; overflow to pool
+    assert [e.sample.group_version for e in entries] == [3, 2]
 
 
 def test_fractional_requires_mini_batches():
@@ -451,34 +510,37 @@ def test_fractional_requires_mini_batches():
     trainer = _make_replay_trainer(
         mini_size=2, requires_mini_batches=1.5, available=[s[0]], blocking=[s[1], s[2], s[3], s[4]]
     )
-    # warm-up runs ceil(1.5) = 2 fresh-chunk updates
-    assert trainer.replay_warmup_updates == 2
-    for expected_versions in ([0, 1], [2, 3]):
-        entries, info = trainer._acquire_replay_minibatch()
-        assert [e.sample.group_version for e in entries] == expected_versions
-        assert info["n_new"] == 2
-        trainer.replay_buffer.mark_used(entries)
-        trainer.replay_updates_done += 1
-    # steady state: buffer holds 4 >= watermark 1.5*2=3 -> no blocking pull
+    # update 1: watermark 1.5*2=3 forces 2 blocking pulls; all-fresh compose
+    entries, info = trainer._acquire_replay_minibatch()
+    assert trainer.message_queue_client.blocking_calls == 2
+    assert [e.sample.group_version for e in entries] == [2, 1]
+    assert info["n_new"] == 2
+    trainer.replay_buffer.mark_trained(entries)
+
+    # buffer 3 >= watermark 3 -> no blocking pull
     calls_before = trainer.message_queue_client.blocking_calls
     entries, info = trainer._acquire_replay_minibatch()
     assert trainer.message_queue_client.blocking_calls == calls_before
-    trainer.replay_buffer.mark_used(entries)
+    trainer.replay_buffer.mark_trained(entries)
 
-    # drop below the fractional watermark: evict everything but 2 groups
+    # drop below the fractional watermark: keep only 2 groups
     trainer.replay_buffer.entries = trainer.replay_buffer.entries[:2]
+    trainer.replay_buffer.pending_fresh = []
     entries, info = trainer._acquire_replay_minibatch()
-    # 2 < 3 forced exactly one blocking pull (s4), then size 3 >= 3 composes
+    # 2 < 3 forced exactly one blocking pull (s3), then size 3 >= 3 composes
+    # with the pulled group as the only fresh one
     assert trainer.message_queue_client.blocking_calls == calls_before + 1
     assert trainer.replay_buffer.size() == 3
+    assert info["n_new"] == 1
 
 
-def test_post_update_maintenance_marks_used_before_eviction():
-    # Regression: _fit_replay used to evict BEFORE mark_used, so a group
+def test_post_update_maintenance_marks_trained_before_eviction():
+    # Regression: _fit_replay used to evict BEFORE marking, so a group
     # trained on the very update that pushed it past the staleness threshold
     # was counted as evicted_unseen ("never trained on" waste). The trainer's
-    # maintenance method must retire is_new first: the just-trained group
-    # counts as evicted-seen, only the genuinely untrained one as unseen.
+    # maintenance method must bump times_trained first: the just-trained
+    # group counts as evicted-seen, only the genuinely untrained one as
+    # unseen.
     trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
     trainer.replay_buffer = ReplayBuffer(tau=4.0, staleness_threshold=8, seed=0)
     just_trained = trainer.replay_buffer.add(_sample(group_version=0), current_version=8)
@@ -489,12 +551,33 @@ def test_post_update_maintenance_marks_used_before_eviction():
     # at the post-update version 9 both version-0 groups cross the threshold.
     trainer._replay_post_update_maintenance([just_trained], new_version=9)
 
-    assert not just_trained.is_new
+    assert just_trained.times_trained == 1 and never_trained.times_trained == 0
     assert trainer.replay_buffer.entries == [survivor]
     assert trainer.replay_buffer.evicted_total == 2
     assert trainer.replay_buffer.evicted_unseen_total == 1  # never_trained only
     # survivor rescored at the post-update version: staleness 4, tau 4 -> 0.5
     assert survivor.score == pytest.approx(0.5)
+
+
+def test_virtual_step_gated_by_fresh_prefix_only():
+    # Only the fresh entries' arrival stamps may gate the virtual step:
+    # replayed groups were ready long ago, whatever their enqueue stamps say.
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
+    for _ in range(2):
+        old_sample = _sample(group_version=0)
+        old_sample.enqueue_time = 1e9  # would dominate if wrongly included
+        old_sample.validation_pause_before = 0.0
+        trainer.replay_buffer.add(old_sample, current_version=0)
+    trainer.replay_buffer.compose_minibatch(2, current_version=0)  # consume freshness
+    fresh_sample = _sample(group_version=0)
+    fresh_sample.enqueue_time = 100.0
+    fresh_sample.validation_pause_before = 0.0
+    trainer.message_queue_client = _QueueStub(available=[fresh_sample])
+
+    entries, info = trainer._acquire_replay_minibatch()
+    assert info["n_new"] == 1 and info["n_replayed"] == 1
+    assert entries[0].sample.enqueue_time == 100.0  # fresh-first ordering
+    assert trainer._step_virtual_start == pytest.approx(100.0)
 
 
 def test_acquire_terminates_on_sentinel_when_buffer_insufficient():
@@ -512,9 +595,7 @@ def test_acquire_terminates_on_sentinel_when_buffer_insufficient():
 
 
 def test_drain_adds_groups_and_flags_sentinel():
-    trainer = _make_replay_trainer(
-        mini_size=2, requires_mini_batches=1, available=[_sample(1), None, _sample(2)]
-    )
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1, available=[_sample(1), None, _sample(2)])
     added = trainer._drain_queue_into_buffer()
     assert added == 2
     assert trainer.rollout_done
@@ -626,8 +707,8 @@ def test_build_replay_batch_uses_frozen_statistics():
         "uid_b", rewards=[-1.0, 1.0], advantages=[-0.5, 0.5], response_mask_rows=[[1, 0, 0], [1, 1, 0]]
     )
     entries = [
-        GroupEntry(sample=rs_a, group_version=3, is_new=True, score=1.0, insert_seq=0),
-        GroupEntry(sample=rs_b, group_version=3, is_new=False, score=0.5, insert_seq=1),
+        GroupEntry(sample=rs_a, group_version=3, score=1.0, insert_seq=0),
+        GroupEntry(sample=rs_b, group_version=3, score=0.5, insert_seq=1, times_trained=1),
     ]
     batch = trainer._build_replay_batch(entries)
 
@@ -675,7 +756,7 @@ def test_build_replay_batch_pins_dp_groups_for_opob():
     rs = _rollout_sample_with_batch(
         "uid_a", rewards=[1.0, -1.0], advantages=[1.0, -1.0], response_mask_rows=[[1, 1, 0], [1, 1, 1]]
     )
-    entries = [GroupEntry(sample=rs, group_version=3, is_new=True, score=1.0, insert_seq=0)]
+    entries = [GroupEntry(sample=rs, group_version=3, score=1.0, insert_seq=0)]
     batch = trainer._build_replay_batch(entries)
     assert batch.meta_info["dp_group_key"] == "uid"
     assert batch.meta_info["dp_group_size"] == 2
@@ -711,9 +792,7 @@ def test_capture_ess_base_means_unclipped_entries_once():
 
 
 def test_capture_ess_base_uses_clipped_field_when_configured():
-    trainer = _make_replay_trainer(
-        mini_size=2, requires_mini_batches=1, ess_auto_base=True, ess_use_clipped=True
-    )
+    trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1, ess_auto_base=True, ess_use_clipped=True)
     metrics = {"staleness/ess": [{"minibatch_ess_ratio": 0.6, "minibatch_ess_ratio_clipped": 0.9}]}
     trainer._capture_ess_base(metrics)
     assert trainer.replay_ess_base == pytest.approx(0.9)
@@ -736,7 +815,7 @@ def test_build_replay_batch_stamps_ess_base_override_in_auto_mode():
         rs = _rollout_sample_with_batch(
             "uid_a", rewards=[1.0, -1.0], advantages=[1.0, -1.0], response_mask_rows=[[1, 1, 0], [1, 1, 1]]
         )
-        entries = [GroupEntry(sample=rs, group_version=3, is_new=True, score=1.0, insert_seq=0)]
+        entries = [GroupEntry(sample=rs, group_version=3, score=1.0, insert_seq=0)]
         return trainer._build_replay_batch(entries)
 
     # auto mode, pre-capture: override present but None (actor skips scaling)

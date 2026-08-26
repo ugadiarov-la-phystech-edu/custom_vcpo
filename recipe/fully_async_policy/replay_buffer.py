@@ -16,12 +16,21 @@
 Decouples generation from updating: the rollouter streams completed
 (non-degenerate) groups through the MessageQueue as before, but the trainer
 keeps them in this buffer and composes each optimizer mini-batch as
-   1) every not-yet-trained-on group (``is_new``), oldest-inserted first,
-      capped at the mini-batch size, then
-   2) a without-replacement sample of already-used groups with probability
+   1) the *fresh* groups — those added since the previous composition —
+      newest-arrived first, capped at the mini-batch size; fresh groups that
+      do not fit (the earliest arrivals of the window) simply join the replay
+      pool (freshness is one-shot: it never carries over), then
+   2) a without-replacement sample of the remaining groups with probability
       proportional to the staleness-decayed score ``2^(-staleness/tau)``.
 Groups staler than ``staleness_threshold`` model updates are evicted after
 every update; scores are recomputed against the new model version.
+
+Freshness is deliberately NOT "never trained on": an absolute priority for
+unseen groups lets a producer/consumer rate imbalance build an unbounded
+unseen FIFO backlog whose head is many updates old — nominally "new"
+mini-batches were ~36 updates stale in the ORZ-7B run, which drove the
+off-policy collapse. With one-shot freshness the queue delay of prioritized
+data is bounded by a single update.
 """
 
 from dataclasses import dataclass
@@ -36,9 +45,11 @@ class GroupEntry:
 
     sample: Any
     group_version: int
-    is_new: bool
     score: float
     insert_seq: int
+    # Metrics only — never consulted by composition. Counts optimizer updates
+    # this group participated in; 0 means generated-but-never-trained-on.
+    times_trained: int = 0
 
     def staleness(self, current_version: int) -> int:
         return int(current_version) - int(self.group_version)
@@ -50,7 +61,7 @@ def staleness_score(staleness: int, tau: float) -> float:
 
 
 class ReplayBuffer:
-    """Version-aware group buffer: add / compose / evict / rescore / mark-used.
+    """Version-aware group buffer: add / compose / evict / rescore / mark-trained.
 
     Lives in the trainer driver process (plain Python object, no Ray). The
     MessageQueue remains the rollouter->trainer transport; this class only
@@ -59,13 +70,14 @@ class ReplayBuffer:
 
     def __init__(self, tau: float, staleness_threshold: int, seed: int = 1234):
         assert tau > 0, f"replay_buffer.tau must be positive, got {tau}"
-        assert staleness_threshold >= 0, (
-            f"replay_buffer.staleness_threshold must be >= 0, got {staleness_threshold}"
-        )
+        assert staleness_threshold >= 0, f"replay_buffer.staleness_threshold must be >= 0, got {staleness_threshold}"
         self.tau = float(tau)
         self.staleness_threshold = int(staleness_threshold)
         self.rng = np.random.default_rng(seed)
         self.entries: list[GroupEntry] = []
+        # Groups added since the last composition, in arrival order. Cleared
+        # wholesale by compose_minibatch: freshness is one-shot.
+        self.pending_fresh: list[GroupEntry] = []
         self._next_insert_seq = 0
         # Lifetime counters (survive checkpointing).
         self.total_added = 0
@@ -79,20 +91,22 @@ class ReplayBuffer:
         entry = GroupEntry(
             sample=sample,
             group_version=group_version,
-            is_new=True,
             score=staleness_score(int(current_version) - group_version, self.tau),
             insert_seq=self._next_insert_seq,
         )
         self._next_insert_seq += 1
         self.entries.append(entry)
+        self.pending_fresh.append(entry)
         self.total_added += 1
         return entry
 
     def evict(self, current_version: int) -> tuple[int, int]:
         """Remove groups with staleness > staleness_threshold.
 
-        Returns (evicted, evicted_unseen); unseen evictions are generated-but-
-        never-trained-on groups, i.e. wasted rollout compute worth monitoring.
+        Returns (evicted, evicted_unseen); unseen evictions are groups with
+        ``times_trained == 0`` — generated-but-never-trained-on, i.e. wasted
+        rollout compute worth monitoring. Evicted groups also leave the
+        pending-fresh list so they cannot resurface at composition.
         """
         kept: list[GroupEntry] = []
         evicted = 0
@@ -100,11 +114,14 @@ class ReplayBuffer:
         for entry in self.entries:
             if entry.staleness(current_version) > self.staleness_threshold:
                 evicted += 1
-                if entry.is_new:
+                if entry.times_trained == 0:
                     evicted_unseen += 1
             else:
                 kept.append(entry)
         self.entries = kept
+        if evicted:
+            kept_ids = set(id(e) for e in kept)
+            self.pending_fresh = [e for e in self.pending_fresh if id(e) in kept_ids]
         self.evicted_total += evicted
         self.evicted_unseen_total += evicted_unseen
         return evicted, evicted_unseen
@@ -113,31 +130,39 @@ class ReplayBuffer:
         for entry in self.entries:
             entry.score = staleness_score(entry.staleness(current_version), self.tau)
 
-    def mark_used(self, entries: list[GroupEntry]) -> None:
+    def mark_trained(self, entries: list[GroupEntry]) -> None:
         for entry in entries:
-            entry.is_new = False
+            entry.times_trained += 1
 
     # ---------------- composition ----------------
 
     def compose_minibatch(self, mini_size: int, current_version: int) -> tuple[list[GroupEntry], dict]:
-        """Compose one mini-batch of ``mini_size`` groups.
+        """Compose one mini-batch of ``mini_size`` groups, fresh-first.
 
-        Priority: all ``is_new`` groups, oldest-inserted first (so no unseen
-        group waits indefinitely toward eviction), capped at ``mini_size``.
-        The remainder is sampled without replacement from the other groups
-        with probability proportional to their staleness-decayed score.
+        Fresh groups (added since the previous composition) go in first,
+        newest-arrived first, capped at ``mini_size`` — the most on-policy
+        data available trains immediately; the overflow (the window's earliest
+        arrivals) stays in the buffer as ordinary replay candidates. The
+        pending list is cleared either way — an unselected fresh group holds
+        no priority next time. Note the starvation trade-off vs oldest-first:
+        under a sustained arrival surplus the displaced earliest arrivals
+        enter the pool at the low end of the weight distribution and may
+        reach the eviction horizon untrained (visible as evicted_unseen).
+        The remainder is sampled without replacement from the non-selected
+        groups with probability proportional to their staleness-decayed
+        score. Returned entries are ordered fresh-first, so
+        ``selected[:info["n_new"]]`` is exactly the fresh prefix.
         """
         if len(self.entries) < mini_size:
             raise ValueError(
                 f"Replay buffer holds {len(self.entries)} groups < mini_size {mini_size}; "
                 "caller must enforce the pause watermark before composing"
             )
-        new_entries = sorted(
-            (e for e in self.entries if e.is_new), key=lambda e: e.insert_seq
-        )
-        selected = new_entries[:mini_size]
-        n_new = len(selected)
-        n_fill = mini_size - n_new
+        fresh = sorted(self.pending_fresh, key=lambda e: e.insert_seq, reverse=True)
+        self.pending_fresh = []
+        selected = fresh[:mini_size]
+        n_fresh = len(selected)
+        n_fill = mini_size - n_fresh
         if n_fill > 0:
             selected_set = set(id(e) for e in selected)
             pool = [e for e in self.entries if id(e) not in selected_set]
@@ -152,30 +177,19 @@ class ReplayBuffer:
             selected = selected + [pool[i] for i in fill_idx]
         staleness = [e.staleness(current_version) for e in selected]
         info = {
-            "n_new": n_new,
-            "n_replayed": mini_size - n_new,
+            "n_new": n_fresh,
+            "n_replayed": mini_size - n_fresh,
             "staleness": staleness,
         }
         return selected, info
-
-    def take_oldest_new(self, mini_size: int) -> list[GroupEntry]:
-        """Warm-up composition: the oldest-inserted ``mini_size`` unseen groups."""
-        new_entries = sorted(
-            (e for e in self.entries if e.is_new), key=lambda e: e.insert_seq
-        )
-        if len(new_entries) < mini_size:
-            raise ValueError(
-                f"Only {len(new_entries)} unseen groups available < mini_size {mini_size}"
-            )
-        return new_entries[:mini_size]
 
     # ---------------- introspection ----------------
 
     def size(self) -> int:
         return len(self.entries)
 
-    def new_count(self) -> int:
-        return sum(1 for e in self.entries if e.is_new)
+    def untrained_count(self) -> int:
+        return sum(1 for e in self.entries if e.times_trained == 0)
 
     def staleness_list(self, current_version: int) -> list[int]:
         return [e.staleness(current_version) for e in self.entries]
@@ -196,13 +210,14 @@ class ReplayBuffer:
             "evicted_total": self.evicted_total,
             "evicted_unseen_total": self.evicted_unseen_total,
             "rng_state": self.rng.bit_generator.state,
+            "pending_seqs": [e.insert_seq for e in self.pending_fresh],
             "entries": [
                 {
                     "sample": e.sample,
                     "group_version": e.group_version,
-                    "is_new": e.is_new,
                     "score": e.score,
                     "insert_seq": e.insert_seq,
+                    "times_trained": e.times_trained,
                 }
                 for e in self.entries
             ],
@@ -221,9 +236,14 @@ class ReplayBuffer:
             GroupEntry(
                 sample=d["sample"],
                 group_version=int(d["group_version"]),
-                is_new=bool(d["is_new"]),
                 score=float(d["score"]),
                 insert_seq=int(d["insert_seq"]),
+                # Legacy payloads (pre-freshness) carried is_new instead:
+                # map seen -> trained once so the eviction-waste counter keeps
+                # its meaning.
+                times_trained=int(d.get("times_trained", 0 if d.get("is_new", True) else 1)),
             )
             for d in state.get("entries", [])
         ]
+        pending_seqs = set(int(s) for s in state.get("pending_seqs", []))
+        self.pending_fresh = [e for e in self.entries if e.insert_seq in pending_seqs]
