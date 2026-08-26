@@ -22,9 +22,9 @@ import numpy as np
 class GroupEntry:
     sample: Any
     group_version: int
-    is_new: bool
     score: float
     insert_seq: int
+    times_trained: int = 0
 
     def staleness(self, current_version: int) -> int:
         return int(current_version) - int(self.group_version)
@@ -37,13 +37,12 @@ def staleness_score(staleness: int, tau: float) -> float:
 class ReplayBuffer:
     def __init__(self, tau: float, staleness_threshold: int, seed: int = 1234):
         assert tau > 0, f"replay_buffer.tau must be positive, got {tau}"
-        assert staleness_threshold >= 0, (
-            f"replay_buffer.staleness_threshold must be >= 0, got {staleness_threshold}"
-        )
+        assert staleness_threshold >= 0, f"replay_buffer.staleness_threshold must be >= 0, got {staleness_threshold}"
         self.tau = float(tau)
         self.staleness_threshold = int(staleness_threshold)
         self.rng = np.random.default_rng(seed)
         self.entries: list[GroupEntry] = []
+        self.pending_fresh: list[GroupEntry] = []
         self._next_insert_seq = 0
         self.total_added = 0
         self.evicted_total = 0
@@ -54,12 +53,12 @@ class ReplayBuffer:
         entry = GroupEntry(
             sample=sample,
             group_version=group_version,
-            is_new=True,
             score=staleness_score(int(current_version) - group_version, self.tau),
             insert_seq=self._next_insert_seq,
         )
         self._next_insert_seq += 1
         self.entries.append(entry)
+        self.pending_fresh.append(entry)
         self.total_added += 1
         return entry
 
@@ -70,11 +69,14 @@ class ReplayBuffer:
         for entry in self.entries:
             if entry.staleness(current_version) > self.staleness_threshold:
                 evicted += 1
-                if entry.is_new:
+                if entry.times_trained == 0:
                     evicted_unseen += 1
             else:
                 kept.append(entry)
         self.entries = kept
+        if evicted:
+            kept_ids = set(id(e) for e in kept)
+            self.pending_fresh = [e for e in self.pending_fresh if id(e) in kept_ids]
         self.evicted_total += evicted
         self.evicted_unseen_total += evicted_unseen
         return evicted, evicted_unseen
@@ -83,9 +85,9 @@ class ReplayBuffer:
         for entry in self.entries:
             entry.score = staleness_score(entry.staleness(current_version), self.tau)
 
-    def mark_used(self, entries: list[GroupEntry]) -> None:
+    def mark_trained(self, entries: list[GroupEntry]) -> None:
         for entry in entries:
-            entry.is_new = False
+            entry.times_trained += 1
 
     def compose_minibatch(self, mini_size: int, current_version: int) -> tuple[list[GroupEntry], dict]:
         if len(self.entries) < mini_size:
@@ -93,12 +95,11 @@ class ReplayBuffer:
                 f"Replay buffer holds {len(self.entries)} groups < mini_size {mini_size}; "
                 "caller must enforce the pause watermark before composing"
             )
-        new_entries = sorted(
-            (e for e in self.entries if e.is_new), key=lambda e: e.insert_seq
-        )
-        selected = new_entries[:mini_size]
-        n_new = len(selected)
-        n_fill = mini_size - n_new
+        fresh = sorted(self.pending_fresh, key=lambda e: e.insert_seq, reverse=True)
+        self.pending_fresh = []
+        selected = fresh[:mini_size]
+        n_fresh = len(selected)
+        n_fill = mini_size - n_fresh
         if n_fill > 0:
             selected_set = set(id(e) for e in selected)
             pool = [e for e in self.entries if id(e) not in selected_set]
@@ -112,27 +113,17 @@ class ReplayBuffer:
             selected = selected + [pool[i] for i in fill_idx]
         staleness = [e.staleness(current_version) for e in selected]
         info = {
-            "n_new": n_new,
-            "n_replayed": mini_size - n_new,
+            "n_new": n_fresh,
+            "n_replayed": mini_size - n_fresh,
             "staleness": staleness,
         }
         return selected, info
 
-    def take_oldest_new(self, mini_size: int) -> list[GroupEntry]:
-        new_entries = sorted(
-            (e for e in self.entries if e.is_new), key=lambda e: e.insert_seq
-        )
-        if len(new_entries) < mini_size:
-            raise ValueError(
-                f"Only {len(new_entries)} unseen groups available < mini_size {mini_size}"
-            )
-        return new_entries[:mini_size]
-
     def size(self) -> int:
         return len(self.entries)
 
-    def new_count(self) -> int:
-        return sum(1 for e in self.entries if e.is_new)
+    def untrained_count(self) -> int:
+        return sum(1 for e in self.entries if e.times_trained == 0)
 
     def staleness_list(self, current_version: int) -> list[int]:
         return [e.staleness(current_version) for e in self.entries]
@@ -151,13 +142,14 @@ class ReplayBuffer:
             "evicted_total": self.evicted_total,
             "evicted_unseen_total": self.evicted_unseen_total,
             "rng_state": self.rng.bit_generator.state,
+            "pending_seqs": [e.insert_seq for e in self.pending_fresh],
             "entries": [
                 {
                     "sample": e.sample,
                     "group_version": e.group_version,
-                    "is_new": e.is_new,
                     "score": e.score,
                     "insert_seq": e.insert_seq,
+                    "times_trained": e.times_trained,
                 }
                 for e in self.entries
             ],
@@ -175,9 +167,11 @@ class ReplayBuffer:
             GroupEntry(
                 sample=d["sample"],
                 group_version=int(d["group_version"]),
-                is_new=bool(d["is_new"]),
                 score=float(d["score"]),
                 insert_seq=int(d["insert_seq"]),
+                times_trained=int(d.get("times_trained", 0 if d.get("is_new", True) else 1)),
             )
             for d in state.get("entries", [])
         ]
+        pending_seqs = set(int(s) for s in state.get("pending_seqs", []))
+        self.pending_fresh = [e for e in self.entries if e.insert_seq in pending_seqs]
