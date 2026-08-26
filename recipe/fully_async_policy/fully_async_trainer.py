@@ -13,13 +13,12 @@
 # limitations under the License.
 
 import json
-import math
 import os
 import time
+from collections import defaultdict
 from datetime import datetime
 from pprint import pprint
 from typing import Any
-from collections import defaultdict
 
 import numpy as np
 import ray
@@ -31,11 +30,11 @@ from recipe.fully_async_policy.detach_utils import (
     MetricsAggregator,
     ValidateMetrics,
     assemble_batch_from_rollout_samples,
-    process_structured_metrics
+    process_structured_metrics,
 )
 from recipe.fully_async_policy.message_queue import MessageQueueClient
-from recipe.fully_async_policy.replay_buffer import ReplayBuffer
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer, make_opportunistic_minibatch_indices
+from recipe.fully_async_policy.replay_buffer import ReplayBuffer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -44,7 +43,6 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
-
 
 # make_opportunistic_minibatch_indices moved to ray_trainer (imported above) so
 # the fractional-ppo_epochs update path can use it too.
@@ -155,31 +153,30 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         )
         self.opportunistic_shuffle_seed = int(opportunistic_cfg.get("shuffle_seed", 1234)) if opportunistic_cfg else 0
         # Replay-buffer mode: the trainer keeps drained groups in a
-        # version-aware buffer, composes each optimizer mini-batch as all
-        # unseen groups (oldest first) plus a staleness-score-weighted sample
-        # of already-used groups, syncs weights after every update, and evicts
-        # groups staler than replay_buffer.staleness_threshold updates.
+        # version-aware buffer, composes each optimizer mini-batch as the
+        # fresh groups (arrived since the previous composition, newest first,
+        # overflow joins the pool with no carried priority) plus a
+        # staleness-score-weighted sample of the rest, syncs weights after
+        # every update, and evicts groups staler than
+        # replay_buffer.staleness_threshold updates.
         replay_cfg = config.async_training.get("replay_buffer", None)
         self.replay_enable = bool(replay_cfg.get("enable", False)) if replay_cfg else False
         if self.replay_enable:
             self.replay_tau = float(replay_cfg.get("tau", 4.0))
             self.replay_staleness_threshold = int(replay_cfg.get("staleness_threshold", 8))
             # May be fractional (e.g. 1.5): the pause watermark is
-            # requires_mini_batches * mini_size groups, while the warm-up runs
-            # ceil(requires_mini_batches) fresh-chunk updates — so warm-up
-            # alone always fills the buffer past the watermark and steady
-            # state starts without a stall.
+            # requires_mini_batches * mini_size groups. The first composition
+            # then happens on an all-pending buffer, so the first mini-batch
+            # is all-fresh without a dedicated warm-up branch.
             self.replay_requires_mini_batches = float(replay_cfg.get("requires_mini_batches", 2))
             assert self.replay_requires_mini_batches >= 1, "replay_buffer.requires_mini_batches must be >= 1"
-            self.replay_warmup_updates = math.ceil(self.replay_requires_mini_batches)
             self.replay_sampling_seed = int(replay_cfg.get("sampling_seed", 1234))
             # Persist replay_buffer.pt with each checkpoint (7-12 GB of resume
             # state); disable for never-resumed runs (e.g. hf_model-only
             # checkpoints under trainer.resume_mode=disable)
             self.replay_save_state = bool(replay_cfg.get("save_state", True))
             assert self.trigger_parameter_sync_step == 1, (
-                "replay_buffer mode syncs weights after every update: set "
-                "async_training.trigger_parameter_sync_step=1"
+                "replay_buffer mode syncs weights after every update: set async_training.trigger_parameter_sync_step=1"
             )
             assert self.require_batches == 1, (
                 "replay_buffer mode composes one mini-batch per update: set async_training.require_batches=1"
@@ -472,7 +469,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             self._collect_metrics(batch, 0, metrics, timing_raw)
             structured_metrics = self.metrics_aggregator.add_step_metrics(
-                metrics=metrics, sample_count=self.required_samples, timestamp=time.time(), structured_metrics=self.structured_metrics
+                metrics=metrics,
+                sample_count=self.required_samples,
+                timestamp=time.time(),
+                structured_metrics=self.structured_metrics,
             )
             if structured_metrics is not None:
                 self.structured_metrics = structured_metrics
@@ -536,57 +536,44 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
     def _acquire_replay_minibatch(self):
         """Compose the next mini-batch of groups from the replay buffer.
 
-        Warm-up (first ceil(requires_mini_batches) updates): wait until
-        mini_size *unseen* groups are buffered and use exactly those, oldest
-        first. Steady state: pause only while the buffer holds fewer than
-        requires_mini_batches x mini_size groups (fractional values allowed),
-        then compose all unseen groups (oldest first, capped) plus a
-        score-weighted sample of used ones. Returns (entries, info) or
-        (None, None) when generation has finished and the buffer cannot
-        support another mini-batch."""
+        Pause only while the buffer holds fewer than requires_mini_batches x
+        mini_size groups (fractional values allowed), then compose the fresh
+        groups (arrived since the previous composition, newest first, capped
+        at mini_size — the overflow joins the replay pool with no carried
+        priority) plus a score-weighted sample of the rest. The first
+        composition sees an all-pending buffer, so the first update trains on
+        fresh groups without a dedicated warm-up path. Returns (entries,
+        info) or (None, None) when generation has finished and the buffer
+        cannot support another mini-batch."""
         mini_size = self.required_samples
         watermark = self.replay_requires_mini_batches * mini_size
         self._drain_queue_into_buffer()
-        if self.replay_updates_done < self.replay_warmup_updates:
-            while self.replay_buffer.new_count() < mini_size:
-                if self.rollout_done:
-                    print(
-                        f"[FullyAsyncTrainer][Replay] rollout finished during warm-up with "
-                        f"{self.replay_buffer.new_count()}/{mini_size} unseen groups; stopping"
-                    )
-                    return None, None
-                self._wait_one_sample_into_buffer()
-            entries = self.replay_buffer.take_oldest_new(mini_size)
-            info = {
-                "n_new": mini_size,
-                "n_replayed": 0,
-                "staleness": [e.staleness(self.current_param_version) for e in entries],
-            }
-        else:
-            while self.replay_buffer.size() < watermark:
-                if self.rollout_done:
-                    print(
-                        f"[FullyAsyncTrainer][Replay] rollout finished with buffer "
-                        f"{self.replay_buffer.size()} < watermark {watermark}; stopping"
-                    )
-                    return None, None
-                self._wait_one_sample_into_buffer()
-            entries, info = self.replay_buffer.compose_minibatch(mini_size, self.current_param_version)
-        # Open the virtual (no-validation-no-save) step: only the unseen
+        while self.replay_buffer.size() < watermark:
+            if self.rollout_done:
+                print(
+                    f"[FullyAsyncTrainer][Replay] rollout finished with buffer "
+                    f"{self.replay_buffer.size()} < watermark {watermark}; stopping"
+                )
+                return None, None
+            self._wait_one_sample_into_buffer()
+        entries, info = self.replay_buffer.compose_minibatch(mini_size, self.current_param_version)
+        # Open the virtual (no-validation-no-save) step: only the fresh
         # entries' arrival stamps gate this step — replayed groups were ready
         # long ago (a pure-replay mini-batch never waits on generation).
+        # compose_minibatch orders the selection fresh-first, so the n_new
+        # prefix is exactly the fresh set.
         consumer_end = time.time()
-        self._open_virtual_step(consumer_end, [e.sample for e in entries if e.is_new])
+        self._open_virtual_step(consumer_end, [e.sample for e in entries[: info["n_new"]]])
         return entries, info
 
     def _replay_post_update_maintenance(self, entries, new_version: int) -> None:
         """Buffer maintenance after one replay update, at the model version the
-        update just produced: retire the used groups' is_new flag BEFORE
+        update just produced: bump the used groups' times_trained BEFORE
         evicting — a just-trained group crossing the staleness threshold must
         count as evicted-seen, not evicted_unseen (that counter means
         generated-but-never-trained-on waste) — then evict too-stale groups
         and decay the survivors' scores."""
-        self.replay_buffer.mark_used(entries)
+        self.replay_buffer.mark_trained(entries)
         self.replay_buffer.evict(new_version)
         self.replay_buffer.recompute_scores(new_version)
 
@@ -612,16 +599,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
 
         response_mask = batch.batch["response_mask"]
-        adv_scalars = torch.from_numpy(
-            np.asarray(batch.non_tensor_batch["advantage_scalar"], dtype=np.float32)
-        )
+        adv_scalars = torch.from_numpy(np.asarray(batch.non_tensor_batch["advantage_scalar"], dtype=np.float32))
         advantages = adv_scalars.unsqueeze(-1) * response_mask.float()
         batch.batch["advantages"] = advantages
         batch.batch["returns"] = advantages
 
-        reward_scalars = torch.from_numpy(
-            np.asarray(batch.non_tensor_batch["reward_scalar"], dtype=np.float32)
-        )
+        reward_scalars = torch.from_numpy(np.asarray(batch.non_tensor_batch["reward_scalar"], dtype=np.float32))
         token_level_scores = torch.zeros_like(response_mask, dtype=torch.float32)
         lengths = response_mask.sum(dim=-1).long()
         valid = lengths > 0
@@ -653,7 +636,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         metrics.update(
             {
                 "replay/buffer_size": self.replay_buffer.size(),
-                "replay/buffer_new": self.replay_buffer.new_count(),
+                "replay/buffer_new": self.replay_buffer.untrained_count(),
                 "replay/buffer_max_staleness": float(self.replay_buffer.max_staleness(new_version) or 0),
                 "replay/minibatch_new": info["n_new"],
                 "replay/minibatch_replayed": info["n_replayed"],
@@ -676,9 +659,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         # dashboard. No-op on the standard update path (no staleness/ess key).
         ess_entries = metrics.get("staleness/ess") or []
         scaled_lrs = [
-            float(e["ess_scaled_lr"])
-            for e in ess_entries
-            if isinstance(e, dict) and e.get("ess_scaled_lr") is not None
+            float(e["ess_scaled_lr"]) for e in ess_entries if isinstance(e, dict) and e.get("ess_scaled_lr") is not None
         ]
         if scaled_lrs:
             metrics["replay/ess_scaled_lr"] = float(np.mean(scaled_lrs))
@@ -758,7 +739,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"[FullyAsyncTrainer][Replay] global_steps: {self.global_steps} "
                 f"update: {self.replay_updates_done} "
                 f"buffer: {self.replay_buffer.size()} "
-                f"(new: {self.replay_buffer.new_count()}) {time_str}"
+                f"(untrained: {self.replay_buffer.untrained_count()}) {time_str}"
             )
             self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
             self._check_save_checkpoint(timing_raw)
@@ -890,10 +871,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             return
         replay_path = os.path.join(local_global_step_folder, "replay_buffer.pt")
         torch.save(self._replay_checkpoint_state(), replay_path)
-        print(
-            f"[FullyAsyncTrainer][Replay] Saved replay buffer "
-            f"({self.replay_buffer.size()} groups) to {replay_path}"
-        )
+        print(f"[FullyAsyncTrainer][Replay] Saved replay buffer ({self.replay_buffer.size()} groups) to {replay_path}")
 
     def _save_timing_state(self, local_global_step_folder, save_start):
         """Persist the cumulative timing totals so a resumed run continues the
@@ -1099,7 +1077,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         )
         self.progress_bar.update(1)
         self.metrics_aggregator.reset()
-        
+
         with marked_timer("timing_s/param_sync", timing_param_sync):
             ray.get(
                 self.param_synchronizer.sync_weights.remote(
@@ -1203,9 +1181,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         """
         Log validation data
         """
-        
+
         # [NOTE] Continue logging val_data until message queue client is empty
-        while True: 
+        while True:
             val_data = self.message_queue_client.get_validate_sync()
             if not val_data:
                 break
@@ -1218,8 +1196,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             if val_metrics.metrics:
                 self.logger.log(data=val_metrics.metrics, step=val_metrics.param_version)
                 pprint(
-                    f"[FullyAsyncTrainer] parameter version: {self.current_param_version} val_metric step={val_metrics.param_version}\n"
+                    f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
+                    f"val_metric step={val_metrics.param_version}\n"
                     f"Validation metrics: {val_metrics.metrics}"
-
                 )
             self.logger.log(data=val_metrics.timing_raw, step=val_metrics.param_version)
