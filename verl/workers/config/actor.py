@@ -48,6 +48,15 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        anchor_mode (Optional[str]): Ratio anchor for the vanilla loss under
+            skip_recompute_old_log_prob. None (default) keeps today's behavior: the ratio is
+            anchored at log_prob.detach() (identically 1, clip inert) and the detached token-IS
+            weight against the rollout policy carries the whole off-policy correction. "mu" feeds
+            the cached rollout log-probs (the behavior policy, frozen at generation) to the loss
+            as old_log_prob and drops the token-IS weight — the PPO ratio pi/mu IS the importance
+            correction, so keeping the weight would apply it twice. The clip band then bounds each
+            token's cumulative movement across replay reuse (Arm A of
+            CLIP_IS_MIXING_ANCHORS_DISCUSSION.md). Megatron-only; requires loss_mode="vanilla".
     """
 
     loss_mode: str = "vanilla"
@@ -56,6 +65,7 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    anchor_mode: Optional[str] = None
 
 
 @dataclass

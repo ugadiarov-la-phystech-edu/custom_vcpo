@@ -578,8 +578,51 @@ class MegatronPPOActor(BasePPOActor):
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
+                old_log_prob_for_loss = old_log_prob
+                anchor_mode = self.config.policy_loss.get("anchor_mode", None)
+                if anchor_mode is not None:
+                    # Arm A (CLIP_IS_MIXING_ANCHORS_DISCUSSION.md §4): anchor the vanilla
+                    # PPO clip at the BEHAVIOR policy mu (the cached rollout log-probs,
+                    # frozen at generation) instead of log_prob.detach(). The ratio pi/mu
+                    # is then the importance correction itself, so the detached token-IS
+                    # weight against the same mu must be dropped — keeping both would
+                    # apply the correction twice. The clip band bounds each token's
+                    # CUMULATIVE movement across replay reuse: once pi/mu exits the band
+                    # the pushing gradient stops permanently, because mu never refreshes.
+                    # The detached old_log_prob variable still feeds the ESS brake inputs
+                    # (collect_seq_log_is) and the deferred-correction metrics above —
+                    # only the loss's copy changes. Side effect: actor/pg_clipfrac and
+                    # actor/ppo_kl become real (both are identically 0 without the anchor);
+                    # ppo_kl now measures in-loss KL(pi‖mu).
+                    assert anchor_mode == "mu", (
+                        f"unknown policy_loss.anchor_mode: {anchor_mode!r} (expected null or 'mu')"
+                    )
+                    assert loss_mode == "vanilla", (
+                        f"policy_loss.anchor_mode='mu' requires loss_mode='vanilla' (got {loss_mode!r}): "
+                        "other losses either do their own mu-substitution (cppo) or have not been "
+                        "audited for the anchored-ratio semantics"
+                    )
+                    assert skip_recompute_old_log_prob, (
+                        "policy_loss.anchor_mode='mu' requires skip_recompute_old_log_prob=True: "
+                        "with recomputed old log-probs the loss already sees the collection policy "
+                        "and the anchor switch would be a silent no-op"
+                    )
+                    assert rollout_log_prob is not None, (
+                        "policy_loss.anchor_mode='mu' requires rollout_log_probs in the batch (behavior-policy anchor)"
+                    )
+                    assert rollout_corr_cfg.get("rollout_rs", None) is None, (
+                        "policy_loss.anchor_mode='mu' does not support rollout_rs rejection: rejected "
+                        "tokens punch holes in response_mask, silently dropping exactly the "
+                        "highest-divergence tokens the clip is meant to handle"
+                    )
+                    assert rollout_corr_cfg.get("rollout_is", "token") in (None, "token"), (
+                        "policy_loss.anchor_mode='mu' subsumes only TOKEN-level IS weights via the "
+                        "clipped pi/mu ratio; sequence-level rollout_is would be silently dropped"
+                    )
+                    old_log_prob_for_loss = rollout_log_prob
+                    rollout_is_weights = None
                 pg_loss, pg_metrics = policy_loss_fn(
-                    old_log_prob=old_log_prob,
+                    old_log_prob=old_log_prob_for_loss,
                     log_prob=log_prob,
                     advantages=advantages,
                     response_mask=response_mask,
@@ -1048,9 +1091,7 @@ class MegatronPPOActor(BasePPOActor):
             )
             values = tensor.tolist()
         ess, ess_ratio, ess_clipped, ess_ratio_clipped, count = values
-        return self._apply_ess_scale_and_step(
-            ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, int(count)
-        )
+        return self._apply_ess_scale_and_step(ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, int(count))
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def _update_policy_per_traj_packed(self, dataloader: Iterable[DataProto]) -> dict:
@@ -1066,7 +1107,13 @@ class MegatronPPOActor(BasePPOActor):
         this path requires skip_recompute_old_log_prob=True: the PPO ratio is
         exp(log_prob - log_prob.detach()) == 1, so the clip branches collapse
         and the vanilla loss with row-constant advantages equals the per-traj
-        A=+1 post-scale loss token-for-token. The only remaining difference —
+        A=+1 post-scale loss token-for-token. (With policy_loss.anchor_mode="mu"
+        the ratio-anchor argument does not apply — loss_func instead feeds the
+        cached behavior log-probs as the loss's old_log_prob and the clip binds
+        for real; this path keeps real row-constant advantages in the tensor,
+        which the sign-dependent clip-branch selection requires, and the mbs=1
+        path matches by skipping its A=+1 fold under the mu anchor.) The only
+        remaining difference —
         Megatron's mean-of-means over unequal micro-batches vs the per-traj
         global 1/N — is removed by the n_rows*M/N rescale in loss_func
         (meta_info["global_seq_mean_count"]), making gradients invariant to
@@ -1187,6 +1234,13 @@ class MegatronPPOActor(BasePPOActor):
             )
             return self._update_policy_per_traj_packed(dataloader)
 
+        mu_anchor = self.config.policy_loss.get("anchor_mode", None) == "mu"
+        assert not (mu_anchor and grad_baselining), (
+            "policy_loss.anchor_mode='mu' is incompatible with grad_baselining (OPOB): OPOB "
+            "accumulates raw A=+1 score gradients per trajectory, but the mu-anchored clipped "
+            "loss selects branches by the advantage sign and cannot be advantage-folded"
+        )
+
         metrics = {}
 
         # Gradient buffers are only needed for OPOB (grad_baselining): each
@@ -1249,7 +1303,10 @@ class MegatronPPOActor(BasePPOActor):
             # minibatch_idx counts across epochs; epoch_idx is stamped by make_minibatch_iterator.
             epoch_idx = int(minibatch.meta_info.get("epoch_idx", 0))
             local_traj_records, _ = compute_staleness_statistics(
-                minibatch, minibatch_idx, rollout_is_threshold, not skip_recompute_old_log_prob,
+                minibatch,
+                minibatch_idx,
+                rollout_is_threshold,
+                not skip_recompute_old_log_prob,
                 epoch_idx=epoch_idx,
             )
 
@@ -1273,14 +1330,24 @@ class MegatronPPOActor(BasePPOActor):
                 traj_record = local_traj_records[traj_uid]
                 reward_scalar = traj_record.reward_scalar
                 adv_scalar = traj_record.advantage_scalar
-                # Use raw score gradients g_i <- w_i * grad(log pi) for per-traj accumulation.
-                microbatch.batch["advantages"] = torch.ones_like(microbatch.batch["advantages"])
-                if not grad_baselining:
-                    # Buffer-free path: fold the advantage into the loss scale —
-                    # backward is linear in it, so the accumulated main-buffer
-                    # gradient equals the former `accum += adv_i * g_i` exactly,
-                    # regardless of the loss shape.
-                    microbatch.meta_info["loss_multiplier"] = microbatch_loss_scale * adv_scalar
+                if mu_anchor:
+                    # mu-anchored clip (anchor_mode="mu"): the vanilla loss selects its
+                    # clip branch by the SIGN of the advantage tensor (and dual-clip by
+                    # advantages < 0), so the A=+1 fold below would apply the wrong clip
+                    # side to negative-advantage trajectories. Keep the real advantages
+                    # in the tensor and only the 1/N micro-batch scale in the multiplier.
+                    # Buffer-free only (no OPOB — asserted above), so nothing downstream
+                    # needs the raw score gradient.
+                    microbatch.meta_info["loss_multiplier"] = microbatch_loss_scale
+                else:
+                    # Use raw score gradients g_i <- w_i * grad(log pi) for per-traj accumulation.
+                    microbatch.batch["advantages"] = torch.ones_like(microbatch.batch["advantages"])
+                    if not grad_baselining:
+                        # Buffer-free path: fold the advantage into the loss scale —
+                        # backward is linear in it, so the accumulated main-buffer
+                        # gradient equals the former `accum += adv_i * g_i` exactly,
+                        # regardless of the loss shape.
+                        microbatch.meta_info["loss_multiplier"] = microbatch_loss_scale * adv_scalar
 
                 with ExitStack() as stack:
                     if dp_world_size > 1 or not grad_baselining:

@@ -68,6 +68,13 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Ratio anchor for the vanilla loss under skip_recompute_old_log_prob.
+  # null = ratio anchored at log_prob.detach() (== 1, clip inert; token-IS weight carries the
+  # off-policy correction). "mu" = the loss sees the cached rollout log-probs as old_log_prob
+  # and the token-IS weight is dropped (the pi/mu ratio IS the IS correction) — the clip band
+  # bounds cumulative per-token movement across replay reuse. Megatron-only, vanilla-only.
+  anchor_mode: null
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
