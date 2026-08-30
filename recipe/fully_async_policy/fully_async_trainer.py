@@ -240,6 +240,30 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         )
         self.metrics_aggregator = MetricsAggregator(total_gpus=total_gpus)
 
+    def _log_git_provenance(self):
+        """One-time provenance record: repo branch/commit/dirty state, written to the
+        tensorboard Text tab (git/state, step 0) and echoed to the console log. Runs
+        git with cwd pinned to the repo root derived from this file (the Ray actor's
+        cwd is not guaranteed); never raises -- a missing git degrades to a note."""
+        import subprocess
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+        def _git(*args):
+            return subprocess.run(
+                ["git", *args], cwd=repo_root, capture_output=True, text=True, timeout=10, check=True
+            ).stdout.strip()
+
+        try:
+            branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+            commit = _git("rev-parse", "--short=12", "HEAD")
+            dirty = "dirty" if _git("status", "--porcelain", "--untracked-files=no") else "clean"
+            text = f"branch={branch} commit={commit} worktree={dirty} root={repo_root}"
+        except Exception as exc:  # noqa: BLE001
+            text = f"unavailable ({type(exc).__name__}: {exc})"
+        print(f"[FullyAsyncTrainer] git: {text}")
+        self.logger.log_text(tag="git/state", text=text, step=0)
+
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
         self.message_queue_client = message_queue_client
@@ -456,6 +480,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        self._log_git_provenance()
         self.max_steps_duration = 0
 
         # get validate data before training
@@ -754,6 +779,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        self._log_git_provenance()
         self.max_steps_duration = 0
         self._log_validation_data()
 

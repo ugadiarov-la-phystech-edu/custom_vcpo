@@ -155,6 +155,13 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def log_text(self, tag, text, step=0):
+        """Dispatch a one-off text record to every backend that supports it (tensorboard's
+        Text tab today); silently skipped elsewhere."""
+        for logger_instance in self.logger.values():
+            if hasattr(logger_instance, "log_text"):
+                logger_instance.log_text(tag=tag, text=text, step=step)
+
     def __del__(self):
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)
@@ -262,7 +269,7 @@ class _TensorboardAdapter:
 
         for key in data:
             value = data[key]
-            if isinstance(value, (list, tuple, np.ndarray)):
+            if isinstance(value, list | tuple | np.ndarray):
                 # Value distributions (e.g. replay-buffer staleness) become
                 # native tensorboard histograms with the per-step slider.
                 value = np.asarray(value)
@@ -270,6 +277,10 @@ class _TensorboardAdapter:
                     self.writer.add_histogram(key, value, step)
             else:
                 self.writer.add_scalar(key, value, step)
+
+    def log_text(self, tag, text, step=0):
+        """One-off text records (run provenance etc.) -> the tensorboard Text tab."""
+        self.writer.add_text(tag, text, step)
 
     def finish(self):
         self.writer.close()
