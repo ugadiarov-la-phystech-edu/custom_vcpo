@@ -120,6 +120,67 @@ async_training:
     # trainer.resume_mode=disable) to cut checkpoint size and save time
     save_state: True
 
+  # Adaptive soft blend between the TIS-only replay loss and the mu-anchored
+  # PPO-clip loss (CLIP_IS_MIXING_ANCHORS_DISCUSSION.md): per token
+  # L = (1-c2)*L_TIS + c2*L_clip. The two pieces are gradient-identical inside
+  # the clip band, so c2 only attenuates the out-of-band tail — c2=0 is
+  # bitwise the baseline, c2=1 is Arm A's hard cumulative bound. After each
+  # update a proportional controller maps the chosen drift signal to the next
+  # update's c2 (stamped into meta_info as anchor_blend_c2). Replay mode +
+  # megatron only; requires policy_loss.anchor_mode=null, vanilla loss,
+  # skip_recompute_old_log_prob=True, rollout_is=token, rollout_rs=null,
+  # grad_baselining off (validated at trainer init). Not persisted: a resumed
+  # run restarts at c2_min.
+  adaptive_anchor:
+
+    # Master switch
+    enable: False
+
+    # Drift signal: "clipfrac" = actor/pg_clipfrac of the mu-anchored clip
+    # piece (dimensionless, backend-transferable; the piece's metrics are
+    # computed even at c2=0 so the signal is always live) or "kl" =
+    # rollout_corr/kl (needs per-stack thresholds: healthy fsdp2 KL was 5x
+    # megatron's)
+    signal: clipfrac
+
+    # Manual thresholds on the smoothed signal: c2 ramps linearly from c2_min
+    # at sig_low to 1 at sig_high. BOTH null = AUTO mode (thresholds derived
+    # from the run's own healthy signal, see low_mult/high_mult); setting only
+    # one is a config error
+    sig_low: null
+
+    # See sig_low
+    sig_high: null
+
+    # AUTO mode: sig_low = low_mult * sig_ref, where sig_ref is the median of
+    # calib_updates valid signals collected after skipping the first
+    # calib_skip updates (clipfrac starts near 0 while buffer staleness
+    # populates), floored at sig_ref_floor
+    low_mult: 5.0
+
+    # AUTO mode: sig_high = high_mult * sig_ref
+    high_mult: 25.0
+
+    # AUTO mode: updates skipped before the calibration window opens
+    calib_skip: 10
+
+    # AUTO mode: valid signal samples collected for the median reference
+    calib_updates: 20
+
+    # AUTO mode: lower bound on the reference so a near-zero healthy signal
+    # cannot make the thresholds degenerate
+    sig_ref_floor: 1.0e-4
+
+    # Floor on c2 (0 = pure TIS while healthy)
+    c2_min: 0.0
+
+    # EMA smoothing of the input signal: ema <- beta*ema + (1-beta)*signal
+    ema_beta: 0.75
+
+    # c2 increases apply instantly (safety); decreases are limited to this
+    # much per update (hysteresis analog)
+    c2_down_rate: 0.05
+
   # Stop-the-world validation: after a sync that triggers validation, the
   # trainer blocks until the validation sweep completes instead of training
   # ahead on backlog. With generation already paused, the whole pipeline

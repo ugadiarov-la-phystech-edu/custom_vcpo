@@ -35,6 +35,7 @@ from recipe.fully_async_policy.detach_utils import (
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer, make_opportunistic_minibatch_indices
 from recipe.fully_async_policy.replay_buffer import ReplayBuffer
+from recipe.fully_async_policy.staleness_utils import AnchorBlendController, validate_adaptive_anchor_config
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -54,6 +55,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
     A fully asynchronous PPO trainer that obtains samples from a MessageQueue for training.
     Based on an improved implementation of OneStepOffRayTrainer
     """
+
+    # Class-level default so unit tests that construct the trainer via __new__
+    # (bypassing __init__) get the feature-off behavior.
+    adaptive_anchor_enable = False
 
     def __init__(
         self,
@@ -203,6 +208,42 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
             self.replay_updates_done = 0
             self.rollout_done = False
+        # Adaptive TIS/clip soft blend (CLIP_IS_MIXING_ANCHORS_DISCUSSION.md):
+        # after each update the configured drift signal feeds a proportional
+        # controller whose output c2 weights the mu-anchored clip piece of the
+        # NEXT update's loss (stamped into meta_info by _build_replay_batch).
+        # One-update decision lag against a 10-15 step collapse ramp.
+        adaptive_cfg = config.async_training.get("adaptive_anchor", None)
+        self.adaptive_anchor_enable = bool(adaptive_cfg.get("enable", False)) if adaptive_cfg else False
+        if self.adaptive_anchor_enable:
+            assert self.replay_enable, (
+                "async_training.adaptive_anchor requires replay_buffer mode: its control loop lives in _fit_replay"
+            )
+            actor_cfg = config.actor_rollout_ref.actor
+            validate_adaptive_anchor_config(
+                adaptive_cfg,
+                actor_cfg.policy_loss,
+                config.algorithm.get("rollout_correction", None),
+                bool(actor_cfg.grad_baselining.get("enable", False)),
+                bool(config.async_training.get("skip_recompute_old_log_prob", False)),
+            )
+            self._adaptive_signal_key = (
+                "actor/pg_clipfrac" if adaptive_cfg.get("signal", "clipfrac") == "clipfrac" else "rollout_corr/kl"
+            )
+            _opt = lambda key: None if adaptive_cfg.get(key, None) is None else float(adaptive_cfg.get(key))  # noqa: E731
+            self.anchor_blend_controller = AnchorBlendController(
+                sig_low=_opt("sig_low"),
+                sig_high=_opt("sig_high"),
+                low_mult=float(adaptive_cfg.get("low_mult", 5.0)),
+                high_mult=float(adaptive_cfg.get("high_mult", 25.0)),
+                calib_skip=int(adaptive_cfg.get("calib_skip", 10)),
+                calib_updates=int(adaptive_cfg.get("calib_updates", 20)),
+                sig_ref_floor=float(adaptive_cfg.get("sig_ref_floor", 1e-4)),
+                c2_min=float(adaptive_cfg.get("c2_min", 0.0)),
+                ema_beta=float(adaptive_cfg.get("ema_beta", 0.75)),
+                c2_down_rate=float(adaptive_cfg.get("c2_down_rate", 0.05)),
+            )
+            self.anchor_blend_c2 = float(adaptive_cfg.get("c2_min", 0.0))
         # Stop-the-world accounting modes: freeze the whole pipeline during
         # validation (trainer blocks instead of training ahead on backlog) and
         # generation during checkpoint saves, so both become pure time
@@ -614,6 +655,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         batch.batch["token_level_rewards"] = token_level_scores
 
         batch.meta_info["skip_recompute_old_log_prob"] = True
+        if self.adaptive_anchor_enable:
+            # Clip-piece weight decided from the PREVIOUS update's drift signal
+            # (see __init__); the actor blends (1-c2)*L_TIS + c2*L_clip.
+            batch.meta_info["anchor_blend_c2"] = float(self.anchor_blend_c2)
         batch.meta_info["rollout_corr_config"] = self.config.algorithm.get("rollout_correction", None)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         batch.meta_info["n_resp_per_rollout"] = self.config.actor_rollout_ref.rollout.n
@@ -716,6 +761,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 with marked_timer("update_actor", timing_raw, color="red"):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                if self.adaptive_anchor_enable:
+                    self.anchor_blend_c2 = self.anchor_blend_controller.update(metrics.get(self._adaptive_signal_key))
+                    for key, value in self.anchor_blend_controller.state().items():
+                        metrics[f"hybrid/{key}"] = value
                 self._log_rollout(batch, {}, timing_raw)
 
             # Post-update buffer maintenance at the version this update just

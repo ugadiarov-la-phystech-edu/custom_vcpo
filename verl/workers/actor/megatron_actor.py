@@ -22,7 +22,7 @@ Note that our model doesn't have to be `MegatronModule` because we don't share e
 import itertools
 import logging
 import os
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 from functools import partial
 from typing import Iterable
@@ -580,7 +580,70 @@ class MegatronPPOActor(BasePPOActor):
                 rollout_is_weights = data.get("rollout_is_weights", None)
                 old_log_prob_for_loss = old_log_prob
                 anchor_mode = self.config.policy_loss.get("anchor_mode", None)
-                if anchor_mode is not None:
+                blend_c2 = meta_info.get("anchor_blend_c2", None)
+                if blend_c2 is not None:
+                    # Adaptive soft blend (CLIP_IS_MIXING_ANCHORS_DISCUSSION.md):
+                    # L = (1-c2)*L_TIS + c2*L_clip, c2 stamped per mini-batch by
+                    # the driver's AnchorBlendController. The two pieces are
+                    # gradient-identical inside the clip band, so c2 only
+                    # rescales the out-of-band tail: the TIS piece (ratio == 1,
+                    # detached capped pi/mu weight) keeps pushing there at
+                    # (1-c2) strength while the mu-anchored clip piece zeroes
+                    # its share — a soft clip with leak factor 1-c2. Each piece
+                    # carries its OWN off-policy correction (weights on the TIS
+                    # piece only, the pi/mu ratio on the clip piece only), so
+                    # blending never double-counts.
+                    c2 = float(blend_c2)
+                    assert 0.0 <= c2 <= 1.0, f"anchor_blend_c2 must be in [0, 1], got {c2}"
+                    assert anchor_mode is None, (
+                        "anchor_blend_c2 (adaptive blend) and static policy_loss.anchor_mode are mutually exclusive"
+                    )
+                    assert loss_mode == "vanilla", f"anchor_blend_c2 requires loss_mode='vanilla' (got {loss_mode!r})"
+                    assert skip_recompute_old_log_prob, "anchor_blend_c2 requires skip_recompute_old_log_prob=True"
+                    assert rollout_log_prob is not None, (
+                        "anchor_blend_c2 requires rollout_log_probs in the batch (behavior-policy anchor)"
+                    )
+                    assert rollout_corr_cfg.get("rollout_rs", None) is None, (
+                        "anchor_blend_c2 does not support rollout_rs rejection: rejected tokens punch "
+                        "holes in response_mask, silently dropping exactly the highest-divergence tokens "
+                        "the clip piece must see"
+                    )
+                    assert rollout_corr_cfg.get("rollout_is", "token") in (None, "token"), (
+                        "anchor_blend_c2 supports token-level IS weights only (the TIS piece's correction)"
+                    )
+                    # The clip piece is ALWAYS evaluated — its pg_clipfrac is the
+                    # controller's input signal; skipping it at c2=0 would blind
+                    # the controller exactly when it must detect the ramp. Only
+                    # the graph is skipped when its loss weight is zero.
+                    with nullcontext() if c2 > 0.0 else torch.no_grad():
+                        pg_clip, pg_metrics = policy_loss_fn(
+                            old_log_prob=rollout_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=None,
+                        )
+                    if c2 >= 1.0:
+                        pg_loss = pg_clip
+                    else:
+                        pg_tis, _tis_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        pg_loss = pg_tis if c2 <= 0.0 else (1.0 - c2) * pg_tis + c2 * pg_clip
+                    # Report the clip piece's metrics (real pg_clipfrac/ppo_kl
+                    # drift dashboard; the TIS piece's are identically 0).
+                    pg_metrics = dict(pg_metrics)
+                    pg_metrics["hybrid/c2"] = c2
+                    stats.update(pg_metrics)
+                elif anchor_mode is not None:
                     # Arm A (CLIP_IS_MIXING_ANCHORS_DISCUSSION.md §4): anchor the vanilla
                     # PPO clip at the BEHAVIOR policy mu (the cached rollout log-probs,
                     # frozen at generation) instead of log_prob.detach(). The ratio pi/mu
@@ -621,16 +684,17 @@ class MegatronPPOActor(BasePPOActor):
                     )
                     old_log_prob_for_loss = rollout_log_prob
                     rollout_is_weights = None
-                pg_loss, pg_metrics = policy_loss_fn(
-                    old_log_prob=old_log_prob_for_loss,
-                    log_prob=log_prob,
-                    advantages=advantages,
-                    response_mask=response_mask,
-                    loss_agg_mode=loss_agg_mode,
-                    config=self.config,
-                    rollout_is_weights=rollout_is_weights,
-                )
-                stats.update(pg_metrics)
+                if blend_c2 is None:
+                    pg_loss, pg_metrics = policy_loss_fn(
+                        old_log_prob=old_log_prob_for_loss,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_is_weights=rollout_is_weights,
+                    )
+                    stats.update(pg_metrics)
 
                 # Skip if using pure rollout correction mode (metrics already in pg_metrics)
                 rollout_log_prob = data.get("rollout_log_probs", None)
@@ -1289,6 +1353,12 @@ class MegatronPPOActor(BasePPOActor):
             skip_recompute_old_log_prob = skip_recompute_old_log_prob or bool(
                 minibatch.meta_info.get("calculate_rollout_policy_is", False)
             )
+            blend_active = minibatch.meta_info.get("anchor_blend_c2", None) is not None
+            assert not (blend_active and grad_baselining), (
+                "anchor_blend_c2 (adaptive TIS/clip blend) is incompatible with grad_baselining "
+                "(OPOB): the clip piece selects branches by the advantage sign and cannot be "
+                "advantage-folded"
+            )
 
             assert (self.config.use_dynamic_bsz is False) and micro_batch_size == 1, (
                 "Must use micro batch size 1 for accurate gradient norm statistics per trajectory"
@@ -1330,14 +1400,16 @@ class MegatronPPOActor(BasePPOActor):
                 traj_record = local_traj_records[traj_uid]
                 reward_scalar = traj_record.reward_scalar
                 adv_scalar = traj_record.advantage_scalar
-                if mu_anchor:
-                    # mu-anchored clip (anchor_mode="mu"): the vanilla loss selects its
-                    # clip branch by the SIGN of the advantage tensor (and dual-clip by
+                if mu_anchor or blend_active:
+                    # mu-anchored clip (anchor_mode="mu") or adaptive blend
+                    # (anchor_blend_c2): the vanilla clip loss selects its clip
+                    # branch by the SIGN of the advantage tensor (and dual-clip by
                     # advantages < 0), so the A=+1 fold below would apply the wrong clip
-                    # side to negative-advantage trajectories. Keep the real advantages
-                    # in the tensor and only the 1/N micro-batch scale in the multiplier.
-                    # Buffer-free only (no OPOB — asserted above), so nothing downstream
-                    # needs the raw score gradient.
+                    # side to negative-advantage trajectories. (For the blend the fold
+                    # would also be exact only for the linear TIS piece.) Keep the real
+                    # advantages in the tensor and only the 1/N micro-batch scale in the
+                    # multiplier. Buffer-free only (no OPOB — asserted above), so nothing
+                    # downstream needs the raw score gradient.
                     microbatch.meta_info["loss_multiplier"] = microbatch_loss_scale
                 else:
                     # Use raw score gradients g_i <- w_i * grad(log pi) for per-traj accumulation.

@@ -1,13 +1,14 @@
 import math
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from typing import Any, Literal, Optional
 
 import torch
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple, Literal
-from verl import DataProto
 from megatron.core import parallel_state as mpu
+
+from verl import DataProto
 from verl.utils.torch_functional import allgather_dict_into_list
 from verl.workers.utils.ess import ess_from_log_weights
-from collections import defaultdict
 
 
 @dataclass
@@ -18,6 +19,7 @@ class TrajRecord:
     (IS weights, log-prob lists, grad norms, loss) are filled in later by the
     actor or trainer.
     """
+
     # --- identity ---
     uid: Any
     group_uid: Any
@@ -45,9 +47,9 @@ class TrajRecord:
     grad_norm_unscaled: Optional[float] = None
 
     # --- IS / staleness fields (set by compute_is_info) ---
-    old_log_probs: Optional[List[float]] = None
-    rollout_log_probs: Optional[List[float]] = None
-    kl_rollout_old: Optional[float] = None          # KL(rollout||old), K3 f-divergence form
+    old_log_probs: Optional[list[float]] = None
+    rollout_log_probs: Optional[list[float]] = None
+    kl_rollout_old: Optional[float] = None  # KL(rollout||old), K3 f-divergence form
     rollout_is_geom_mean: Optional[float] = None
     rollout_seq_is: Optional[float] = None
     rollout_seq_is_clipped: Optional[float] = None
@@ -62,7 +64,7 @@ class TrajRecordList(list):
     """List of :class:`TrajRecord` objects with optional lookup by ``traj_uid``."""
 
     def __getitem__(self, key):
-        if isinstance(key, (int, slice)):
+        if isinstance(key, int | slice):
             return super().__getitem__(key)
         key_str = str(key)
         for record in self:
@@ -85,6 +87,7 @@ def mean_nonzero(x: torch.Tensor, dim=None, keepdim: bool = False):
     cnt = mask.sum(dim=dim, keepdim=keepdim)
 
     return torch.where(cnt > 0, sum_ / cnt.clamp_min(1), torch.zeros_like(sum_))
+
 
 def compute_global_ess_ratio(
     local_is_sum: float,
@@ -117,7 +120,7 @@ def compute_global_ess_ratio(
         global_minibatch_size = int(global_minibatch_size)
 
     if global_minibatch_size > 0:
-        global_ess = (global_is_sum ** 2) / (global_is_sq_sum + eps)
+        global_ess = (global_is_sum**2) / (global_is_sq_sum + eps)
         global_ess_ratio = global_ess / global_minibatch_size
     else:
         global_ess = 0.0
@@ -125,13 +128,14 @@ def compute_global_ess_ratio(
 
     return global_ess, global_ess_ratio, global_is_sum, global_is_sq_sum, global_minibatch_size
 
+
 def compute_staleness_statistics(
-    batch: DataProto, 
+    batch: DataProto,
     minibatch_idx: int,
     rollout_is_threshold: float | None,
     use_old_log_probs: bool = False,
     epoch_idx: int = 0,
-) -> Tuple[list[TrajRecord], Dict]:
+) -> tuple[list[TrajRecord], dict]:
     """
     Computes the local per-traj :class:`TrajRecord` list as well as ESS info.
 
@@ -171,8 +175,7 @@ def compute_staleness_statistics(
     param_version_end_all = non_tensor_batch.get("param_version_end")
     if param_version_start_all is None or param_version_end_all is None:
         raise KeyError(
-            "Missing param version metadata. Expected non_tensor keys "
-            "'param_version_start'/'param_version_end'."
+            "Missing param version metadata. Expected non_tensor keys 'param_version_start'/'param_version_end'."
         )
 
     local_records = TrajRecordList()
@@ -211,7 +214,7 @@ def compute_staleness_statistics(
         if use_old_log_probs:
             old_log_prob = batch.batch["old_log_probs"][idx]
             rollout_log_prob = batch.batch["rollout_log_probs"][idx]
-            
+
             record = compute_is_info(
                 record,
                 rollout_log_prob,
@@ -224,10 +227,11 @@ def compute_staleness_statistics(
 
     if not use_old_log_probs:
         return local_records, {}
-    
+
     staleness_info = compute_ess_info(list(local_records), rollout_is_threshold)
 
     return local_records, staleness_info
+
 
 def compute_is_info(
     record: TrajRecord,
@@ -281,14 +285,15 @@ def compute_is_info(
             seq_log_is = (log_ratio.float() * mask_float.float()).sum()
             record.rollout_seq_log_is = float(seq_log_is.detach().item())
 
-            seq_is = torch.exp(((log_ratio * mask_float).sum()))
+            seq_is = torch.exp((log_ratio * mask_float).sum())
             seq_is_value = float(seq_is.detach().item())
             record.rollout_seq_is = seq_is_value
             if rollout_is_threshold is not None and rollout_is_threshold > 0:
                 record.rollout_seq_is_clipped = min(seq_is_value, float(rollout_is_threshold))
     return record
 
-def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold: float | None, eps: float = 1e-8):
+
+def compute_ess_info(local_records_list: list[TrajRecord], rollout_is_threshold: float | None, eps: float = 1e-8):
     """
     ESS Calculations:
         ess = (sum w_i)^2 / (sum w_i^2)
@@ -309,10 +314,7 @@ def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold:
     max-shift makes the denominator positive whenever the batch is non-empty.
     """
     dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-    is_leader = (
-        mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.get_pipeline_model_parallel_rank() == 0
-    )
+    is_leader = mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == 0
 
     # allgather_dict_into_list requires plain dicts; serialize TrajRecord objects first.
     local_dicts: list[dict] = [asdict(r) for r in local_records_list] if is_leader else []
@@ -332,9 +334,7 @@ def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold:
             log_is = math.log(float(seq_is))
         seq_log_is.append(float(log_is))
 
-    ESS_unclipped, ess_ratio_unclipped, ESS, ess_ratio, count = ess_from_log_weights(
-        seq_log_is, rollout_is_threshold
-    )
+    ESS_unclipped, ess_ratio_unclipped, ESS, ess_ratio, count = ess_from_log_weights(seq_log_is, rollout_is_threshold)
 
     staleness_info = {
         "ess": ESS_unclipped,
@@ -347,6 +347,7 @@ def compute_ess_info(local_records_list: List[TrajRecord], rollout_is_threshold:
     }
 
     return staleness_info
+
 
 def rearrange_minibatch(batch: DataProto) -> DataProto:
     """
@@ -370,6 +371,7 @@ def rearrange_minibatch(batch: DataProto) -> DataProto:
 
     return batch[new_indices]
 
+
 def compute_grad_info(batch: DataProto, scope: Literal["group", "minibatch"] = "group", eps: float = 1e-8):
     n_resp_per_rollout = batch.meta_info["n_resp_per_rollout"]
     batch = rearrange_minibatch(batch)
@@ -390,9 +392,9 @@ def compute_grad_info(batch: DataProto, scope: Literal["group", "minibatch"] = "
         group_traj_counts[group_uid] += 1
 
         if scope == "group":
-            is_last_traj_in_scope[traj_uid] = (group_traj_counts[group_uid] == n_resp_per_rollout)
+            is_last_traj_in_scope[traj_uid] = group_traj_counts[group_uid] == n_resp_per_rollout
         else:
-            is_last_traj_in_scope[traj_uid] = (idx == len(traj_uids) - 1)
+            is_last_traj_in_scope[traj_uid] = idx == len(traj_uids) - 1
 
         group_to_trajs[group_uid].append(traj_uid)
 
@@ -426,9 +428,9 @@ def compute_grad_info(batch: DataProto, scope: Literal["group", "minibatch"] = "
 
     return batch
 
-    
+
 def compute_opob_baseline(
-    local_traj_records: List[TrajRecord],
+    local_traj_records: list[TrajRecord],
     group_uid: int,
     eps: float = 1e-8,
     use_is_weights: bool = True,
@@ -450,7 +452,7 @@ def compute_opob_baseline(
         if scope == "minibatch":
             return True
         return rec.group_uid == group_uid
-    
+
     with torch.no_grad():
         for rec in local_traj_records:
             if _in_scope(rec):
@@ -458,20 +460,20 @@ def compute_opob_baseline(
                     rwd = rec.advantage_scalar
                 else:
                     rwd = rec.reward_scalar
-    
+
                 if use_clipped_is_ratios:
                     seq_is_ratio = rec.rollout_seq_is_clipped
                 else:
                     seq_is_ratio = rec.rollout_seq_is
-                
+
                 grad_norm = rec.grad_norm_unscaled
-                weight = grad_norm ** 2
+                weight = grad_norm**2
                 if use_is_weights:
-                    weight *= seq_is_ratio ** 2
+                    weight *= seq_is_ratio**2
 
                 if normalize_by_length:
                     length = rec.response_length
-                    weight = weight / (length ** 2)
+                    weight = weight / (length**2)
 
                 weights.append(weight)
                 values.append(rwd)
@@ -500,7 +502,7 @@ def get_weighted_mean(values, weights, eps: float = 1e-8):
         return 0.0
     numer = 0.0
     denom = 0.0
-    for value, weight in zip(values, weights):
+    for value, weight in zip(values, weights, strict=False):
         numer += float(value) * float(weight)
         denom += float(weight)
     return numer / (denom + eps)
@@ -532,7 +534,7 @@ def get_weighted_median(values, weights):
         total_w += float(weight)
     if total_w == 0.0:
         return 0.0
-    sorted_pairs = sorted(zip(values, weights), key=lambda pair: pair[0])
+    sorted_pairs = sorted(zip(values, weights, strict=False), key=lambda pair: pair[0])
     cum_w = 0.0
     cutoff = 0.5 * total_w
     for value, weight in sorted_pairs:
@@ -583,7 +585,7 @@ def get_weighted_winsorized_mean(values, weights, lower_q: float = 0.05, upper_q
     if total_w == 0.0:
         return 0.0
 
-    sorted_pairs = sorted(zip(values, weights), key=lambda pair: pair[0])
+    sorted_pairs = sorted(zip(values, weights, strict=False), key=lambda pair: pair[0])
     cum_w = 0.0
     lower_cut = lower_q * total_w
     upper_cut = upper_q * total_w
@@ -603,8 +605,178 @@ def get_weighted_winsorized_mean(values, weights, lower_q: float = 0.05, upper_q
 
     numer = 0.0
     denom = 0.0
-    for value, weight in zip(values, weights):
+    for value, weight in zip(values, weights, strict=False):
         clipped = min(max(float(value), float(lower_val)), float(upper_val))
         numer += clipped * float(weight)
         denom += float(weight)
     return numer / (denom + eps)
+
+
+class AnchorBlendController:
+    """Driver-side controller for the soft TIS/clip loss blend
+    (CLIP_IS_MIXING_ANCHORS_DISCUSSION.md; per-token loss
+    ``L = (1-c2)*L_TIS + c2*L_clip``).
+
+    Maps a smoothed drift signal (default: the mu-anchored clip piece's
+    ``actor/pg_clipfrac`` -- dimensionless and backend-transferable; KL needs
+    per-stack recalibration) to the clip-piece weight ``c2 in [c2_min, 1]``:
+
+    * ``sig_ema <- beta*sig_ema + (1-beta)*sig``; a missing/NaN signal holds
+      the previous EMA and c2 (a failed measurement must not move the blend).
+    * target ``c2 = clamp((sig_ema - sig_low) / (sig_high - sig_low),
+      c2_min, 1)`` -- proportional control on the tail fraction.
+    * Asymmetric slew: increases apply instantly (safety); decreases are
+      rate-limited by ``c2_down_rate`` per update (the hysteresis/dwell analog
+      of a hard switch, without discrete state).
+
+    AUTO threshold mode (default, the house ``base=auto`` pattern): with
+    ``sig_low``/``sig_high`` both None the thresholds self-calibrate from the
+    run's own healthy signal -- the median of ``calib_updates`` valid samples
+    collected after skipping the first ``calib_skip`` updates (clipfrac starts
+    near 0 while the buffer/staleness populate), floored at ``sig_ref_floor``,
+    then frozen as ``low_mult*ref`` / ``high_mult*ref``. During calibration
+    ``c2 = c2_min``. Setting both thresholds explicitly disables calibration;
+    setting only one is a config error.
+    """
+
+    def __init__(
+        self,
+        sig_low: Optional[float] = None,
+        sig_high: Optional[float] = None,
+        low_mult: float = 5.0,
+        high_mult: float = 25.0,
+        calib_skip: int = 10,
+        calib_updates: int = 20,
+        sig_ref_floor: float = 1e-4,
+        c2_min: float = 0.0,
+        ema_beta: float = 0.75,
+        c2_down_rate: float = 0.05,
+    ):
+        manual = (sig_low is not None) or (sig_high is not None)
+        if manual:
+            assert sig_low is not None and sig_high is not None, (
+                "adaptive_anchor: set BOTH sig_low and sig_high (manual thresholds) or NEITHER (auto calibration); "
+                f"got sig_low={sig_low}, sig_high={sig_high}"
+            )
+            assert 0.0 <= float(sig_low) < float(sig_high), (
+                f"adaptive_anchor: need 0 <= sig_low < sig_high, got {sig_low}, {sig_high}"
+            )
+        assert 0.0 <= float(c2_min) <= 1.0, f"adaptive_anchor: c2_min must be in [0, 1], got {c2_min}"
+        assert 0.0 < float(ema_beta) < 1.0, f"adaptive_anchor: ema_beta must be in (0, 1), got {ema_beta}"
+        assert float(c2_down_rate) > 0.0, f"adaptive_anchor: c2_down_rate must be > 0, got {c2_down_rate}"
+        assert float(low_mult) < float(high_mult), (
+            f"adaptive_anchor: need low_mult < high_mult, got {low_mult}, {high_mult}"
+        )
+        assert int(calib_updates) >= 1, f"adaptive_anchor: calib_updates must be >= 1, got {calib_updates}"
+
+        self.auto = not manual
+        self.sig_low = None if self.auto else float(sig_low)
+        self.sig_high = None if self.auto else float(sig_high)
+        self.low_mult = float(low_mult)
+        self.high_mult = float(high_mult)
+        self.calib_skip = int(calib_skip)
+        self.calib_updates = int(calib_updates)
+        self.sig_ref_floor = float(sig_ref_floor)
+        self.c2_min = float(c2_min)
+        self.ema_beta = float(ema_beta)
+        self.c2_down_rate = float(c2_down_rate)
+
+        self.sig_ref: Optional[float] = None
+        self._calib_window: list[float] = []
+        self._updates_seen = 0
+        self._sig_ema: Optional[float] = None
+        self._c2 = self.c2_min
+
+    @property
+    def calibrated(self) -> bool:
+        """True once thresholds are available (immediately in manual mode)."""
+        return self.sig_low is not None and self.sig_high is not None
+
+    def update(self, sig: Optional[float]) -> float:
+        """Consume the just-finished update's signal; return c2 for the NEXT update."""
+        self._updates_seen += 1
+        valid = sig is not None and math.isfinite(float(sig))
+        if valid:
+            sig = float(sig)
+            if self._sig_ema is None:
+                self._sig_ema = sig
+            else:
+                self._sig_ema = self.ema_beta * self._sig_ema + (1.0 - self.ema_beta) * sig
+            if self.auto and not self.calibrated and self._updates_seen > self.calib_skip:
+                self._calib_window.append(sig)
+                if len(self._calib_window) >= self.calib_updates:
+                    ordered = sorted(self._calib_window)
+                    mid = len(ordered) // 2
+                    median = ordered[mid] if len(ordered) % 2 == 1 else 0.5 * (ordered[mid - 1] + ordered[mid])
+                    self.sig_ref = max(median, self.sig_ref_floor)
+                    self.sig_low = self.low_mult * self.sig_ref
+                    self.sig_high = self.high_mult * self.sig_ref
+
+        if not self.calibrated or self._sig_ema is None:
+            self._c2 = self.c2_min
+            return self._c2
+        if not valid:
+            return self._c2
+
+        target = (self._sig_ema - self.sig_low) / (self.sig_high - self.sig_low)
+        target = min(max(target, self.c2_min), 1.0)
+        if target >= self._c2:
+            self._c2 = target  # rise instantly (safety)
+        else:
+            self._c2 = max(target, self._c2 - self.c2_down_rate)  # rate-limited descent
+        return self._c2
+
+    def state(self) -> dict[str, float]:
+        """Metrics snapshot (prefixed hybrid/ by the trainer)."""
+        out = {"c2": self._c2, "calibrated": float(self.calibrated)}
+        if self._sig_ema is not None:
+            out["sig_ema"] = self._sig_ema
+        if self.calibrated:
+            out["sig_low"] = float(self.sig_low)
+            out["sig_high"] = float(self.sig_high)
+        if self.sig_ref is not None:
+            out["sig_ref"] = self.sig_ref
+        return out
+
+
+def validate_adaptive_anchor_config(
+    adaptive_cfg,
+    policy_loss_cfg,
+    rollout_corr_cfg,
+    grad_baselining_enable: bool,
+    skip_recompute_old_log_prob: bool,
+) -> None:
+    """Fail-fast startup validation for async_training.adaptive_anchor.
+
+    Mirrors the actor's static anchor_mode='mu' assert battery on the driver so
+    a mid-run c2 > 0 mini-batch cannot die hundreds of steps in. Pure function
+    over plain dict-likes (``.get``) for CPU unit tests.
+    """
+    signal = adaptive_cfg.get("signal", "clipfrac")
+    assert signal in ("clipfrac", "kl"), f"adaptive_anchor.signal must be 'clipfrac' or 'kl', got {signal!r}"
+    assert policy_loss_cfg.get("anchor_mode", None) is None, (
+        "adaptive_anchor owns the TIS/clip blend: set policy_loss.anchor_mode=null "
+        f"(got {policy_loss_cfg.get('anchor_mode')!r}); static anchor_mode='mu' and the "
+        "adaptive blend are mutually exclusive"
+    )
+    loss_mode = policy_loss_cfg.get("loss_mode", "vanilla")
+    assert loss_mode == "vanilla", (
+        f"adaptive_anchor requires policy_loss.loss_mode='vanilla' (got {loss_mode!r}): the clip piece "
+        "reuses the stock vanilla surrogate"
+    )
+    assert skip_recompute_old_log_prob, (
+        "adaptive_anchor requires async_training.skip_recompute_old_log_prob=True (the TIS piece anchors "
+        "at log_prob.detach() and the clip piece at the cached rollout log-probs)"
+    )
+    assert not grad_baselining_enable, (
+        "adaptive_anchor is incompatible with grad_baselining (OPOB): the clipped piece selects branches "
+        "by the advantage sign and cannot be advantage-folded"
+    )
+    assert rollout_corr_cfg is not None and rollout_corr_cfg.get("rollout_is", None) == "token", (
+        "adaptive_anchor requires algorithm.rollout_correction.rollout_is='token' (the TIS piece's weights "
+        "and the drift metrics both come from the token-level deferred correction)"
+    )
+    assert rollout_corr_cfg.get("rollout_rs", None) is None, (
+        "adaptive_anchor does not support rollout_rs rejection: rejected tokens punch holes in "
+        "response_mask, silently dropping exactly the highest-divergence tokens the clip piece must see"
+    )

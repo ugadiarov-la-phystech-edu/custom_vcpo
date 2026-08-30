@@ -6,34 +6,38 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=grpo-novcpo-replay-anchor-mu-wide-clip
+#SBATCH --job-name=grpo-novcpo-replay-anchor-blend
 
-# ARM A (mu-anchored PPO clip; CLIP_IS_MIXING_ANCHORS_DISCUSSION.md §4) on top
-# of the min-ess replay arm below. What changes vs the base script:
-#   * actor.policy_loss.anchor_mode=mu — the vanilla PPO loss's old_log_prob is
-#     the CACHED behavior log-probs mu (frozen in the replay buffer at
-#     generation) instead of log_prob.detach(). The ratio pi/mu is then the
-#     importance correction itself, so the detached token-IS weight sg(min(
-#     pi/mu, 2)) is dropped IN-LOSS (composition rule, doc §3) — the
-#     rollout_is=token config below stays ONLY to feed the deferred correction
-#     metrics (rollout_corr/*) and the ESS brake inputs; its weights never
-#     reach the loss on this arm.
-#   * The clip band bounds each token's CUMULATIVE movement across replay
-#     reuse: once pi/mu exits [1-clip_ratio_low, 1+clip_ratio_high] the pushing
-#     gradient stops permanently (mu never refreshes) — the trust region the
-#     TIS-only loss lacks (its A>0/up-drift quadrant is unbounded; all four
-#     collapse post-mortems). clip_ratio_high=0.28 (DAPO clip-higher) admits
-#     more up-side for low-probability tokens; clip_ratio_c=3.0 dual-clips the
-#     A<0, ratio>>1 corner.
-#   * mbs=1 per-traj path note: under anchor_mode=mu the actor keeps the REAL
-#     advantages in the tensor (no A=+1 fold) — the clipped loss selects
-#     branches by the advantage sign. Buffer-free only; OPOB must stay off.
-#   * RESTORED METRIC SEMANTICS: actor/pg_clipfrac becomes real clip activity
-#     (expected low single digits % early, rising with mini-batch staleness —
-#     the first-line drift dashboard; >30-40% with stalled val = signal
-#     starvation, see doc §6 for Arm B/CPPO) and actor/ppo_kl becomes in-loss
-#     KL(pi||mu). Both are identically 0 on the base arm — do not overlay.
-#   * min-ESS lr brake kept as-is: lr-level, orthogonal to the loss-level clip.
+# ADAPTIVE BLEND arm (soft TIS/clip hybrid; CLIP_IS_MIXING_ANCHORS_DISCUSSION.md
+# §7-8 diagnosis, blend design in the async_training.adaptive_anchor config
+# docstring) on top of the min-ess replay arm below. Per token:
+#     L = (1 - c2) * L_TIS  +  c2 * L_clip
+#   * L_TIS = the baseline loss (ratio == 1, detached token-IS weight
+#     sg(min(pi/mu, 2))) — fast learning, unbounded A>0/up-drift quadrant.
+#   * L_clip = Arm A's mu-anchored vanilla clip (no TIS weight — composition
+#     rule per piece). The two pieces are GRADIENT-IDENTICAL inside the clip
+#     band, so c2 only attenuates the out-of-band tail: c2=0 is bitwise the
+#     baseline, c2=1 is Arm A's hard cumulative bound, in between the runaway
+#     quadrant flows at (1-c2) strength — a soft clip with leak factor 1-c2.
+#   * c2 is set per update by a proportional controller on the mu-anchored
+#     clip piece's pg_clipfrac (the tail fraction itself — dimensionless,
+#     backend-transferable; the clip piece's metrics are computed even at
+#     c2=0 so the signal is always live). AUTO thresholds: engage at
+#     low_mult x (median healthy clipfrac over the calibration window), full
+#     clip at high_mult x; measured healthy narrow-band clipfrac here is
+#     ~0.2-0.75%, the fsdp2-runaway regime is ~4-25% out-of-band.
+#   * Clip band kept NARROW (0.2/0.28, c=3.0): the clip piece exists to damp
+#     during ramps — the TIS piece carries learning speed while healthy — so
+#     this arm should NOT pay Arm A's 2x slow-learning tax (doc §7).
+#   * METRICS: actor/pg_clipfrac + actor/ppo_kl are always-on (from the clip
+#     piece even at c2=0; ppo_kl = KL(pi||mu) in-loss) — pg_clipfrac doubles
+#     as the controller input. hybrid/c2 is the blend trace (c2_min while
+#     healthy, rising on drift ramps); hybrid/sig_low, hybrid/sig_high appear
+#     once auto-calibration freezes (after calib_skip + calib_updates
+#     updates). mbs=1 per-traj path keeps REAL advantages (no A=+1 fold);
+#     OPOB must stay off.
+#   * min-ESS lr brake kept as-is: lr-level, orthogonal (last line against a
+#     knee faster than the controller's one-update lag).
 # MIN-ESS-braked replay arm (mbs=1 per-traj path): the ESS brake is a floor
 # detector — brake (lr * ess_lr_scale) only when the mini-batch's global ESS
 # is <= min_ess (1.1) effective samples, i.e. within 10% of the structural
@@ -167,25 +171,33 @@ bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}} # Rollout Bsz
 adv_estimator=grpo
 loss_agg_mode="seq-mean-token-mean"
 clip_ratio=0.2
-# WIDENED Arm A clip band (CLIP_IS_MIXING_ANCHORS_DISCUSSION.md §7-8): the
-# [0.8, 1.28] band is a cumulative movement budget over a group's whole
-# ~16-reuse/64-update buffer life (mu never refreshes), and the measured
-# healthy drift (rollout_corr/kl ~0.0017, RMS log-ratio ~0.06 at staleness
-# ~15) puts the highest-signal gradient tail right at the 1.28 edge — the
-# clip cut 0.35% of tokens but enough gradient MASS to halve policy movement
-# vs the sqrt-brake baseline (lr-insensitive: lrscale 0.5 vs 1 arms were
-# near-identical, so the band, not lr, is the limiter). Widen to
-# [0.7, 1.5]: r=1.5 ~ 7 sigma of healthy drift admits nearly all healthy
-# movement while still excluding the collapse regime (r-tails >> 2, KL knee
-# 10x healthy). clip_ratio_c stays 3.0 (dual-clip guard; the cppo arms'
-# 20.0 repurposes it as a TIS cap and must NOT be copied here). Success =
-# val slope approaches the baseline, pg_clipfrac < 0.35%, rollout_corr/kl
-# rises toward ~0.0017 with no knee; collapse = the 1.28 edge was
-# load-bearing -> retreat to a band between 0.28 and 0.5.
-anchor_mode=${anchor_mode:-mu}
-clip_ratio_low=${clip_ratio_low:-0.3}
-clip_ratio_high=${clip_ratio_high:-0.5}
+# Clip band for the BLEND's clip piece (see header): narrow DAPO band — the
+# piece damps, it does not need to admit learning movement; clip_ratio_c is
+# the dual-clip guard for the A<0, r>>1 corner (keep at 3.0 — the cppo arms'
+# 20.0 repurposes it as a TIS cap and must NOT be copied here). anchor_mode
+# stays null: the adaptive controller owns the blend (static anchor_mode=mu
+# and the blend are mutually exclusive, asserted).
+anchor_mode=${anchor_mode:-null}
+clip_ratio_low=${clip_ratio_low:-0.2}
+clip_ratio_high=${clip_ratio_high:-0.28}
 clip_ratio_c=${clip_ratio_c:-3.0}
+
+# ================= Adaptive TIS/clip blend =================
+# AUTO thresholds (sig_low/sig_high null): engage c2 above low_mult x healthy
+# clipfrac, full clip at high_mult x; median over blend_calib_updates valid
+# signals after skipping blend_calib_skip updates. c2 rises instantly, falls
+# at c2_down_rate/update. c2_min=0: pure-TIS (baseline-speed) while healthy.
+adaptive_anchor_enable=${adaptive_anchor_enable:-True}
+blend_signal=${blend_signal:-clipfrac}
+blend_sig_low=${blend_sig_low:-null}
+blend_sig_high=${blend_sig_high:-null}
+blend_low_mult=${blend_low_mult:-5.0}
+blend_high_mult=${blend_high_mult:-25.0}
+blend_calib_skip=${blend_calib_skip:-10}
+blend_calib_updates=${blend_calib_updates:-20}
+blend_c2_min=${blend_c2_min:-0.0}
+blend_ema_beta=${blend_ema_beta:-0.75}
+blend_c2_down_rate=${blend_c2_down_rate:-0.05}
 use_kl_loss=False
 kl_loss_coef=0.0
 use_kl_in_reward=False
@@ -294,7 +306,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} anchor-${anchor_mode}-clip-${clip_ratio_low}-${clip_ratio_high}-c-${clip_ratio_c} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} anchor-blend-${blend_signal}-auto-x${blend_low_mult}-x${blend_high_mult}-floor-${blend_c2_min} clip-${clip_ratio_low}-${clip_ratio_high}-c-${clip_ratio_c} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -343,6 +355,17 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=${clip_ratio_c} \
     actor_rollout_ref.actor.policy_loss.anchor_mode=${anchor_mode} \
+    async_training.adaptive_anchor.enable=${adaptive_anchor_enable} \
+    async_training.adaptive_anchor.signal=${blend_signal} \
+    async_training.adaptive_anchor.sig_low=${blend_sig_low} \
+    async_training.adaptive_anchor.sig_high=${blend_sig_high} \
+    async_training.adaptive_anchor.low_mult=${blend_low_mult} \
+    async_training.adaptive_anchor.high_mult=${blend_high_mult} \
+    async_training.adaptive_anchor.calib_skip=${blend_calib_skip} \
+    async_training.adaptive_anchor.calib_updates=${blend_calib_updates} \
+    async_training.adaptive_anchor.c2_min=${blend_c2_min} \
+    async_training.adaptive_anchor.ema_beta=${blend_ema_beta} \
+    async_training.adaptive_anchor.c2_down_rate=${blend_c2_down_rate} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.hybrid_engine=False \
