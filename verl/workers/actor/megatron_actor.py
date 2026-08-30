@@ -641,7 +641,11 @@ class MegatronPPOActor(BasePPOActor):
                     # Report the clip piece's metrics (real pg_clipfrac/ppo_kl
                     # drift dashboard; the TIS piece's are identically 0).
                     pg_metrics = dict(pg_metrics)
-                    pg_metrics["hybrid/c2"] = c2
+                    # *_used = what weighted THIS update's gradient; the trainer's
+                    # hybrid/c2 + hybrid/grad_method (controller state) describe the
+                    # NEXT update and would overwrite same-named keys here.
+                    pg_metrics["hybrid/c2_used"] = c2
+                    pg_metrics["hybrid/grad_method_used"] = 0.0 if c2 <= 0.0 else 2.0 if c2 >= 1.0 else 1.0
                     stats.update(pg_metrics)
                 elif anchor_mode is not None:
                     # Arm A (CLIP_IS_MIXING_ANCHORS_DISCUSSION.md §4): anchor the vanilla

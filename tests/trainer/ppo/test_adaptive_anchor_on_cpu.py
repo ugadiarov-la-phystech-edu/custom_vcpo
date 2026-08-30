@@ -474,6 +474,50 @@ class TestValidateConfig:
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
+class TestGradMethodLogging:
+    """Which gradient method is active (TIS / blend / PPO-clip) must be legible
+    from metrics and log lines."""
+
+    @pytest.mark.parametrize(
+        "c2,code,name",
+        [
+            (0.0, 0.0, "TIS"),
+            (-0.0, 0.0, "TIS"),
+            (1e-6, 1.0, "blend"),
+            (0.5, 1.0, "blend"),
+            (1.0 - 1e-6, 1.0, "blend"),
+            (1.0, 2.0, "PPO-clip"),
+        ],
+    )
+    def test_grad_method_mapping(self, c2, code, name):
+        assert AnchorBlendController.grad_method_code(c2) == code
+        assert AnchorBlendController.grad_method_name(c2) == name
+
+    def test_state_carries_grad_method(self):
+        ctrl = AnchorBlendController(sig_low=0.01, sig_high=0.05)
+        assert ctrl.state()["grad_method"] == 0.0  # starts at c2_min=0 -> pure TIS
+        for _ in range(20):
+            ctrl.update(0.03)  # mid-band signal -> partial c2
+        state = ctrl.state()
+        assert 0.0 < state["c2"] < 1.0
+        assert state["grad_method"] == 1.0
+        for _ in range(50):
+            ctrl.update(1.0)  # saturating signal -> c2 pinned at 1
+        state = ctrl.state()
+        assert state["c2"] == 1.0
+        assert state["grad_method"] == 2.0
+
+    def test_state_grad_method_tracks_c2_descent(self):
+        ctrl = AnchorBlendController(sig_low=0.01, sig_high=0.05, c2_down_rate=0.5)
+        for _ in range(50):
+            ctrl.update(1.0)
+        assert ctrl.state()["grad_method"] == 2.0
+        for _ in range(50):
+            ctrl.update(0.0)  # healthy signal -> c2 decays back to c2_min
+        assert ctrl.state()["c2"] == 0.0
+        assert ctrl.state()["grad_method"] == 0.0
+
+
 class TestConfigPlumbing:
     def test_recipe_yaml_carries_adaptive_anchor_defaults(self):
         cfg = OmegaConf.load(

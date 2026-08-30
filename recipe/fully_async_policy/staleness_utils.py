@@ -692,6 +692,16 @@ class AnchorBlendController:
         """True once thresholds are available (immediately in manual mode)."""
         return self.sig_low is not None and self.sig_high is not None
 
+    @staticmethod
+    def grad_method_code(c2: float) -> float:
+        """Numeric gradient-method indicator for dashboards: 0 = pure TIS, 1 = soft blend, 2 = pure PPO clip."""
+        return 0.0 if c2 <= 0.0 else 2.0 if c2 >= 1.0 else 1.0
+
+    @staticmethod
+    def grad_method_name(c2: float) -> str:
+        """Human-readable gradient method for a given c2 (log lines)."""
+        return "TIS" if c2 <= 0.0 else "PPO-clip" if c2 >= 1.0 else "blend"
+
     def update(self, sig: Optional[float]) -> float:
         """Consume the just-finished update's signal; return c2 for the NEXT update."""
         self._updates_seen += 1
@@ -728,7 +738,7 @@ class AnchorBlendController:
 
     def state(self) -> dict[str, float]:
         """Metrics snapshot (prefixed hybrid/ by the trainer)."""
-        out = {"c2": self._c2, "calibrated": float(self.calibrated)}
+        out = {"c2": self._c2, "calibrated": float(self.calibrated), "grad_method": self.grad_method_code(self._c2)}
         if self._sig_ema is not None:
             out["sig_ema"] = self._sig_ema
         if self.calibrated:

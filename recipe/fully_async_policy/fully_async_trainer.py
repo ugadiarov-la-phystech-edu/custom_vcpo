@@ -762,7 +762,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
                 if self.adaptive_anchor_enable:
+                    prev_c2 = self.anchor_blend_c2
                     self.anchor_blend_c2 = self.anchor_blend_controller.update(metrics.get(self._adaptive_signal_key))
+                    prev_method = AnchorBlendController.grad_method_name(prev_c2)
+                    new_method = AnchorBlendController.grad_method_name(self.anchor_blend_c2)
+                    if new_method != prev_method:
+                        print(
+                            f"[AnchorBlend] gradient method: {prev_method} -> {new_method} "
+                            f"(c2={self.anchor_blend_c2:.4f}, "
+                            f"signal {self._adaptive_signal_key}={metrics.get(self._adaptive_signal_key)}, "
+                            f"state={self.anchor_blend_controller.state()})"
+                        )
                     for key, value in self.anchor_blend_controller.state().items():
                         metrics[f"hybrid/{key}"] = value
                 self._log_rollout(batch, {}, timing_raw)
