@@ -24,6 +24,8 @@ decision rather than a silent reward shift. Nothing here needs the model: the st
 reward manager sees after ``decode(skip_special_tokens=True)``.
 """
 
+import os
+import time
 import unittest
 
 from recipe.fully_async_policy.reward import orz_tag_aware_math as orz
@@ -216,6 +218,70 @@ class TestOrzEqualityTierThree(unittest.TestCase):
                 os.environ.pop("ORZ_MATH_SYMPY_TIER", None)
             else:
                 os.environ["ORZ_MATH_SYMPY_TIER"] = saved_env
+
+
+def _sleeping_worker(str1, str2, backend, send_conn):
+    """A worker that never answers -- stands in for a pathological evalf hang."""
+    import time
+
+    time.sleep(60)
+
+
+def _raising_worker(str1, str2, backend, send_conn):
+    raise RuntimeError("boom")
+
+
+def _crashing_worker(str1, str2, backend, send_conn):
+    import os
+
+    os._exit(1)
+
+
+class TestSympyTierHardTimeout(unittest.TestCase):
+    """The 2026-08-30 remote_mary stall: parse_latex/evalf can burn CPU for minutes on
+    short inputs; the tier must be bounded by a KILLED fork child, never waited on.
+    The worker is monkeypatched module-side -- fork children inherit the patch."""
+
+    def setUp(self):
+        if not orz._sympy_tier_enabled():
+            self.skipTest("no sympy latex parser backend available")
+        self._saved_worker = orz._latex_equal_worker
+        self._saved_timeout = os.environ.get("ORZ_MATH_SYMPY_TIMEOUT")
+
+    def tearDown(self):
+        orz._latex_equal_worker = self._saved_worker
+        if self._saved_timeout is None:
+            os.environ.pop("ORZ_MATH_SYMPY_TIMEOUT", None)
+        else:
+            os.environ["ORZ_MATH_SYMPY_TIMEOUT"] = self._saved_timeout
+
+    def test_hanging_comparison_returns_false_within_the_deadline(self):
+        orz._latex_equal_worker = _sleeping_worker
+        os.environ["ORZ_MATH_SYMPY_TIMEOUT"] = "0.5"
+        start = time.monotonic()
+        self.assertFalse(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 5.0, f"hard timeout did not bound the call ({elapsed:.1f}s)")
+
+    def test_timeout_env_override_is_respected(self):
+        orz._latex_equal_worker = _sleeping_worker
+        os.environ["ORZ_MATH_SYMPY_TIMEOUT"] = "0.2"
+        start = time.monotonic()
+        orz._is_latex_equal("1", "1")
+        self.assertLess(time.monotonic() - start, 3.0)
+
+    def test_raising_worker_returns_false(self):
+        orz._latex_equal_worker = _raising_worker
+        self.assertFalse(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+
+    def test_hard_crashing_worker_returns_false(self):
+        orz._latex_equal_worker = _crashing_worker
+        self.assertFalse(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+
+    def test_real_equivalence_still_passes_through_the_subprocess(self):
+        # No monkeypatch: the genuine worker, via fork + pipe + deadline.
+        self.assertTrue(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+        self.assertFalse(orz._is_latex_equal("\\frac{1}{3}", "\\frac{1}{4}"))
 
 
 class TestOrzEqualityEdgeCases(unittest.TestCase):

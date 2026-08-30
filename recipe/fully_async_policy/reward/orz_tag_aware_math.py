@@ -47,6 +47,7 @@ Wired into an arm via::
     custom_reward_function.name=compute_score
 """
 
+import multiprocessing
 import os
 import re
 from typing import Optional
@@ -138,9 +139,12 @@ def extract_answer(solution_str: str) -> str:
 # negatives ORZ's own training never had (280/83 vs \frac{280}{83}, 0.5 vs
 # \frac{1}{2}). ORZ's is_equal is: _strip_string normalization + float compare
 # ("is_equiv"), then sympy parse_latex symbolic/numeric equality. Ported verbatim
-# except: no executor/timeout machinery (a 128-char guard + except-all bounds the
-# sympy tier instead), and parse_latex falls back to the lark backend where the antlr4
-# runtime is absent. The sympy tier can be disabled with ORZ_MATH_SYMPY_TIER=0.
+# except: the sympy tier runs in a forked child under a HARD wall-clock deadline
+# (ORZ_MATH_SYMPY_TIMEOUT, default 1.0 s) and is killed on overrun — ORZ's
+# executor+timeout equivalent, but leak-free (a killed child cannot keep burning
+# CPU; the 2026-08-30 remote_mary stall came from an unbounded in-process tier) —
+# plus a 128-char pre-filter, and parse_latex falls back to the lark backend where
+# the antlr4 runtime is absent. ORZ_MATH_SYMPY_TIER=0 disables the tier.
 # =====================================================================================
 
 
@@ -245,26 +249,33 @@ def _is_equiv_orz(str1: str, str2: str) -> bool:
 
 
 _SYMPY_TIER_MAX_CHARS = 128
-_parse_latex = None
+_sympy_backend: Optional[str] = None  # "antlr" | "lark", set by the probe
 _sympy_tier_state: Optional[bool] = None  # None = not probed yet
 
 
 def _sympy_tier_enabled() -> bool:
-    global _parse_latex, _sympy_tier_state
+    global _sympy_backend, _sympy_tier_state
     if _sympy_tier_state is None:
         if os.environ.get("ORZ_MATH_SYMPY_TIER", "1") == "0":
             _sympy_tier_state = False
+        elif not hasattr(multiprocessing, "get_context"):
+            # The tier is time-bounded by a killable fork child; without
+            # multiprocessing it would be silently unbounded (the exact failure
+            # that stalled the 2026-08-30 remote_mary run) — refuse instead.
+            print("[orz_tag_aware_math] sympy latex tier disabled (no multiprocessing)")
+            _sympy_tier_state = False
         else:
             try:
+                multiprocessing.get_context("fork")
                 from sympy.parsing.latex import parse_latex
 
                 try:
                     parse_latex("1")
-                    _parse_latex = parse_latex
+                    _sympy_backend = "antlr"
                 except ImportError:
                     # antlr4 runtime missing; try the lark backend.
                     parse_latex("1", backend="lark")
-                    _parse_latex = lambda s: parse_latex(s, backend="lark")  # noqa: E731
+                    _sympy_backend = "lark"
                 _sympy_tier_state = True
             except Exception as exc:  # noqa: BLE001
                 print(f"[orz_tag_aware_math] sympy latex tier disabled ({type(exc).__name__}: {exc})")
@@ -272,21 +283,66 @@ def _sympy_tier_enabled() -> bool:
     return _sympy_tier_state
 
 
+def _latex_equal_worker(str1: str, str2: str, backend: str, send_conn) -> None:
+    """Child-process body for the sympy tier: parse both strings (raw pair, then
+    stripped pair) and send the boolean verdict. Runs under a hard deadline
+    enforced by the parent — anything slow here gets killed, not waited on."""
+    try:
+        from sympy.parsing.latex import parse_latex
+
+        def _parse(s):
+            return parse_latex(s) if backend == "antlr" else parse_latex(s, backend="lark")
+
+        result = False
+        for a, b in ((str1, str2), (_strip_string(str1), _strip_string(str2))):
+            try:
+                sym1, sym2 = _parse(a), _parse(b)
+                if sym1 == sym2 or sym1.evalf() == sym2.evalf():
+                    result = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        send_conn.send(result)
+    except Exception:  # noqa: BLE001
+        try:
+            send_conn.send(False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _is_latex_equal(str1: str, str2: str) -> bool:
-    """ORZ's sympy tier: symbolic-or-numeric equality of the raw pair, retried on the
-    stripped pair. Guarded by length and except-all instead of ORZ's executor timeout."""
+    """ORZ's sympy tier: symbolic-or-numeric equality of the raw pair, retried on
+    the stripped pair. Each comparison runs in a forked child with a HARD wall-clock
+    deadline (ORZ_MATH_SYMPY_TIMEOUT, default 1.0 s — ORZ's own bound) and is
+    killed on overrun: parse_latex/evalf can burn CPU for minutes on short inputs
+    (power towers evalf, pathological grammars), and a thread-based timeout would
+    leak that CPU; a killed fork child cannot. Length guard stays as a cheap
+    pre-filter. Timeout/kill/crash/exception in the child all count as not-equal,
+    matching ORZ's timeout semantics."""
     if not _sympy_tier_enabled():
         return False
     if len(str1) > _SYMPY_TIER_MAX_CHARS or len(str2) > _SYMPY_TIER_MAX_CHARS:
         return False
-    for a, b in ((str1, str2), (_strip_string(str1), _strip_string(str2))):
-        try:
-            sym1, sym2 = _parse_latex(a), _parse_latex(b)
-            if sym1 == sym2 or sym1.evalf() == sym2.evalf():
-                return True
-        except Exception:  # noqa: BLE001
-            continue
-    return False
+    timeout = float(os.environ.get("ORZ_MATH_SYMPY_TIMEOUT", "1.0"))
+    try:
+        ctx = multiprocessing.get_context("fork")
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(target=_latex_equal_worker, args=(str1, str2, _sympy_backend, send_conn), daemon=True)
+        proc.start()
+        send_conn.close()
+        result = False
+        if recv_conn.poll(timeout):
+            try:
+                result = bool(recv_conn.recv())
+            except (EOFError, OSError):
+                result = False
+        recv_conn.close()
+        if proc.is_alive():
+            proc.kill()
+        proc.join(timeout=1.0)
+        return result
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def compute_score(
@@ -304,8 +360,10 @@ def compute_score(
        truths from dapo-math-17k/AceReason short-circuit here);
     2. ORZ ``is_equiv``: ``_strip_string`` normalization + float compare (handles
        280/83 vs \\frac{280}{83}, 0.5 vs \\frac{1}{2}, units, percents);
-    3. ORZ sympy tier: ``parse_latex`` symbolic/numeric equality (length-guarded,
-       optional -- ORZ_MATH_SYMPY_TIER=0 disables).
+    3. ORZ sympy tier: ``parse_latex`` symbolic/numeric equality, run in a forked
+       child under a hard wall-clock deadline (ORZ_MATH_SYMPY_TIMEOUT, default
+       1.0 s) and killed on overrun; length-guarded; ORZ_MATH_SYMPY_TIER=0
+       disables the tier entirely.
 
     Args:
         data_source: dataset tag, unused (kept for the reward-manager call signature).
