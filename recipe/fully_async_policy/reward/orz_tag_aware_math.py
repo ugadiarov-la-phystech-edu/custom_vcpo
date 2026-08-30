@@ -47,6 +47,7 @@ Wired into an arm via::
     custom_reward_function.name=compute_score
 """
 
+import os
 import re
 from typing import Optional
 
@@ -100,23 +101,192 @@ def _unbox(region: str) -> Optional[str]:
         return None
 
 
-def extract_answer(solution_str: str) -> str:
-    """Extract the normalized final answer, or ``'[INVALID]'`` when there is nothing to extract."""
+def _extract_answer_raw(solution_str: str) -> Optional[str]:
+    """The un-normalized answer candidate, or None when there is nothing to extract.
+
+    Same precedence as ``extract_answer`` (boxed > 'Answer:' line > bare complete block); the raw
+    form is what the ORZ equality tiers below compare (they do their own normalization).
+    """
     region, is_complete_block = _answer_region(solution_str)
 
     unboxed = _unbox(region)
     if unboxed is not None:
-        return normalize_final_answer(unboxed)
+        return unboxed
 
     lines = _ANSWER_LINE.findall(region)
     if lines:
-        return normalize_final_answer(lines[-1])
+        return lines[-1]
 
     stripped = region.strip()
     if is_complete_block and 0 < len(stripped) <= _MAX_BARE_ANSWER_CHARS:
-        return normalize_final_answer(stripped)
+        return stripped
 
-    return INVALID
+    return None
+
+
+def extract_answer(solution_str: str) -> str:
+    """Extract the normalized final answer, or ``'[INVALID]'`` when there is nothing to extract."""
+    raw = _extract_answer_raw(solution_str)
+    return INVALID if raw is None else normalize_final_answer(raw)
+
+
+# =====================================================================================
+# ORZ equality tiers (vendored from Open-Reasoner-Zero, orz/ppo/tools/math_utils.py, MIT
+# license). dapo-math-17k ground truths are 100% plain integers, so normalized-string
+# equality was sufficient; the ORZ 72k collection has ~24% LaTeX-expression ground
+# truths (\frac{280}{83}, 8\sqrt{3}, ...) where string equality produces false
+# negatives ORZ's own training never had (280/83 vs \frac{280}{83}, 0.5 vs
+# \frac{1}{2}). ORZ's is_equal is: _strip_string normalization + float compare
+# ("is_equiv"), then sympy parse_latex symbolic/numeric equality. Ported verbatim
+# except: no executor/timeout machinery (a 128-char guard + except-all bounds the
+# sympy tier instead), and parse_latex falls back to the lark backend where the antlr4
+# runtime is absent. The sympy tier can be disabled with ORZ_MATH_SYMPY_TIER=0.
+# =====================================================================================
+
+
+def _fix_fracs(string: str) -> str:
+    substrs = string.split("\\frac")
+    new_str = substrs[0]
+    if len(substrs) > 1:
+        substrs = substrs[1:]
+        for substr in substrs:
+            new_str += "\\frac"
+            if substr and substr[0] == "{":
+                new_str += substr
+            else:
+                if len(substr) < 2:
+                    return string
+                a = substr[0]
+                b = substr[1]
+                if b != "{":
+                    new_str += "{" + a + "}{" + b + "}" + substr[2:]
+                else:
+                    new_str += "{" + a + "}" + b + substr[2:]
+    return new_str
+
+
+def _fix_a_slash_b(string: str) -> str:
+    if len(string.split("/")) != 2:
+        return string
+    a, b = string.split("/")
+    try:
+        ia, ib = int(a), int(b)
+        assert string == f"{ia}/{ib}"
+        return "\\frac{" + str(ia) + "}{" + str(ib) + "}"
+    except Exception:  # noqa: BLE001
+        return string
+
+
+def _remove_right_units(string: str) -> str:
+    if "\\text{ " in string:
+        splits = string.split("\\text{ ")
+        if len(splits) == 2:
+            return splits[0]
+    return string
+
+
+def _fix_sqrt(string: str) -> str:
+    if "\\sqrt" not in string:
+        return string
+    splits = string.split("\\sqrt")
+    new_string = splits[0]
+    for split in splits[1:]:
+        if split and split[0] != "{":
+            new_string += "\\sqrt{" + split[0] + "}" + split[1:]
+        else:
+            new_string += "\\sqrt" + split
+    return new_string
+
+
+def _strip_string(string: str) -> str:
+    string = string.replace("\n", "")
+    string = string.replace("\\!", "")
+    string = string.replace("\\\\", "\\")
+    string = string.replace("tfrac", "frac")
+    string = string.replace("dfrac", "frac")
+    string = string.replace("\\left", "")
+    string = string.replace("\\right", "")
+    string = string.replace("^{\\circ}", "")
+    string = string.replace("^\\circ", "")
+    string = string.replace("\\$", "")
+    string = string.replace("$", "")
+    string = string.replace(",", "")
+    string = _remove_right_units(string)
+    string = string.replace("\\%", "")
+    string = string.replace("%", "")
+    string = string.replace(" .", " 0.")
+    string = string.replace("{.", "{0.")
+    if len(string) == 0:
+        return string
+    if string[0] == ".":
+        string = "0" + string
+    if len(string.split("=")) == 2 and len(string.split("=")[0]) <= 2:
+        string = string.split("=")[1]
+    string = _fix_sqrt(string)
+    string = string.replace(" ", "")
+    string = _fix_fracs(string)
+    if string == "0.5":
+        string = "\\frac{1}{2}"
+    string = _fix_a_slash_b(string)
+    return string
+
+
+def _is_equiv_orz(str1: str, str2: str) -> bool:
+    """ORZ's is_equiv: _strip_string both sides, float-compare, else string-compare."""
+    try:
+        ss1 = _strip_string(str1)
+        ss2 = _strip_string(str2)
+        try:
+            return float(ss1) == float(ss2)
+        except Exception:  # noqa: BLE001
+            return ss1 == ss2
+    except Exception:  # noqa: BLE001
+        return str1 == str2
+
+
+_SYMPY_TIER_MAX_CHARS = 128
+_parse_latex = None
+_sympy_tier_state: Optional[bool] = None  # None = not probed yet
+
+
+def _sympy_tier_enabled() -> bool:
+    global _parse_latex, _sympy_tier_state
+    if _sympy_tier_state is None:
+        if os.environ.get("ORZ_MATH_SYMPY_TIER", "1") == "0":
+            _sympy_tier_state = False
+        else:
+            try:
+                from sympy.parsing.latex import parse_latex
+
+                try:
+                    parse_latex("1")
+                    _parse_latex = parse_latex
+                except ImportError:
+                    # antlr4 runtime missing; try the lark backend.
+                    parse_latex("1", backend="lark")
+                    _parse_latex = lambda s: parse_latex(s, backend="lark")  # noqa: E731
+                _sympy_tier_state = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[orz_tag_aware_math] sympy latex tier disabled ({type(exc).__name__}: {exc})")
+                _sympy_tier_state = False
+    return _sympy_tier_state
+
+
+def _is_latex_equal(str1: str, str2: str) -> bool:
+    """ORZ's sympy tier: symbolic-or-numeric equality of the raw pair, retried on the
+    stripped pair. Guarded by length and except-all instead of ORZ's executor timeout."""
+    if not _sympy_tier_enabled():
+        return False
+    if len(str1) > _SYMPY_TIER_MAX_CHARS or len(str2) > _SYMPY_TIER_MAX_CHARS:
+        return False
+    for a, b in ((str1, str2), (_strip_string(str1), _strip_string(str2))):
+        try:
+            sym1, sym2 = _parse_latex(a), _parse_latex(b)
+            if sym1 == sym2 or sym1.evalf() == sym2.evalf():
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
 
 
 def compute_score(
@@ -127,6 +297,15 @@ def compute_score(
     **kwargs,
 ) -> dict:
     """Score one rollout. Same return contract as ``verl.utils.reward_score.math_dapo.compute_score``.
+
+    Equality is tiered (first hit wins):
+
+    1. math_dapo normalized-string equality (the original behavior -- integer ground
+       truths from dapo-math-17k/AceReason short-circuit here);
+    2. ORZ ``is_equiv``: ``_strip_string`` normalization + float compare (handles
+       280/83 vs \\frac{280}{83}, 0.5 vs \\frac{1}{2}, units, percents);
+    3. ORZ sympy tier: ``parse_latex`` symbolic/numeric equality (length-guarded,
+       optional -- ORZ_MATH_SYMPY_TIER=0 disables).
 
     Args:
         data_source: dataset tag, unused (kept for the reward-manager call signature).
@@ -139,11 +318,18 @@ def compute_score(
     """
     del data_source, extra_info, kwargs
 
-    pred = extract_answer(solution_str)
+    raw_pred = _extract_answer_raw(solution_str)
+    pred = INVALID if raw_pred is None else normalize_final_answer(raw_pred)
 
-    gt = ground_truth
-    unboxed_gt = _unbox(gt) if isinstance(gt, str) else None
-    gt = normalize_final_answer(unboxed_gt if unboxed_gt is not None else gt)
+    raw_gt = ground_truth if isinstance(ground_truth, str) else str(ground_truth)
+    unboxed_gt = _unbox(raw_gt)
+    if unboxed_gt is not None:
+        raw_gt = unboxed_gt
+    gt = normalize_final_answer(raw_gt)
 
-    acc = bool(pred == gt)
+    if raw_pred is None or not raw_gt.strip():
+        # Nothing extracted, or an empty ground truth: never correct.
+        return {"score": -1.0, "acc": False, "pred": pred}
+
+    acc = bool(pred == gt) or _is_equiv_orz(raw_gt, raw_pred) or _is_latex_equal(raw_gt, raw_pred)
     return {"score": 1.0 if acc else -1.0, "acc": acc, "pred": pred}
