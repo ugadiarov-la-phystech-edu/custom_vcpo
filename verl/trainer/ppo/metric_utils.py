@@ -266,6 +266,44 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
     }
 
 
+def compute_cumulative_timing_metrics(cumulative: dict[str, float], timing_raw: dict[str, float]) -> dict[str, float]:
+    """Accumulate the synchronous trainer's clean-training-time counters.
+
+    ``cumulative`` is caller-owned mutable state (one dict per fit loop),
+    updated in place from this step's ``timing_raw`` and rendered as metrics.
+    "Clean training time" is the step's wall time minus validation
+    (``testing``) and checkpoint saving (``save_checkpoint``) — both timed
+    INSIDE the ``step`` timer in RayPPOTrainer.fit, which is what makes the
+    subtraction exact in the synchronous trainer (no pipeline overlap; the
+    fully-async recipe needs a virtual-timeline reconstruction for the same
+    quantity). ``val_before_train`` validation runs before the loop, outside
+    any step timer, so it is excluded by construction.
+
+    The tags deliberately match FullyAsyncTrainer's fully_async/timing/*
+    family: every val-vs-clean-time plot keys on
+    ``fully_async/timing/cumulative_training_time`` and silently skips runs
+    without it, so emitting the same names makes sync runs drop into the
+    existing cross-arm tooling unchanged. In the sync trainer
+    ``wall_time_since_first_sample`` is the sum of step durations (excludes
+    between-step dataloader/init gaps).
+    """
+    step = float(timing_raw.get("step", 0.0))
+    testing = float(timing_raw.get("testing", 0.0))
+    save = float(timing_raw.get("save_checkpoint", 0.0))
+    cumulative["wall"] = cumulative.get("wall", 0.0) + step
+    cumulative["validation"] = cumulative.get("validation", 0.0) + testing
+    cumulative["save"] = cumulative.get("save", 0.0) + save
+    # max(0, .) guards a pathological clock (testing+save exceeding the step
+    # that contains them) from ever making training time run backwards
+    cumulative["training"] = cumulative.get("training", 0.0) + max(step - testing - save, 0.0)
+    return {
+        "fully_async/timing/wall_time_since_first_sample": cumulative["wall"],
+        "fully_async/timing/cumulative_validation_time": cumulative["validation"],
+        "fully_async/timing/cumulative_save_time": cumulative["save"],
+        "fully_async/timing/cumulative_training_time": cumulative["training"],
+    }
+
+
 def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
     """
     Computes throughput metrics for PPO training.
