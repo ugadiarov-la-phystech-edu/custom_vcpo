@@ -52,7 +52,7 @@ use_remove_padding=True
 
 rollout_name=vllm
 rollout_mode=async
-gpu_memory_utilization=${gpu_memory_utilization:-0.6}
+gpu_memory_utilization=${gpu_memory_utilization:-0.5}
 rollout_tp=1
 enable_chunked_prefill=True
 max_num_batched_tokens=$((1024 * 10))
