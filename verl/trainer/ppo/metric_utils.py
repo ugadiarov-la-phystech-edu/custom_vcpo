@@ -266,6 +266,22 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
     }
 
 
+def compute_cumulative_timing_metrics(cumulative: dict[str, float], timing_raw: dict[str, float]) -> dict[str, float]:
+    step = float(timing_raw.get("step", 0.0))
+    testing = float(timing_raw.get("testing", 0.0))
+    save = float(timing_raw.get("save_checkpoint", 0.0))
+    cumulative["wall"] = cumulative.get("wall", 0.0) + step
+    cumulative["validation"] = cumulative.get("validation", 0.0) + testing
+    cumulative["save"] = cumulative.get("save", 0.0) + save
+    cumulative["training"] = cumulative.get("training", 0.0) + max(step - testing - save, 0.0)
+    return {
+        "fully_async/timing/wall_time_since_first_sample": cumulative["wall"],
+        "fully_async/timing/cumulative_validation_time": cumulative["validation"],
+        "fully_async/timing/cumulative_save_time": cumulative["save"],
+        "fully_async/timing/cumulative_training_time": cumulative["training"],
+    }
+
+
 def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
     """
     Computes throughput metrics for PPO training.
