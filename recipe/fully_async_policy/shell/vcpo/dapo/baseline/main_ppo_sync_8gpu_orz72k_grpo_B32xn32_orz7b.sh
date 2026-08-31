@@ -52,6 +52,19 @@
 # ~24% of ORZ-72k ground truths are LaTeX expressions; the pre-tier scorer
 # would score them as false negatives.
 #
+# CHECKPOINTS (save_contents=['hf_model'], max_actor_ckpt_to_keep=null, resume_mode=disable):
+#   * each save writes global_step_N/actor/huggingface/ - config, tokenizer and bf16
+#     safetensors - directly loadable by vLLM / from_pretrained, no merge step. No
+#     optimizer state, no sharded dist_ckpt/ directory at all.
+#   * nothing is rotated away: ~15.2 GB per save for ORZ-7B; at save_freq=50 over the
+#     1,499-step epoch that is ~30 saves, ~450 GB. Raise save_freq at launch if the
+#     disk is tighter.
+#   * the run is NOT resumable: 'hf_model' is written but never read back, so
+#     load_contents would restore nothing. resume_mode=disable makes that explicit,
+#     and the trainer refuses the resume combination outright (the same guard the
+#     fully-async trainer got in the "Save only hf_model" commit, ported to
+#     RayPPOTrainer._load_checkpoint).
+#
 # ENTROPY WATCH. No stabilizer by design (matching ORZ). actor/entropy is
 # logged every step (calculate_entropy=True): this model starts at ~0.06 —
 # watch the first ~50 steps; a monotone actor/grad_norm ramp (healthy: flat
@@ -135,13 +148,19 @@ val_temperature=${val_temperature:-1.0}
 calculate_log_probs=True
 
 # ================= Trainer =================
-test_freq=${test_freq:-10}
+test_freq=${test_freq:-50}
 save_freq=${save_freq:-50}
-total_epochs=${total_epochs:-1}
+total_epochs=${total_epochs:-3}
 val_before_train=${val_before_train:-True}
-max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null}
-ckpt_save_contents="['hf_model']"
-resume_mode=disable
+# Weights only, in huggingface format: no optimizer state (fp32 master + 2 adam
+# moments is ~6x the bf16 weights on the megatron distributed optimizer) and no
+# merge step before offline eval - global_step_N/actor/huggingface/ loads in
+# vLLM as is. See the CHECKPOINTS header block for sizes.
+save_contents=${save_contents:-"['hf_model']"}
+max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null} # keep every checkpoint
+# Mandatory, not cosmetic: 'hf_model' is written but never read back, so a
+# resume would restore nothing. The trainer refuses that combination outright.
+resume_mode=${resume_mode:-disable}
 
 NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
@@ -237,7 +256,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=${test_freq} \
     trainer.save_freq=${save_freq} \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
-    actor_rollout_ref.actor.checkpoint.save_contents="${ckpt_save_contents}" \
+    actor_rollout_ref.actor.checkpoint.save_contents="${save_contents}" \
     trainer.resume_mode=${resume_mode} \
     trainer.rollout_data_dir=null \
     trainer.log_val_generations=0 \

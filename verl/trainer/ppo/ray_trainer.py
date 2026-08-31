@@ -52,7 +52,11 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.checkpoint_manager import (
+    find_latest_ckpt_path,
+    restores_model_weights,
+    should_save_ckpt_esi,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
@@ -912,6 +916,17 @@ class RayPPOTrainer:
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
+        load_contents = self.config.actor_rollout_ref.actor.checkpoint.get("load_contents", None)
+        if not restores_model_weights(load_contents):
+            # An 'hf_model' checkpoint stores the weights in huggingface format, which the checkpoint
+            # manager writes but never reads back: resuming from one would load nothing and silently
+            # continue from the pretrained weights. Refuse instead of pretending it worked.
+            raise ValueError(
+                f"Cannot resume from {global_step_folder}: "
+                f"actor.checkpoint.load_contents={list(load_contents)} does not include 'model', so the "
+                "trained weights would not be restored. Set trainer.resume_mode=disable, or save and load "
+                "checkpoints with 'model' in actor.checkpoint.save_contents."
+            )
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
