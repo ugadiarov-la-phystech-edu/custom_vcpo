@@ -62,13 +62,13 @@ top_k=-1
 val_temperature=${val_temperature:-1.0}
 calculate_log_probs=True
 
-test_freq=${test_freq:-10}
+test_freq=${test_freq:-50}
 save_freq=${save_freq:-50}
-total_epochs=${total_epochs:-1}
+total_epochs=${total_epochs:-3}
 val_before_train=${val_before_train:-True}
+save_contents=${save_contents:-"['hf_model']"}
 max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null}
-ckpt_save_contents="['hf_model']"
-resume_mode=disable
+resume_mode=${resume_mode:-disable}
 
 NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
@@ -163,7 +163,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=${test_freq} \
     trainer.save_freq=${save_freq} \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
-    actor_rollout_ref.actor.checkpoint.save_contents="${ckpt_save_contents}" \
+    actor_rollout_ref.actor.checkpoint.save_contents="${save_contents}" \
     trainer.resume_mode=${resume_mode} \
     trainer.rollout_data_dir=null \
     trainer.log_val_generations=0 \

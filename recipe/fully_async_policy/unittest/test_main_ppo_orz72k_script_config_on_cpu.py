@@ -162,6 +162,16 @@ class TestSyncOrz72kArmConfig(unittest.TestCase):
         )
         self.assertEqual(result["acc"], True)
 
+    def test_weights_only_checkpoints_not_resumable(self):
+        """save_contents=['hf_model'] (no optimizer state, no dist_ckpt/) with resume
+        explicitly disabled — the trainer-side guard refuses resuming from a
+        checkpoint whose load_contents cannot restore the weights."""
+        c = self.cfg
+        self.assertEqual(list(c.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
+        self.assertEqual(c.trainer.resume_mode, "disable")
+        self.assertIsNone(c.trainer.max_actor_ckpt_to_keep)
+        self.assertEqual(c.trainer.save_freq, 50)
+
     def test_validation_on_orz_prompt_parquets(self):
         """aime-2024/2025 exactly as the _final branch's ORZ-72k arms (x32 ORZ-prompt parquets)."""
         vals = list(self.cfg.data.val_files)
