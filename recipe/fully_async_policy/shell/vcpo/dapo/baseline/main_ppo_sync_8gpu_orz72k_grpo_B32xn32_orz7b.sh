@@ -130,7 +130,14 @@ use_remove_padding=True
 # ================= Rollout =================
 rollout_name=vllm
 rollout_mode=async
-gpu_memory_utilization=${gpu_memory_utilization:-0.6}
+# 0.5, not the async arms' 0.6: in the colocated hybrid engine the Megatron
+# trainer initializes FIRST and holds ~33 GiB (bf16 params + bf16 grad buffer
+# + overhead), and vLLM validates its claim against FREE memory at init —
+# 0.6*79.2 = 47.5 GiB > the ~46.3 GiB left, which aborted the 2026-08-31
+# launch before step 1. 0.5 claims 39.6 GiB (~25 GiB KV after weights, enough
+# for 128 concurrent seqs at our lengths) with ~7 GiB headroom. To go higher,
+# flip megatron param_offload/grad_offload=True first.
+gpu_memory_utilization=${gpu_memory_utilization:-0.5}
 rollout_tp=1
 enable_chunked_prefill=True
 max_num_batched_tokens=$((1024 * 10))
