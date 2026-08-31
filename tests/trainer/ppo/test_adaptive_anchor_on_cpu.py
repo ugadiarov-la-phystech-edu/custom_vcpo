@@ -474,6 +474,70 @@ class TestValidateConfig:
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
+class TestLossFuncMetaInfoPlumbing:
+    """forward_step hands loss_func a CONSTRUCTED meta_info dict, not the
+    batch's — driver-stamped keys must be forwarded explicitly. Regression for
+    the bug where anchor_blend_c2 was dropped and the blend ran inert."""
+
+    @staticmethod
+    def _cfg():
+        return OmegaConf.create({"clip_ratio": 0.2, "entropy_coeff": 0.0, "clip_ratio_c": 3.0})
+
+    def test_training_meta_forwards_anchor_blend_c2(self):
+        from verl.workers.actor.megatron_actor import build_loss_func_meta_info
+
+        meta = build_loss_func_meta_info(
+            self._cfg(),
+            {"anchor_blend_c2": 0.37, "global_seq_mean_count": 33, "collect_seq_log_is": True},
+            forward_only=False,
+            skip_recompute_old_log_prob=True,
+            rollout_corr_cfg={"rollout_is": "token"},
+        )
+        assert meta["anchor_blend_c2"] == 0.37
+        assert meta["skip_recompute_old_log_prob"] is True
+        assert meta["rollout_corr_config"] == {"rollout_is": "token"}
+        assert meta["global_seq_mean_count"] == 33
+        assert meta["collect_seq_log_is"] is True
+        assert meta["clip_ratio"] == 0.2 and meta["clip_ratio_c"] == 3.0
+
+    def test_training_meta_defaults_blend_off(self):
+        from verl.workers.actor.megatron_actor import build_loss_func_meta_info
+
+        meta = build_loss_func_meta_info(
+            self._cfg(), {}, forward_only=False, skip_recompute_old_log_prob=True, rollout_corr_cfg=None
+        )
+        # None (not a KeyError, not 0.0): loss_func's `blend_c2 is None` check
+        # selects the static path when the driver did not stamp the key.
+        assert meta["anchor_blend_c2"] is None
+
+    def test_forward_only_meta_has_no_blend_key(self):
+        from verl.workers.actor.megatron_actor import build_loss_func_meta_info
+
+        meta = build_loss_func_meta_info(
+            self._cfg(),
+            {"anchor_blend_c2": 0.5},
+            forward_only=True,
+            skip_recompute_old_log_prob=False,
+            rollout_corr_cfg=None,
+        )
+        # log-prob-only passes never reach the loss blend; .get() in loss_func
+        # tolerates the absent key.
+        assert "anchor_blend_c2" not in meta
+        assert meta["loss_multiplier"] == 1.0
+
+    def test_explicit_zero_loss_multiplier_honored(self):
+        from verl.workers.actor.megatron_actor import build_loss_func_meta_info
+
+        meta = build_loss_func_meta_info(
+            self._cfg(),
+            {"loss_multiplier": 0.0},
+            forward_only=False,
+            skip_recompute_old_log_prob=True,
+            rollout_corr_cfg=None,
+        )
+        assert meta["loss_multiplier"] == 0.0
+
+
 class TestGradMethodLogging:
     """Which gradient method is active (TIS / blend / PPO-clip) must be legible
     from metrics and log lines."""

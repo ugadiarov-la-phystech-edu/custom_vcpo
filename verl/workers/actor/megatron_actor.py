@@ -88,6 +88,32 @@ def _resolve_loss_multiplier(meta_info) -> float:
     return 1.0 if value is None else float(value)
 
 
+def build_loss_func_meta_info(config, data_meta_info, forward_only, skip_recompute_old_log_prob, rollout_corr_cfg):
+    """The meta_info dict handed to loss_func by forward_step.
+
+    loss_func sees THIS dict, not the batch's meta_info — any driver-stamped
+    key the loss reads (e.g. anchor_blend_c2 for the adaptive TIS/clip blend)
+    must be forwarded here explicitly, or the corresponding branch is a silent
+    no-op (the blend ran inert for 80 updates before this was factored out)."""
+    if forward_only:
+        return {
+            "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
+            "rollout_corr_config": rollout_corr_cfg,
+            "loss_multiplier": _resolve_loss_multiplier(data_meta_info),
+        }
+    return {
+        "clip_ratio": config.clip_ratio,
+        "entropy_coeff": config.entropy_coeff,
+        "clip_ratio_c": config.get("clip_ratio_c", 3.0),
+        "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
+        "rollout_corr_config": rollout_corr_cfg,
+        "loss_multiplier": _resolve_loss_multiplier(data_meta_info),
+        "global_seq_mean_count": data_meta_info.get("global_seq_mean_count"),
+        "collect_seq_log_is": bool(data_meta_info.get("collect_seq_log_is", False)),
+        "anchor_blend_c2": data_meta_info.get("anchor_blend_c2", None),
+    }
+
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -866,24 +892,9 @@ class MegatronPPOActor(BasePPOActor):
                     data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                 )
 
-            if forward_only:
-                meta_info = {
-                    "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
-                    "rollout_corr_config": rollout_corr_cfg,
-                    "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
-                }
-            else:
-                clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                meta_info = {
-                    "clip_ratio": self.config.clip_ratio,
-                    "entropy_coeff": self.config.entropy_coeff,
-                    "clip_ratio_c": clip_ratio_c,
-                    "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
-                    "rollout_corr_config": rollout_corr_cfg,
-                    "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
-                    "global_seq_mean_count": data.meta_info.get("global_seq_mean_count"),
-                    "collect_seq_log_is": bool(data.meta_info.get("collect_seq_log_is", False)),
-                }
+            meta_info = build_loss_func_meta_info(
+                self.config, data.meta_info, forward_only, skip_recompute_old_log_prob, rollout_corr_cfg
+            )
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
         # batch should be a list of batches inside micro-batches
