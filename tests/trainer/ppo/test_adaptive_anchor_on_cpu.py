@@ -212,6 +212,51 @@ class TestControllerDynamics:
         c2s = [ctrl.update(s) for s in signals]
         assert all(b >= a for a, b in zip(c2s, c2s[1:], strict=False))
 
+    def test_attack_release_betas_apply_per_direction(self):
+        # rise smoothed with ema_beta_up=0.25, fall with ema_beta=0.5:
+        # 0.04 (init) -> 0.08: ema = .25*.04+.75*.08 = 0.07, c2 = 0.625;
+        # -> 0.00: ema = .5*.07 = 0.035, target 0.1875, descent capped at 0.05.
+        ctrl = _manual(ema_beta=0.5, ema_beta_up=0.25)
+        assert ctrl.update(0.04) == pytest.approx(0.25, abs=1e-6)
+        assert ctrl.update(0.08) == pytest.approx(0.625, abs=1e-6)
+        assert ctrl.update(0.00) == pytest.approx(0.575, abs=1e-6)
+        assert ctrl.state()["sig_ema"] == pytest.approx(0.035, abs=1e-9)
+
+    def test_zero_attack_beta_jumps_to_raw_signal(self):
+        # even with near-total release smoothing, one crisis reading saturates c2
+        ctrl = _manual(ema_beta=0.999, ema_beta_up=0.0)
+        assert ctrl.update(0.02) == 0.0
+        assert ctrl.update(0.10) == pytest.approx(1.0, abs=1e-6)
+
+    def test_equal_betas_match_symmetric_controller(self):
+        sym = _manual(ema_beta=0.5)
+        asym = _manual(ema_beta=0.5, ema_beta_up=0.5)
+        signals = [0.01, 0.09, 0.03, 0.12, 0.00, 0.05, 0.11, 0.02]
+        for s in signals:
+            assert asym.update(s) == pytest.approx(sym.update(s), abs=1e-12)
+
+    def test_replay_of_the_update_437_divergence(self):
+        # The real trace that killed the 2026-08 anchor-blend run: thresholds
+        # 0.018/0.090 (calibrated), healthy clipfrac 0.018, then four updates
+        # of raw signal [0.036, 0.066, 0.068, 0.169]. The shipped attack beta
+        # must reach full clip ON the trace; the symmetric controller must not
+        # (it peaked at target 0.81 in the run) — pinning why ema_beta_up exists.
+        fast = AnchorBlendController(sig_low=0.018, sig_high=0.090, ema_beta=0.75, ema_beta_up=0.25)
+        slow = AnchorBlendController(sig_low=0.018, sig_high=0.090, ema_beta=0.75)
+        for ctrl in (fast, slow):
+            _drive_to_steady(ctrl, 0.018)
+        trace = [0.036, 0.066, 0.068, 0.169]
+        fast_c2 = [fast.update(s) for s in trace]
+        slow_c2 = [slow.update(s) for s in trace]
+        assert fast_c2[-1] == pytest.approx(1.0, abs=1e-6)
+        assert slow_c2[-1] < 0.85
+        assert all(f >= s for f, s in zip(fast_c2, slow_c2, strict=True))
+
+    def test_bad_attack_beta_rejected(self):
+        for bad in (1.0, 1.5, -0.1):
+            with pytest.raises(AssertionError):
+                _manual(ema_beta_up=bad)
+
 
 # ---------------------------------------------------------------------------
 # controller: AUTO calibration
@@ -595,5 +640,6 @@ class TestConfigPlumbing:
         assert block.calib_updates >= 1
         assert 0.0 <= block.c2_min <= 1.0
         assert 0.0 < block.ema_beta < 1.0
+        assert 0.0 <= block.ema_beta_up < block.ema_beta  # attack faster than release
         assert block.c2_down_rate > 0.0
         assert math.isclose(block.sig_ref_floor, 1e-4)

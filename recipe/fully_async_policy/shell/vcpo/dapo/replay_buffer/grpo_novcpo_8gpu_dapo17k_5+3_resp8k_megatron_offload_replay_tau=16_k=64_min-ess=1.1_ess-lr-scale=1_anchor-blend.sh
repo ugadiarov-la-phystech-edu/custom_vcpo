@@ -197,6 +197,9 @@ blend_calib_skip=${blend_calib_skip:-10}
 blend_calib_updates=${blend_calib_updates:-20}
 blend_c2_min=${blend_c2_min:-0.0}
 blend_ema_beta=${blend_ema_beta:-0.75}
+# Attack beta (signal rising above the EMA); release stays at blend_ema_beta.
+# The update-437 blow-up outran the symmetric 0.75 EMA by two updates.
+blend_ema_beta_up=${blend_ema_beta_up:-0.25}
 blend_c2_down_rate=${blend_c2_down_rate:-0.05}
 use_kl_loss=False
 kl_loss_coef=0.0
@@ -365,6 +368,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.adaptive_anchor.calib_updates=${blend_calib_updates} \
     async_training.adaptive_anchor.c2_min=${blend_c2_min} \
     async_training.adaptive_anchor.ema_beta=${blend_ema_beta} \
+    async_training.adaptive_anchor.ema_beta_up=${blend_ema_beta_up} \
     async_training.adaptive_anchor.c2_down_rate=${blend_c2_down_rate} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \

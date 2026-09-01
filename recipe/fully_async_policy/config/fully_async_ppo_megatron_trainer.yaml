@@ -174,8 +174,17 @@ async_training:
     # Floor on c2 (0 = pure TIS while healthy)
     c2_min: 0.0
 
-    # EMA smoothing of the input signal: ema <- beta*ema + (1-beta)*signal
+    # EMA smoothing of the input signal: ema <- beta*ema + (1-beta)*signal.
+    # With ema_beta_up set this is the RELEASE beta (signal below the EMA)
     ema_beta: 0.75
+
+    # ATTACK beta, applied when the signal is above the current EMA (0 =
+    # jump straight to the raw signal; null = symmetric, use ema_beta both
+    # ways). Must ramp c2 to full clip within ~3 updates of a divergence
+    # onset: the 2026-08 anchor-blend run died at update ~437 because the
+    # symmetric 0.75 EMA reached the full-clip threshold two updates after
+    # the raw signal did
+    ema_beta_up: 0.25
 
     # c2 increases apply instantly (safety); decreases are limited to this
     # much per update (hysteresis analog)

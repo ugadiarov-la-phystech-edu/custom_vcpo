@@ -241,6 +241,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 sig_ref_floor=float(adaptive_cfg.get("sig_ref_floor", 1e-4)),
                 c2_min=float(adaptive_cfg.get("c2_min", 0.0)),
                 ema_beta=float(adaptive_cfg.get("ema_beta", 0.75)),
+                ema_beta_up=_opt("ema_beta_up"),
                 c2_down_rate=float(adaptive_cfg.get("c2_down_rate", 0.05)),
             )
             self.anchor_blend_c2 = float(adaptive_cfg.get("c2_min", 0.0))

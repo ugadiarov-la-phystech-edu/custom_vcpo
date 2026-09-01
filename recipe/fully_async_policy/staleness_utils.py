@@ -623,6 +623,13 @@ class AnchorBlendController:
 
     * ``sig_ema <- beta*sig_ema + (1-beta)*sig``; a missing/NaN signal holds
       the previous EMA and c2 (a failed measurement must not move the blend).
+      With ``ema_beta_up`` set, the EMA is attack/release-asymmetric: a signal
+      above the current EMA is smoothed with the (smaller) ``ema_beta_up``, one
+      below it with ``ema_beta`` — a divergence ramp reaches the thresholds
+      within a couple of updates while the descent stays smoothed. (The
+      symmetric beta=0.75 EMA was the binding lag in the update-437 blow-up of
+      the 2026-08 anchor-blend run: raw clipfrac crossed sig_high two updates
+      before the EMA-driven target did.)
     * target ``c2 = clamp((sig_ema - sig_low) / (sig_high - sig_low),
       c2_min, 1)`` -- proportional control on the tail fraction.
     * Asymmetric slew: increases apply instantly (safety); decreases are
@@ -650,6 +657,7 @@ class AnchorBlendController:
         sig_ref_floor: float = 1e-4,
         c2_min: float = 0.0,
         ema_beta: float = 0.75,
+        ema_beta_up: Optional[float] = None,
         c2_down_rate: float = 0.05,
     ):
         manual = (sig_low is not None) or (sig_high is not None)
@@ -663,6 +671,11 @@ class AnchorBlendController:
             )
         assert 0.0 <= float(c2_min) <= 1.0, f"adaptive_anchor: c2_min must be in [0, 1], got {c2_min}"
         assert 0.0 < float(ema_beta) < 1.0, f"adaptive_anchor: ema_beta must be in (0, 1), got {ema_beta}"
+        if ema_beta_up is not None:
+            assert 0.0 <= float(ema_beta_up) < 1.0, (
+                f"adaptive_anchor: ema_beta_up must be in [0, 1) (0 = attack jumps to the raw signal), "
+                f"got {ema_beta_up}"
+            )
         assert float(c2_down_rate) > 0.0, f"adaptive_anchor: c2_down_rate must be > 0, got {c2_down_rate}"
         assert float(low_mult) < float(high_mult), (
             f"adaptive_anchor: need low_mult < high_mult, got {low_mult}, {high_mult}"
@@ -679,6 +692,7 @@ class AnchorBlendController:
         self.sig_ref_floor = float(sig_ref_floor)
         self.c2_min = float(c2_min)
         self.ema_beta = float(ema_beta)
+        self.ema_beta_up = None if ema_beta_up is None else float(ema_beta_up)
         self.c2_down_rate = float(c2_down_rate)
 
         self.sig_ref: Optional[float] = None
@@ -711,7 +725,8 @@ class AnchorBlendController:
             if self._sig_ema is None:
                 self._sig_ema = sig
             else:
-                self._sig_ema = self.ema_beta * self._sig_ema + (1.0 - self.ema_beta) * sig
+                beta = self.ema_beta_up if (self.ema_beta_up is not None and sig > self._sig_ema) else self.ema_beta
+                self._sig_ema = beta * self._sig_ema + (1.0 - beta) * sig
             if self.auto and not self.calibrated and self._updates_seen > self.calib_skip:
                 self._calib_window.append(sig)
                 if len(self._calib_window) >= self.calib_updates:
