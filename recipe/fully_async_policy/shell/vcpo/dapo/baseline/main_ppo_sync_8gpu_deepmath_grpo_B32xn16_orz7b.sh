@@ -6,11 +6,12 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=main-ppo-sync-orz72k-grpo-orz7b
+#SBATCH --job-name=main-ppo-sync-deepmath-grpo-orz7b
 
 # SYNCHRONOUS ORZ-continuation arm: verl.trainer.main_ppo (the plain colocated
 # hybrid-engine trainer, NOT recipe/fully_async_policy), GRPO without a critic,
-# continuing Open-Reasoner-Zero-7B on the ORZ-72k collection with ORZ prompts.
+# continuing Open-Reasoner-Zero-7B on the DeepMath-derived training set (see
+# DATA below; the earlier ORZ-72k run trained flat) with ORZ prompts.
 #
 # WHY SYNC. Every async arm on this model either collapsed (is-pg: no trust
 # region, entropy collapse at ~step 90 after briefly reaching AIME-24 0.201;
@@ -20,8 +21,8 @@
 # (playground/orz_7b_ppo.py in the reference repo) — is the setting proven to
 # train this checkpoint for 700+ steps. This arm reproduces that regime's
 # schedule with GRPO in place of their PPO+critic:
-#   * train_batch_size = ppo_mini_batch_size = 32 prompts, rollout.n = 32
-#     -> 1024 sequences per optimizer step, exactly ONE optimizer step per
+#   * train_batch_size = ppo_mini_batch_size = 32 prompts, rollout.n = 16
+#     -> 512 sequences per optimizer step, exactly ONE optimizer step per
 #     generation batch (the PPO ratio is identically 1, so the clip is inert
 #     insurance; the loss degenerates to on-policy policy gradient — the same
 #     effective loss ORZ's policy update has in its strictly on-policy limit).
@@ -38,9 +39,13 @@
 #     advantage no-ops, there is no group filter here), and the scorer returns
 #     +/-1 instead of ORZ's 1/0 — equivalent under GRPO group normalization.
 #
-# DATA. Training: orz-math-72k parquet (47,981 deduplicated problems, ORZ
-# inner instruction verbatim; built by scripts/convert_orz72k_to_verl_parquet
-# .py on the replay_buffer_vcpo_ess_threshold_final branch). Validation:
+# DATA. Training: deepmath_orz_train parquet (22,571 problems from
+# zwhe99/DeepMath-103K, built by deep_math_dataset/filter_deepmath.py: AIME-
+# syllabus topics only, difficulty >= 5, single closed-form answers -- no
+# yes/no, equation, inequality, matrix, multi-answer or \text{} ground truths
+# -- deduplicated and decontaminated against the aime-2024/2025 parquets; same
+# ORZ inner instruction and schema as the earlier orz-math-72k set, which is
+# ORZ-7B's own RL training data and trained flat). Validation:
 # aime-2024/2025 ORZ-prompt parquets exactly as that branch's ORZ-72k arms
 # (x32 duplication, data_source aime2024_orz/aime2025_orz -> the same
 # val-core/.../acc/mean@1 metric keys, so curves are directly comparable).
@@ -57,8 +62,8 @@
 #     safetensors - directly loadable by vLLM / from_pretrained, no merge step. No
 #     optimizer state, no sharded dist_ckpt/ directory at all.
 #   * nothing is rotated away: ~15.2 GB per save for ORZ-7B; at save_freq=50 over the
-#     1,499-step epoch that is ~30 saves, ~450 GB. Raise save_freq at launch if the
-#     disk is tighter.
+#     ~705-step epoch (22,571 prompts / 32) that is ~14 saves, ~215 GB per epoch.
+#     Raise save_freq at launch if the disk is tighter.
 #   * the run is NOT resumable: 'hf_model' is written but never read back, so
 #     load_contents would restore nothing. resume_mode=disable makes that explicit,
 #     and the trainer refuses the resume combination outright (the same guard the
@@ -77,7 +82,7 @@ export PYTHONUNBUFFERED=1
 
 # ================= Paths =================
 MODEL_PATH=${MODEL_PATH:-"Open-Reasoner-Zero/Open-Reasoner-Zero-7B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/orz-math-72k.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/deepmath_orz_train.parquet"}
 TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/orz/aime-2024-orz.parquet','/home/jovyan/datasets/math_datasets/orz/aime-2025-orz.parquet']"}
 REWARD_FILE=${REWARD_FILE:-"recipe/fully_async_policy/reward/orz_tag_aware_math.py"}
 
@@ -89,9 +94,9 @@ truncation='left'
 
 # ================= Batch geometry (strictly on-policy) =================
 # ONE optimizer step per generation batch: train_batch_size == ppo_mini_batch
-# _size, ppo_epochs=1. 32 prompts x 32 rollouts = 1024 seqs per step.
+# _size, ppo_epochs=1. 32 prompts x 16 rollouts = 512 seqs per step.
 train_prompt_bsz=${train_prompt_bsz:-32}
-n_resp_per_prompt=${n_resp_per_prompt:-32}
+n_resp_per_prompt=${n_resp_per_prompt:-16}
 ppo_epochs=${ppo_epochs:-1}
 
 # ================= Algorithm =================
@@ -173,7 +178,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} ppo-epochs-${ppo_epochs} ORZ72K-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} ppo-epochs-${ppo_epochs} DEEPMATH-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
