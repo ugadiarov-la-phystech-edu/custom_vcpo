@@ -18,7 +18,9 @@ from datetime import datetime
 from pprint import pprint
 from typing import Any
 
+import numpy as np
 import ray
+import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
@@ -29,6 +31,13 @@ from recipe.fully_async_policy.detach_utils import (
 )
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
+from recipe.fully_async_policy.rollout_replay import (
+    AdvantagePrioritizedReplayBuffer,
+    resolve_replay_draw,
+    rollout_priorities,
+    zero_variance_group_mask,
+)
+from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -109,11 +118,173 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.compute_prox_log_prob = self.config.async_training.compute_prox_log_prob
+        self._init_rollout_replay(config)
         total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
             + config.rollout.nnodes * config.rollout.n_gpus_per_node
         )
         self.metrics_aggregator = MetricsAggregator(total_gpus=total_gpus)
+
+    def _init_rollout_replay(self, config):
+        """Rollout-level |A_i|-prioritized experience replay (arXiv:2606.04560).
+
+        Validates the mode's preconditions and builds the driver-side buffer.
+        The loss contract is the paper's: the PPO ratio must anchor to the
+        cached generation-time log-probs (old_log_probs := rollout_log_probs)
+        with no IS machinery on top, and advantages must be group-relative
+        GRPO values frozen at birth.
+        """
+        self.replay_buffer = None
+        replay_cfg = config.async_training.get("rollout_replay", None)
+        if replay_cfg is None or not replay_cfg.get("enable", False):
+            return
+        assert config.async_training.use_rollout_log_probs, (
+            "rollout_replay needs async_training.use_rollout_log_probs=True: the PPO ratio anchors "
+            "to the cached generation-time log-probs (the paper's pi_t)"
+        )
+        assert not config.async_training.compute_prox_log_prob, (
+            "rollout_replay is incompatible with compute_prox_log_prob: replayed rollouts must keep "
+            "their frozen birth-step behavior log-probs"
+        )
+        rollout_corr = config.algorithm.get("rollout_correction", None)
+        assert rollout_corr is None or rollout_corr.get("rollout_is", None) is None, (
+            "rollout_replay uses the pure PPO-clip loss: disable algorithm.rollout_correction.rollout_is"
+        )
+        assert str(config.algorithm.adv_estimator) == "grpo", (
+            f"rollout_replay expects GRPO advantages, got {config.algorithm.adv_estimator}"
+        )
+        assert config.async_training.require_batches == 1, (
+            "rollout_replay composes one gradient batch per pull: set async_training.require_batches=1"
+        )
+        assert config.actor_rollout_ref.rollout.calculate_log_probs, (
+            "rollout_replay needs actor_rollout_ref.rollout.calculate_log_probs=True for the cached behavior log-probs"
+        )
+        megatron_cfg = config.actor_rollout_ref.actor.megatron
+        model_parallel = (
+            megatron_cfg.tensor_model_parallel_size
+            * megatron_cfg.pipeline_model_parallel_size
+            * megatron_cfg.context_parallel_size
+        )
+        trainer_world = config.trainer.nnodes * config.trainer.n_gpus_per_node
+        assert trainer_world % model_parallel == 0
+        self.trainer_dp_size = trainer_world // model_parallel
+        self.replay_buffer = AdvantagePrioritizedReplayBuffer(
+            replay_ratio=replay_cfg.get("replay_ratio", 0.5),
+            priority_alpha=replay_cfg.get("priority_alpha", 0.5),
+            priority_eps=replay_cfg.get("priority_eps", 1e-6),
+            tau_max=replay_cfg.get("tau_max", 10),
+            warmup_steps=replay_cfg.get("warmup_steps", 20),
+            capacity=replay_cfg.get("capacity", 30000),
+            seed=replay_cfg.get("sampling_seed", 1234),
+            with_replacement=replay_cfg.get("with_replacement", False),
+        )
+        self._replay_trim_rng = np.random.default_rng(int(replay_cfg.get("sampling_seed", 1234)) + 1)
+        self.replay_filtered_groups_cum = 0
+        print(
+            f"[FullyAsyncTrainer] rollout_replay enabled: r={self.replay_buffer.replay_ratio} "
+            f"alpha={self.replay_buffer.priority_alpha} tau_max={self.replay_buffer.tau_max} "
+            f"warmup={self.replay_buffer.warmup_steps} capacity={self.replay_buffer.capacity} "
+            f"dp={self.trainer_dp_size}"
+        )
+
+    def _compose_training_batch(self, batch, metrics):
+        """Algorithm 1 of arXiv:2606.04560, steps 2-6, between advantage
+        computation and the PPO update:
+
+        filter zero-variance groups -> draw r*B'_fresh replayed rollouts by
+        |A_i| PER priority -> concatenate (fresh anchor retained in full) ->
+        insert the survivors with the current birth version -> age-evict.
+        The mixed batch ships its per-DP-rank mini-batch size in meta_info so
+        the megatron actor runs ONE update over the whole variable-size batch.
+        """
+        if self.replay_buffer is None:
+            return batch
+        version = self.current_param_version
+        uids = batch.non_tensor_batch["uid"]
+        scores = batch.batch["token_level_scores"].sum(dim=-1).cpu().numpy()
+        keep_mask = zero_variance_group_mask(scores, uids)
+        total_groups = len(set(uids))
+        kept_groups = len(set(uids[keep_mask])) if keep_mask.any() else 0
+        self.replay_filtered_groups_cum += total_groups - kept_groups
+
+        if not keep_mask.any():
+            # Every group is degenerate: all advantages are exactly zero, so the
+            # update is a no-op either way. Keep the original (dp-divisible)
+            # batch to keep the pipeline cadence, and store nothing.
+            metrics.update(
+                {
+                    "replay/degenerate_step": 1.0,
+                    "replay/filtered_zero_variance_groups": total_groups,
+                    "replay/filtered_zero_variance_groups_cum": self.replay_filtered_groups_cum,
+                    **{f"replay/{k}": v for k, v in self.replay_buffer.stats(version).items()},
+                }
+            )
+            return batch
+
+        survivors = batch.select_idxs(keep_mask)
+        priorities = rollout_priorities(
+            survivors.batch["advantages"], survivors.batch["response_mask"], self.replay_buffer.priority_eps
+        )
+        # Evict BEFORE the draw so no update reuses a rollout older than
+        # tau_max (the paper's stated guarantee), and draw BEFORE inserting
+        # this step's rollouts (Algorithm 1: the fresh anchor is not replay).
+        evicted = self.replay_buffer.evict_older_than(version)
+        warmup = self.replay_buffer.warmup_active(version)
+        draw_n, trim_n = resolve_replay_draw(
+            n_fresh=len(survivors),
+            replay_ratio=self.replay_buffer.replay_ratio,
+            buffer_size=self.replay_buffer.size(),
+            dp_size=self.trainer_dp_size,
+            warmup_active=warmup,
+        )
+        replay_rows, draw_info = self.replay_buffer.sample(draw_n, current_version=version)
+        self.replay_buffer.add(survivors, priorities, birth_version=version)
+
+        fresh_for_grad = survivors
+        if trim_n > 0:
+            keep_idx = np.sort(
+                self._replay_trim_rng.choice(len(survivors), size=len(survivors) - trim_n, replace=False)
+            )
+            fresh_for_grad = survivors.select_idxs(keep_idx.tolist())
+        parts = [fresh_for_grad] + ([replay_rows] if replay_rows is not None else [])
+        mixed = DataProto.concat(parts) if len(parts) > 1 else fresh_for_grad
+        # concat merges meta_info; refresh the batch-shape-dependent entries.
+        mixed.meta_info.update(batch.meta_info)
+        mixed.meta_info["global_token_num"] = torch.sum(mixed.batch["attention_mask"], dim=-1).tolist()
+        assert len(mixed) % self.trainer_dp_size == 0, (
+            f"composed batch of {len(mixed)} rows does not divide dp={self.trainer_dp_size}"
+        )
+        mixed.meta_info["mini_batch_size"] = len(mixed) // self.trainer_dp_size
+        if self.config.trainer.balance_batch:
+            self._balance_batch(mixed, metrics=metrics)
+
+        drawn = len(draw_info["ages"])
+        metrics.update(
+            {
+                "replay/degenerate_step": 0.0,
+                "replay/filtered_zero_variance_groups": total_groups - kept_groups,
+                "replay/filtered_zero_variance_groups_cum": self.replay_filtered_groups_cum,
+                "replay/fresh_groups_kept": kept_groups,
+                "replay/fresh_rollouts_kept": len(survivors),
+                "replay/draw_size": drawn,
+                "replay/replay_fraction": drawn / max(len(mixed), 1),
+                "replay/trimmed_for_dp": trim_n,
+                "replay/warmup_active": float(warmup),
+                "replay/evicted_by_age": evicted,
+                **{f"replay/{k}": v for k, v in self.replay_buffer.stats(version).items()},
+            }
+        )
+        if drawn > 0:
+            metrics.update(
+                {
+                    "replay/minibatch_age_mean": float(draw_info["ages"].mean()),
+                    "replay/minibatch_age_p50": float(np.percentile(draw_info["ages"], 50)),
+                    "replay/minibatch_age_max": int(draw_info["ages"].max()),
+                    "replay/minibatch_priority_mean": float(draw_info["priorities"].mean()),
+                    "replay/minibatch_priority_max": float(draw_info["priorities"].max()),
+                }
+            )
+        return mixed
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""

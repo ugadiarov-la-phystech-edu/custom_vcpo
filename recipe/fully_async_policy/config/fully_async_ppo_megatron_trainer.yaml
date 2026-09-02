@@ -27,6 +27,50 @@ async_training:
   # compute_prox_log_prob
   compute_prox_log_prob: False
 
+  # Rollout-level |A_i|-prioritized experience replay (arXiv:2606.04560).
+  # Each trainer step: drop zero-variance groups from the fresh 33-group pull,
+  # draw replay_ratio * B'_fresh individual past rollouts from an age-gated
+  # buffer with PER probability ~ (|A_i| + priority_eps)^priority_alpha, and
+  # run ONE PPO-clip update on the fresh survivors + replay draw concatenated
+  # (fresh-anchored composition). Advantages and behavior log-probs are frozen
+  # at birth; the ratio anchors to the cached generation-time log-probs, so
+  # this mode requires use_rollout_log_probs=True, compute_prox_log_prob=False,
+  # algorithm.rollout_correction.rollout_is=null, adv_estimator=grpo and
+  # require_batches=1 (validated at trainer init).
+  rollout_replay:
+
+    # Master switch; False keeps the trainer exactly as before
+    enable: False
+
+    # r: replay draw size as a fraction of the surviving fresh rollouts
+    replay_ratio: 0.5
+
+    # PER exponent alpha on p_i = |A_i| + priority_eps (0 = uniform,
+    # 1 = fully proportional)
+    priority_alpha: 0.5
+
+    # Additive priority floor (the paper's eps in p_i = |A_i| + eps)
+    priority_eps: 1.0e-6
+
+    # Age-eviction horizon in model updates: rollouts older than tau_max are
+    # removed regardless of buffer fullness
+    tau_max: 10
+
+    # Replay stays disabled (draw = 0) while param_version < warmup_steps;
+    # the buffer still fills so replay starts from a populated buffer
+    warmup_steps: 20
+
+    # FIFO capacity backstop in rollouts; age eviction is the binding rule
+    # at the paper's settings, this is a safety cap
+    capacity: 30000
+
+    # Seed for the PER draw
+    sampling_seed: 1234
+
+    # False = duplicate-free draw (weighted sampling without replacement);
+    # True = canonical Schaul PER draw with replacement
+    with_replacement: False
+
 # Rollout config
 rollout:
 

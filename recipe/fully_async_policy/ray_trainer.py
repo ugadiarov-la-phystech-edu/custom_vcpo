@@ -453,6 +453,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 config=self.config.algorithm,
             )
 
+        # Hook between advantage computation and the update: subclasses may
+        # recompose the gradient batch (e.g. rollout-level experience replay).
+        batch = self._compose_training_batch(batch, metrics)
+
         # update critic
         if self.use_critic:
             with marked_timer("update_critic", timing_raw, color="pink"):
@@ -469,6 +473,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
             metrics.update(actor_output_metrics)
         return batch, reward_extra_infos_dict
+
+    def _compose_training_batch(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Identity by default; FullyAsyncTrainer overrides it in replay mode."""
+        return batch
 
     def _log_rollout(self, batch, reward_extra_infos_dict, timing_raw):
         # Log rollout generations if enabled

@@ -328,8 +328,13 @@ class MegatronPPOActor(BasePPOActor):
             data = data.select(select_keys, ["multi_modal_inputs"])
         else:
             data = data.select(batch_keys=select_keys)
+        # A driver that composes variable-size batches (e.g. the rollout-level
+        # replay recipe: fresh survivors + a replay draw) ships the per-DP-rank
+        # mini-batch size in meta_info, because the static config value only
+        # divides fixed-size pulls. Absent the key, behavior is unchanged.
+        mini_batch_size = data.meta_info.get("mini_batch_size", self.config.ppo_mini_batch_size)
         return data.make_iterator(
-            mini_batch_size=self.config.ppo_mini_batch_size,
+            mini_batch_size=mini_batch_size,
             epochs=self.config.ppo_epochs,
             seed=self.config.data_loader_seed,
             dataloader_kwargs={"shuffle": self.config.shuffle},
@@ -488,6 +493,7 @@ class MegatronPPOActor(BasePPOActor):
                     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                     entropy_coeff = meta_info["entropy_coeff"]
                     policy_loss = pg_loss - entropy_coeff * entropy_loss
+                    stats["actor/entropy"] = entropy_loss.detach().item()
                 else:
                     ret_entropy = entropy
 
@@ -676,7 +682,9 @@ class MegatronPPOActor(BasePPOActor):
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            # Honor actor.calculate_entropy so actor/entropy is logged even at
+            # entropy_coeff=0 (the campaign's collapse indicator).
+            calculate_entropy = self.config.entropy_coeff != 0 or self.config.get("calculate_entropy", False)
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:
