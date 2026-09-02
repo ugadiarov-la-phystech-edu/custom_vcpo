@@ -236,12 +236,20 @@ _ADD_CHUNK = 2**28  # elements per chunked add_ (512 MiB of bf16)
 
 
 def _chunked_add_enabled() -> bool:
-    """VCPO_OPOB_CHUNKED_ADD=1: replace torch._foreach_add_ on the grad-sized buffers by
-    per-tensor, chunked ``add_`` (experiment: the OPOB score accumulator was seen receiving
-    +-alpha*accum instead of alpha*main_grad in the output_layer slice at 4.1e9 elements)."""
+    """Default ON: the grad-sized OPOB accumulators are updated with per-tensor, chunked
+    ``add_`` instead of ``torch._foreach_add_``.
+
+    Why: with torch 2.8.0+cu128 on H100, ``_foreach_add_([score], [main_grad], alpha)`` on
+    the 4.1e9-element bf16 Megatron grad buffer (Qwen3-8B, TP=2) was measured in situ to add
+    +-alpha * (the *other* accumulator's output_layer slice) instead of alpha * main_grad
+    whenever alpha != 1 (2026-09-02/03 OPOB smokes: score-add residual 0.3-0.7 with cosine
+    +-0.98 to the accum buffer; per-tensor chunked add_: residual 4e-5, actor/grad_norm 0.14
+    instead of 1e7-1e9). A standalone probe of the same op/size/layout did not reproduce it,
+    so the trigger is process-specific; chunked add_ avoids the foreach kernel entirely.
+    Set VCPO_OPOB_CHUNKED_ADD=0 to get the old foreach path back (diagnosis only)."""
     import os
 
-    return os.environ.get("VCPO_OPOB_CHUNKED_ADD", "0") not in ("", "0", "false", "False")
+    return os.environ.get("VCPO_OPOB_CHUNKED_ADD", "1") not in ("", "0", "false", "False")
 
 
 def _add_lists_(dest: Sequence[torch.Tensor], src: Sequence[torch.Tensor], alpha: float) -> None:

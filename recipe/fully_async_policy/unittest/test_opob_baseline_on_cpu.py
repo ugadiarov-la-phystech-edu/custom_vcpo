@@ -269,6 +269,14 @@ class TestOpobDebugHelpers:
         vcpo.move_grad_buffers([torch.zeros(4)], [torch.zeros(4)], scale=1.0)
         assert called[-1] == ("foreach",)
 
+    def test_chunked_add_is_the_default(self, monkeypatch):
+        from verl.workers.utils import vcpo
+
+        monkeypatch.delenv("VCPO_OPOB_CHUNKED_ADD", raising=False)
+        assert vcpo._chunked_add_enabled()  # foreach is opt-in (diagnosis only)
+        monkeypatch.setenv("VCPO_OPOB_CHUNKED_ADD", "0")
+        assert not vcpo._chunked_add_enabled()
+
     def test_debug_flag_reads_env(self, monkeypatch):
         from verl.workers.utils.vcpo import _opob_debug_enabled
 
