@@ -141,6 +141,21 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.global_steps = 1
         self.idle_start_time = None
         self.version_start_time = None
+        # Wall-clock anchor for cumulative_training_time: set once, at the first
+        # draw from the training dataloader. Validation time and checkpoint-save
+        # generation pauses are accumulated only after this anchor exists
+        # (val_before_train runs are excluded).
+        self.first_sample_time = None
+        self.cumulative_validation_time = 0.0
+        self.cumulative_checkpoint_pause = 0.0
+        # Stop-the-world saves (async_training.pause_generation_during_save):
+        # the trainer freezes generation for the whole checkpoint save via
+        # begin_save_pause/end_save_pause.
+        self._external_save_pause_active = False
+        self._external_save_pause_start = None
+        # Set while a stop-the-world save is in progress; gates the feed loop
+        # together with self.paused.
+        self.checkpointing = False
 
         # Concurrency control
         # Modified by self.pause() or self._should_pause_generation()
@@ -240,12 +255,48 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             ) or (validate and self.val_reward_fn is not None):
                 with marked_timer("rollouter/validate_time", timing_raw, color="green"):
                     val_metrics: dict = self._validate()
+            val_time = timing_raw.get("rollouter/validate_time")
+            if val_time is not None and self.first_sample_time is not None:
+                self.cumulative_validation_time += val_time
             data = ValidateMetrics(
-                timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
+                timing_raw=timing_raw,
+                metrics=val_metrics,
+                global_steps=global_steps,
+                param_version=version,
+                first_sample_time=self.first_sample_time,
+                cumulative_validation_time=self.cumulative_validation_time,
             )
             await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
 
             self.version_start_time = time.time()
+
+    async def begin_save_pause(self):
+        """Freeze generation for the entire checkpoint save (stop-the-world
+        saves). Called by the trainer before its own (long) actor save, so the
+        whole save becomes a pure time translation of the pipeline instead of
+        letting generation build a queue surplus during it. The full frozen
+        window is accumulated into cumulative_checkpoint_pause at
+        end_save_pause, shifting later samples' virtual arrival times. The
+        start timestamp is taken *after* acquiring the lock, so time spent
+        waiting behind a running validation (update_param_version holds the
+        lock) is never double-counted into both accumulators."""
+        async with self.lock:
+            self._external_save_pause_start = time.time()
+            self._external_save_pause_active = True
+            self.checkpointing = True
+            self.condition.notify_all()
+        await self.pause()
+
+    async def end_save_pause(self):
+        """Resume generation after a stop-the-world save and account the full
+        pause window (post-anchor only, like all virtual-clock accumulators)."""
+        async with self.lock:
+            self.checkpointing = False
+        await self.resume()
+        self._external_save_pause_active = False
+        if self._external_save_pause_start is not None and self.first_sample_time is not None:
+            self.cumulative_checkpoint_pause += time.time() - self._external_save_pause_start
+        self._external_save_pause_start = None
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -382,6 +433,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
+            if self.first_sample_time is None:
+                self.first_sample_time = time.time()
+                print(f"[FullyAsyncRollouter][Feed] First training sample drawn, t0={self.first_sample_time}")
+            async with self.lock:
+                while self.paused or self.checkpointing:
+                    await self.condition.wait()
+
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
 
@@ -510,6 +568,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             rollout_sample.param_version = self.current_param_version
             rollout_sample.rollout_status = await self.get_statistics()
             rollout_sample.agent_loop_output_list = []
+            # Stamp the sample for the trainer's virtual (no-validation-no-save)
+            # timeline: cumulative_validation_time is exactly the generation pause
+            # validation has caused so far (the sync pause exists with or without
+            # validation), and cumulative_checkpoint_pause the pause caused by
+            # stop-the-world checkpoint saves.
+            rollout_sample.enqueue_time = time.time()
+            rollout_sample.validation_pause_before = self.cumulative_validation_time
+            rollout_sample.checkpoint_pause_before = self.cumulative_checkpoint_pause
 
             success = await self.message_queue_client.put_sample(
                 sample=ray.cloudpickle.dumps(rollout_sample),

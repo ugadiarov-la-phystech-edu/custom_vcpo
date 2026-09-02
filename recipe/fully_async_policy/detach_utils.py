@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -46,6 +47,16 @@ class RolloutSample:
     param_version_end: list[int]
     rollout_status: dict[str, Any]
 
+    # Virtual-timeline stamps for the trainer's cumulative_training_time metric:
+    # wall-clock when the sample was pushed to the message queue, and the
+    # rollouter's total validation- and checkpoint-caused generation pauses
+    # before that moment. enqueue_time - validation_pause_before -
+    # checkpoint_pause_before is when the sample would have been ready in an
+    # identical run with neither validation nor checkpointing.
+    enqueue_time: Optional[float] = None
+    validation_pause_before: float = 0.0
+    checkpoint_pause_before: float = 0.0
+
 
 @dataclass
 class ValidateMetrics:
@@ -55,6 +66,10 @@ class ValidateMetrics:
     metrics: Optional[dict[str, Any]] = None
     global_steps: Optional[int] = None
     param_version: Optional[int] = None
+    # Rollouter wall-clock bookkeeping for the trainer's cumulative_training_time metric:
+    # when the first training sample was drawn, and total time spent in validation since then.
+    first_sample_time: Optional[float] = None
+    cumulative_validation_time: Optional[float] = None
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
@@ -223,6 +238,14 @@ class MetricsAggregator:
                 "fully_async/count/current_param_version",
                 "fully_async/count/dropped_stale_samples",
                 "training/global_step",  # TODO change name to: total_step
+                # Cumulative counters: only the newest value is meaningful. They are
+                # normally added after aggregation (see FullyAsyncTrainer.
+                # _add_cumulative_time_metrics), so these entries are a guard in case
+                # they are ever routed through add_step_metrics instead.
+                "fully_async/timing/cumulative_training_time",
+                "fully_async/timing/wall_time_since_first_sample",
+                "fully_async/timing/cumulative_validation_time",
+                "fully_async/timing/cumulative_save_time",
             ],
         }
 
@@ -249,18 +272,20 @@ class MetricsAggregator:
                 return agg_type
 
         metric_lower = metric_name.lower()
-        if any(keyword in metric_lower for keyword in ["timing_s/"]):
+        if "timing_s/" in metric_lower:
             return "time_sum"
-        if any(keyword in metric_lower for keyword in ["mean", "avg", "average"]):
+        # Match whole words, not substrings: "timing" contains "min", so substring
+        # matching silently aggregated every timing_per_token_ms/* metric (and any
+        # fully_async/timing/* one) with min instead of averaging it.
+        words = set(re.split(r"[^a-z]+", metric_lower))
+        if words & {"mean", "avg", "average"}:
             return "avg"
-        if any(keyword in metric_lower for keyword in ["max", "maximum"]):
+        if words & {"max", "maximum"}:
             return "max"
-        if any(keyword in metric_lower for keyword in ["min", "minimum"]):
+        if words & {"min", "minimum"}:
             return "min"
-        if any(keyword in metric_lower for keyword in ["sum", "total"]):
+        if words & {"sum", "total"}:
             return "sum"
-        if any(keyword in metric_lower for keyword in ["weighted_avg"]):
-            return "weighted_avg"
 
         return "avg"
 

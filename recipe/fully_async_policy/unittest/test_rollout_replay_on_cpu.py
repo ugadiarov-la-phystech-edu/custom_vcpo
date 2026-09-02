@@ -390,6 +390,23 @@ class TestComposeTrainingBatch:
         batch = make_batch([mixed_group("a")])
         assert trainer._compose_training_batch(batch, {}) is batch
 
+    def test_resume_restarts_with_an_empty_buffer_and_refills(self):
+        """The replay buffer is not checkpointed: a resumed run (fresh buffer,
+        large restored param version) draws 0 on its first step, refills the
+        buffer, and draws normally from the next step on — warmup does not
+        re-trigger because it compares against the restored version."""
+        trainer = make_trainer(dp_size=2, warmup_steps=20, version=500)
+        metrics = {}
+        out = trainer._compose_training_batch(make_batch([mixed_group("a"), mixed_group("b")]), metrics)
+        assert len(out) == 8
+        assert metrics["replay/draw_size"] == 0
+        assert metrics["replay/warmup_active"] == 0.0
+        assert trainer.replay_buffer.size() == 8
+        metrics = {}
+        out = trainer._compose_training_batch(make_batch([mixed_group("c"), mixed_group("d")]), metrics)
+        assert metrics["replay/draw_size"] == 4
+        assert len(out) == 12
+
     def test_age_eviction_runs_before_the_draw(self):
         trainer = make_trainer(dp_size=2, version=0)
         trainer.replay_buffer.tau_max = 1
@@ -541,12 +558,19 @@ class TestMegatronActorPatches:
 
     def test_update_policy_honors_calculate_entropy_at_zero_coeff(self):
         """The pristine branch only computed entropy when entropy_coeff != 0;
-        the patch also honors actor.calculate_entropy so actor/entropy (the
-        campaign's collapse indicator) is logged with entropy_coeff=0."""
+        the should_calculate_entropy helper (ported from baselines) also honors
+        actor.calculate_entropy so actor/entropy (the campaign's collapse
+        indicator) is logged with entropy_coeff=0."""
+        megatron_actor = self._import_actor()
+
+        def cfg(coeff, calc):
+            return OmegaConf.create({"entropy_coeff": coeff, "calculate_entropy": calc})
+
+        assert megatron_actor.should_calculate_entropy(cfg(0, True)) is True
+        assert megatron_actor.should_calculate_entropy(cfg(0, False)) is False
+        assert megatron_actor.should_calculate_entropy(cfg(0.001, False)) is True
         source = self._module_source()
-        assert 'calculate_entropy = self.config.entropy_coeff != 0 or self.config.get("calculate_entropy", False)' in (
-            source
-        )
+        assert "calculate_entropy = should_calculate_entropy(self.config)" in source
 
     def test_loss_func_emits_the_entropy_metric(self):
         source = self._module_source()

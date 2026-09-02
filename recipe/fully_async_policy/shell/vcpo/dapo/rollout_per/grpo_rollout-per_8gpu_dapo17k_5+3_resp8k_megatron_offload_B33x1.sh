@@ -48,10 +48,23 @@
 # saw ~50-65%) -- the number of *trained* steps per fed prompt is unchanged,
 # but each update carries fewer fresh rollouts than the 528 fed.
 #
-# CHECKPOINTS (save_contents=['hf_model'], resume_mode=disable): HF-format
-# weights only, directly loadable by vLLM, NOT resumable ('hf_model' is
-# written but never read back); ~16.4 GB per save for Qwen3-8B, nothing
-# rotated away (max_actor_ckpt_to_keep=null).
+# STOP-THE-WORLD ACCOUNTING (serialize_validation /
+# pause_generation_during_save, both True): the pipeline freezes for the whole
+# validation sweep and the whole checkpoint save, so both are pure time
+# translations and fully_async/timing/cumulative_training_time + the
+# trajectory match a no-validation-no-save run exactly (the stalls are
+# excluded from the virtual clock).
+#
+# CHECKPOINTS (save_contents=['model','optimizer','extra','hf_model'],
+# resume_mode=auto, max_actor_ckpt_to_keep=2): full resumable dist-ckpt
+# (optimizer state is ~6x the bf16 weights, hence the rotation to the newest
+# 2) plus an hf_model/ directory per save, directly loadable by vLLM for
+# offline eval. resume_mode=auto continues from the newest checkpoint after a
+# restart, and timing_state.json keeps cumulative_training_time continuous.
+# CAVEAT: the replay buffer is NOT persisted — a resumed run restarts with an
+# empty buffer and refills it within ~tau_max updates (draws shrink to what
+# the buffer holds; warmup does not re-trigger since it compares against the
+# restored param version).
 #
 # Trainer layout: tp=1/dp=3 (sequence_parallel needs TP>1), HDO full CPU
 # offload with bf16 master weights (do NOT swap for
@@ -164,6 +177,13 @@ use_rollout_log_probs=True
 # ================= PPO epochs =================
 ppo_epochs=${ppo_epochs:-1} # paper: one pass per gradient batch
 
+# ================= Stop-the-world accounting =================
+# Freeze the pipeline during validation / checkpoint saves so
+# fully_async/timing/cumulative_training_time and the trajectory match a
+# no-validation-no-save run exactly.
+serialize_validation=${serialize_validation:-True}
+pause_generation_during_save=${pause_generation_during_save:-True}
+
 # ================= Training/Rollout Steps =================
 # Counts FED prompts (see horizon caveat in the header): 66000 licenses up to
 # ~2000 trainer steps of 33 fed groups.
@@ -172,10 +192,11 @@ epochs=10000000
 # test/save freq are in param-version units; versions tick per 33-group step.
 test_freq=${test_freq:-10}
 save_freq=${save_freq:-10}
-save_contents=${save_contents:-"['hf_model']"}
-max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null} # keep every checkpoint
-# 'hf_model' is written but never read back; a resume would restore nothing.
-resume_mode=${resume_mode:-disable}
+# Full resumable checkpoint + an hf_model/ copy for direct offline eval; the
+# optimizer state dominates the size, so rotate to the newest 2.
+save_contents=${save_contents:-"['model','optimizer','extra','hf_model']"}
+max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-2}
+resume_mode=${resume_mode:-auto}
 
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO rollout-PER r-${replay_ratio} a-${priority_alpha} tau-${replay_tau_max} warmup-${replay_warmup_steps} k-${staleness_threshold} clip-0.2-0.28-c-10 DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
@@ -311,6 +332,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.partial_rollout="${partial_rollout}" \
     async_training.compute_prox_log_prob="${compute_prox_log_prob}" \
     async_training.use_rollout_log_probs="${use_rollout_log_probs}" \
+    async_training.serialize_validation="${serialize_validation}" \
+    async_training.pause_generation_during_save="${pause_generation_during_save}" \
     async_training.rollout_replay.enable=True \
     async_training.rollout_replay.replay_ratio="${replay_ratio}" \
     async_training.rollout_replay.priority_alpha="${priority_alpha}" \

@@ -187,9 +187,28 @@ class TestRolloutPerArmConfig(unittest.TestCase):
         self.assertEqual(self.cfg.async_training.require_batches, 1)
         self.assertTrue(self.cfg.async_training.partial_rollout)
 
-    def test_checkpoints_are_hf_model_only_and_not_resumable(self):
-        self.assertEqual(list(self.cfg.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
-        self.assertEqual(self.cfg.trainer.resume_mode, "disable")
+    def test_checkpoints_are_resumable_with_auto_resume(self):
+        """Full dist-ckpt + an hf_model/ eval copy, auto resume, rotation to
+        the newest 2 (optimizer state dominates the size)."""
+        save_contents = list(self.cfg.actor_rollout_ref.actor.checkpoint.save_contents)
+        self.assertEqual(save_contents, ["model", "optimizer", "extra", "hf_model"])
+        self.assertEqual(self.cfg.trainer.resume_mode, "auto")
+        self.assertEqual(self.cfg.trainer.max_actor_ckpt_to_keep, 2)
+
+    def test_resume_refusal_cannot_fire_on_this_arm(self):
+        """load_checkpoint refuses to resume when load_contents would not
+        restore the model weights; the composed load_contents must include
+        'model' so resume_mode=auto actually works after a restart."""
+        from verl.utils.checkpoint.checkpoint_manager import restores_model_weights
+
+        load_contents = self.cfg.actor_rollout_ref.actor.checkpoint.load_contents
+        self.assertTrue(restores_model_weights(load_contents))
+
+    def test_stop_the_world_accounting_is_on(self):
+        """Both freezes on: cumulative_training_time and the trajectory match
+        a no-validation-no-save run, comparable to the baseline arms."""
+        self.assertTrue(self.cfg.async_training.serialize_validation)
+        self.assertTrue(self.cfg.async_training.pause_generation_during_save)
 
     def test_generation_budget(self):
         self.assertEqual(self.cfg.rollout.total_rollout_steps, 66000)
@@ -207,6 +226,10 @@ class TestRecipeYamlDefaults(unittest.TestCase):
     def test_replay_is_disabled_by_default(self):
         replay = self.yaml.async_training.rollout_replay
         self.assertFalse(replay.enable)
+
+    def test_stop_the_world_is_off_by_default(self):
+        self.assertFalse(self.yaml.async_training.serialize_validation)
+        self.assertFalse(self.yaml.async_training.pause_generation_during_save)
 
     def test_yaml_defaults_match_the_paper(self):
         replay = self.yaml.async_training.rollout_replay
