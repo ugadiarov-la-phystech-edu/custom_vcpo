@@ -106,7 +106,7 @@ rollout_name="vllm"
 return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-gpu_memory_utilization=0.8
+gpu_memory_utilization=0.9
 enable_chunked_prefill=True
 # Mandatory for this arm: the cached generation-time log-probs are the PPO
 # ratio's behavior anchor for fresh AND replayed rollouts.
