@@ -216,8 +216,8 @@ class TestRolloutPerArmConfig(unittest.TestCase):
 
     def test_generation_budget(self):
         self.assertEqual(self.cfg.rollout.total_rollout_steps, 66000)
-        self.assertEqual(self.cfg.rollout.test_freq, 10)
-        self.assertEqual(self.cfg.trainer.save_freq, 10)
+        self.assertEqual(self.cfg.rollout.test_freq, 20)
+        self.assertEqual(self.cfg.trainer.save_freq, 20)
 
 
 SMOKE_SCRIPT = os.path.join(

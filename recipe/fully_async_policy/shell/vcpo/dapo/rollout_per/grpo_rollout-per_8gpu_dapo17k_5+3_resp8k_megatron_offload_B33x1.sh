@@ -193,14 +193,15 @@ pause_generation_during_save=${pause_generation_during_save:-True}
 # ~2000 trainer steps of 33 fed groups.
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
-# test/save freq are in param-version units; versions tick per 33-group step.
-test_freq=${test_freq:-10}
-save_freq=${save_freq:-10}
+# test/save freq are in param-version units; versions tick per 33-group step,
+# so 20 = validate and checkpoint every 660 fed groups.
+test_freq=${test_freq:-20}
+save_freq=${save_freq:-20}
 # Weights only, in huggingface format: no optimizer state (fp32 master + adam
 # moments are ~6x the bf16 weights) and no dist_ckpt/ directory at all -
 # global_step_N/actor/huggingface/ loads in vLLM as is. ~16.4 GB per save for
 # Qwen3-8B and nothing is rotated away: raise save_freq at launch if the disk
-# is tighter than ~200 saves' worth. Override save_contents to
+# is tighter than ~100 saves' worth. Override save_contents to
 # "['model','optimizer','extra','hf_model']" for a run that must be resumable.
 save_contents=${save_contents:-"['hf_model']"}
 max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null} # keep every checkpoint
