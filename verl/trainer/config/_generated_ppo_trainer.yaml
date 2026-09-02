@@ -126,6 +126,9 @@ actor_rollout_ref:
       use_clipped_is_ratios: false
       normalize_by_length: false
       norm_by_std: false
+      accum_device: cuda
+      accum_dtype: auto
+      accum_cpu_threads: 16
     grad_clip: 1.0
     ulysses_sequence_parallel_size: 1
     entropy_from_logits_with_chunking: false

@@ -262,11 +262,12 @@ class TestOpobDebugHelpers:
         monkeypatch.setattr(vcpo.torch, "_foreach_add_", lambda *a, **k: called.append(("foreach",)))
         buf = SimpleNamespace(grad_data=torch.zeros(4))
         module = SimpleNamespace(buffers=[buf])
+        gpu_dest = [SimpleNamespace(is_cuda=True)]  # device accumulators take the chunked/foreach paths
         vcpo.accumulate_grad_buffers([module], [torch.zeros(4)], scale=2.0)
-        vcpo.move_grad_buffers([torch.zeros(4)], [torch.zeros(4)], scale=-0.5)
+        vcpo.move_grad_buffers([torch.zeros(4)], gpu_dest, scale=-0.5)
         assert called == [("add", 2.0), ("add", -0.5)]
         monkeypatch.setenv("VCPO_OPOB_CHUNKED_ADD", "0")
-        vcpo.move_grad_buffers([torch.zeros(4)], [torch.zeros(4)], scale=1.0)
+        vcpo.move_grad_buffers([torch.zeros(4)], gpu_dest, scale=1.0)
         assert called[-1] == ("foreach",)
 
     def test_chunked_add_is_the_default(self, monkeypatch):

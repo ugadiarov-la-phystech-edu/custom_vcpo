@@ -67,8 +67,11 @@ from verl.workers.utils.vcpo import (
     _get_local_model_grads_for_norm,
     _iter_grad_buffers,
     _opob_debug_enabled,
+    _optimizer_has_grad_scaler,
     accumulate_grad_buffers,
+    accumulate_grad_buffers_multi,
     allocate_grad_accum_buffers,
+    allocate_staging_buffers,
     copy_accum_buffers_to_grad_buffers,
     disable_dp_sync,
     disable_grad_finalize,
@@ -851,7 +854,13 @@ class MegatronPPOActor(BasePPOActor):
         loss_scale = 1.0
         if hasattr(self.actor_optimizer, "get_loss_scale"):
             loss_scale = float(self.actor_optimizer.get_loss_scale().item())
-        found_inf_flag = self.actor_optimizer.prepare_grads()
+        # prepare_grads() only matters here for the inf/nan check of a loss-scaled (fp16)
+        # optimizer. Without a grad scaler it merely materializes the optimizer's copy of the
+        # gradient shard (a grad-sized fp32 tensor with fp32 master weights) on every
+        # trajectory; the norm below reads main_grad directly, so skip it.
+        found_inf_flag = False
+        if _optimizer_has_grad_scaler(self.actor_optimizer):
+            found_inf_flag = self.actor_optimizer.prepare_grads()
 
         if found_inf_flag:
             unscaled_grad_norm = grad_norm = float("inf")
@@ -873,6 +882,32 @@ class MegatronPPOActor(BasePPOActor):
 
         return unscaled_grad_norm, grad_norm
 
+    def _allocate_opob_buffers(self):
+        """Allocate OPOB's accum (G_R) and score (G_S) buffers per grad_baselining.accum_device /
+        accum_dtype. Returns (accum, score, staging); ``staging`` is a pinned host copy of the
+        grad buffers used for the single d2h transfer per trajectory when the accumulators are
+        host-resident, else None."""
+        gb_cfg = self.config.grad_baselining
+        accum_device = str(getattr(gb_cfg, "accum_device", "cuda") or "cuda")
+        accum_dtype = getattr(gb_cfg, "accum_dtype", "auto")
+        if accum_device == "cuda" and accum_dtype in (None, "auto"):
+            accum_buffers = allocate_grad_accum_buffers(self.actor_module)
+            score_gradient_buffers = allocate_grad_accum_buffers(self.actor_module)
+        else:
+            accum_buffers = allocate_grad_accum_buffers(self.actor_module, device=accum_device, dtype=accum_dtype)
+            score_gradient_buffers = allocate_grad_accum_buffers(
+                self.actor_module, device=accum_device, dtype=accum_dtype
+            )
+        staging_buffers = None
+        if accum_device == "cpu":
+            staging_buffers = allocate_staging_buffers(self.actor_module)
+            # Ray workers start with OMP_NUM_THREADS=1: the host-side adds over ~1e10
+            # elements per trajectory would be single-threaded.
+            threads = int(getattr(gb_cfg, "accum_cpu_threads", 0) or 0)
+            if threads > 0 and torch.get_num_threads() < threads:
+                torch.set_num_threads(threads)
+        return accum_buffers, score_gradient_buffers, staging_buffers
+
     def _update_grad_buffers(
         self,
         accum_buffers: list[torch.Tensor],
@@ -888,11 +923,15 @@ class MegatronPPOActor(BasePPOActor):
         grad_baselining: bool = False,
         opob_records: list[dict] | None = None,
         traj_uid=None,
+        staging: list[torch.Tensor] | None = None,
     ):
         """Gradient buffer update.
 
         ``opob_records`` (OPOB only): one ``summarize_opob_group`` dict is appended per closed
         scope; the trainer reduces them into the ``opob/*`` scalars.
+        ``staging`` (OPOB with CPU-resident accumulators): pinned host copies of the grad
+        buffers; the trajectory's gradient is moved d2h once and added into both accumulators
+        on the host.
         """
         if grad_baselining:
             assert score_gradient_buffers is not None
@@ -906,7 +945,15 @@ class MegatronPPOActor(BasePPOActor):
                 scale_reward = adv_scalar
                 scale_baseline = 1
 
-            dbg_param = getattr(self, "_opob_dbg_param", None) if _opob_debug_enabled() else None
+            if staging is not None:
+                # Host-resident accumulators: one d2h copy, both adds on the CPU.
+                accumulate_grad_buffers_multi(
+                    self.actor_module,
+                    [(accum_buffers, scale_reward), (score_gradient_buffers, scale_baseline)],
+                    staging=staging,
+                )
+
+            dbg_param = getattr(self, "_opob_dbg_param", None) if (staging is None and _opob_debug_enabled()) else None
             if dbg_param is not None:
                 # Decompose what the two accumulates actually add to the watched
                 # parameter's slice: intended = scale * main_grad slice; suspect = the
@@ -919,13 +966,15 @@ class MegatronPPOActor(BasePPOActor):
                 w_acc_before = w_acc.clone()
                 w_sc_before = w_sc.clone()
 
-            accumulate_grad_buffers(self.actor_module, accum_buffers, scale=scale_reward)
+            if staging is None:
+                accumulate_grad_buffers(self.actor_module, accum_buffers, scale=scale_reward)
 
             if dbg_param is not None:
                 w_acc_mid = w_acc.clone()
                 w_main_mid = w_main.clone()
 
-            accumulate_grad_buffers(self.actor_module, score_gradient_buffers, scale=scale_baseline)
+            if staging is None:
+                accumulate_grad_buffers(self.actor_module, score_gradient_buffers, scale=scale_baseline)
 
             if dbg_param is not None:
                 rank = torch.distributed.get_rank()
@@ -1176,14 +1225,14 @@ class MegatronPPOActor(BasePPOActor):
         # saving a full grad-buffer copy of peak memory.
         accum_buffers = None
         score_gradient_buffers = None
+        staging_buffers = None
         if grad_baselining:
             assert self.config.loss_agg_mode in [
                 "seq-mean-token-mean",
                 "seq-mean-token-sum",
                 "seq-mean-token-sum-norm",
             ]
-            accum_buffers = allocate_grad_accum_buffers(self.actor_module)
-            score_gradient_buffers = allocate_grad_accum_buffers(self.actor_module)
+            accum_buffers, score_gradient_buffers, staging_buffers = self._allocate_opob_buffers()
             if _opob_debug_enabled():
                 # Memory layout check: the three buffer sets must not overlap.
                 describe = lambda bufs: [  # noqa: E731
@@ -1350,6 +1399,7 @@ class MegatronPPOActor(BasePPOActor):
                         grad_baselining=grad_baselining,
                         opob_records=opob_records,
                         traj_uid=traj_uid,
+                        staging=staging_buffers,
                     )
 
                     self.actor_optimizer.zero_grad()
