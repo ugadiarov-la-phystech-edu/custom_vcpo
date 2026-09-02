@@ -62,8 +62,8 @@ top_k=-1
 val_temperature=${val_temperature:-1.0}
 calculate_log_probs=True
 
-test_freq=${test_freq:-50}
-save_freq=${save_freq:-50}
+test_freq=${test_freq:-25}
+save_freq=${save_freq:-25}
 total_epochs=${total_epochs:-3}
 val_before_train=${val_before_train:-True}
 save_contents=${save_contents:-"['hf_model']"}

@@ -170,7 +170,8 @@ class TestSyncDeepMathArmConfig(unittest.TestCase):
         self.assertEqual(list(c.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
         self.assertEqual(c.trainer.resume_mode, "disable")
         self.assertIsNone(c.trainer.max_actor_ckpt_to_keep)
-        self.assertEqual(c.trainer.save_freq, 50)
+        self.assertEqual(c.trainer.save_freq, 25)
+        self.assertEqual(c.trainer.test_freq, 25)
 
     def test_validation_on_orz_prompt_parquets(self):
         """aime-2024/2025 exactly as the _final branch's ORZ-72k arms (x32 ORZ-prompt parquets)."""
