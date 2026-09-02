@@ -55,16 +55,20 @@
 # trajectory match a no-validation-no-save run exactly (the stalls are
 # excluded from the virtual clock).
 #
-# CHECKPOINTS (save_contents=['model','optimizer','extra','hf_model'],
-# resume_mode=auto, max_actor_ckpt_to_keep=2): full resumable dist-ckpt
-# (optimizer state is ~6x the bf16 weights, hence the rotation to the newest
-# 2) plus an hf_model/ directory per save, directly loadable by vLLM for
-# offline eval. resume_mode=auto continues from the newest checkpoint after a
-# restart, and timing_state.json keeps cumulative_training_time continuous.
-# CAVEAT: the replay buffer is NOT persisted — a resumed run restarts with an
-# empty buffer and refills it within ~tau_max updates (draws shrink to what
-# the buffer holds; warmup does not re-trigger since it compares against the
-# restored param version).
+# CHECKPOINTS (save_contents=['hf_model'], resume_mode=auto,
+# max_actor_ckpt_to_keep=null): each save writes global_step_N/actor/
+# huggingface/ - config, tokenizer and bf16 safetensors - directly loadable by
+# vLLM / from_pretrained, with NO optimizer state and NO dist_ckpt/ directory
+# at all; timing_state.json is still written per save. 'hf_model' is written
+# but never read back, so with the default contents resume_mode=auto behaves
+# like disable on a fresh run dir (nothing to resume, trains from scratch),
+# and a restart ON TOP OF existing checkpoints stops with the trainer's loud
+# restores_model_weights refusal instead of silently training from pretrained
+# under the old exp_name - archive the run dir before relaunching, as usual.
+# To make auto resume real, override
+# save_contents="['model','optimizer','extra','hf_model']" at launch (the
+# replay buffer is still not persisted: a resumed run refills it within
+# ~tau_max updates).
 #
 # Trainer layout: tp=1/dp=3 (sequence_parallel needs TP>1), HDO full CPU
 # offload with bf16 master weights (do NOT swap for
@@ -192,10 +196,14 @@ epochs=10000000
 # test/save freq are in param-version units; versions tick per 33-group step.
 test_freq=${test_freq:-10}
 save_freq=${save_freq:-10}
-# Full resumable checkpoint + an hf_model/ copy for direct offline eval; the
-# optimizer state dominates the size, so rotate to the newest 2.
-save_contents=${save_contents:-"['model','optimizer','extra','hf_model']"}
-max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-2}
+# Weights only, in huggingface format: no optimizer state (fp32 master + adam
+# moments are ~6x the bf16 weights) and no dist_ckpt/ directory at all -
+# global_step_N/actor/huggingface/ loads in vLLM as is. ~16.4 GB per save for
+# Qwen3-8B and nothing is rotated away: raise save_freq at launch if the disk
+# is tighter than ~200 saves' worth. Override save_contents to
+# "['model','optimizer','extra','hf_model']" for a run that must be resumable.
+save_contents=${save_contents:-"['hf_model']"}
+max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null} # keep every checkpoint
 resume_mode=${resume_mode:-auto}
 
 # ================= Logging =================
