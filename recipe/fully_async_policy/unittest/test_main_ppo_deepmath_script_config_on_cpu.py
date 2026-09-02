@@ -23,7 +23,7 @@ of the tiered ORZ scorer + ORZ-prompt validation parquets.
 
 Composing runs the real script with ``--cfg job --resolve``; skips if that cannot run.
 
-Run: pytest recipe/fully_async_policy/unittest/test_main_ppo_orz72k_script_config_on_cpu.py
+Run: pytest recipe/fully_async_policy/unittest/test_main_ppo_deepmath_script_config_on_cpu.py
 """
 
 import os
@@ -36,7 +36,7 @@ from omegaconf import OmegaConf
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 BASELINE = os.path.join(REPO_ROOT, "recipe/fully_async_policy/shell/vcpo/dapo/baseline")
-SCRIPT = "main_ppo_sync_8gpu_orz72k_grpo_B32xn32_orz7b.sh"
+SCRIPT = "main_ppo_sync_8gpu_deepmath_grpo_B32xn16_orz7b.sh"
 
 _COMPOSED = {}
 
@@ -66,7 +66,7 @@ def compose(script_name, **env_overrides):
     return cfg
 
 
-class TestSyncOrz72kArmConfig(unittest.TestCase):
+class TestSyncDeepMathArmConfig(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if sys.platform.startswith("win"):
@@ -80,7 +80,7 @@ class TestSyncOrz72kArmConfig(unittest.TestCase):
         self.assertEqual(c.actor_rollout_ref.actor.ppo_mini_batch_size, 32)
         self.assertEqual(c.data.train_batch_size, c.actor_rollout_ref.actor.ppo_mini_batch_size)
         self.assertEqual(c.actor_rollout_ref.actor.ppo_epochs, 1)
-        self.assertEqual(c.actor_rollout_ref.rollout.n, 32)
+        self.assertEqual(c.actor_rollout_ref.rollout.n, 16)
 
     def test_orz_schedule_parity(self):
         c = self.cfg

@@ -6,14 +6,14 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=main-ppo-sync-orz72k-grpo-orz7b
+#SBATCH --job-name=main-ppo-sync-deepmath-grpo-orz7b
 
 set -x
 export VLLM_USE_V1=1
 export PYTHONUNBUFFERED=1
 
 MODEL_PATH=${MODEL_PATH:-"Open-Reasoner-Zero/Open-Reasoner-Zero-7B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/orz-math-72k.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/deepmath_orz_train.parquet"}
 TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/orz/aime-2024-orz.parquet','/home/jovyan/datasets/math_datasets/orz/aime-2025-orz.parquet']"}
 REWARD_FILE=${REWARD_FILE:-"recipe/fully_async_policy/reward/orz_tag_aware_math.py"}
 
@@ -23,7 +23,7 @@ filter_overlong_prompts=True
 truncation='left'
 
 train_prompt_bsz=${train_prompt_bsz:-32}
-n_resp_per_prompt=${n_resp_per_prompt:-32}
+n_resp_per_prompt=${n_resp_per_prompt:-16}
 ppo_epochs=${ppo_epochs:-1}
 
 adv_estimator=grpo
@@ -73,7 +73,7 @@ resume_mode=${resume_mode:-disable}
 NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} ppo-epochs-${ppo_epochs} ORZ72K-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} ppo-epochs-${ppo_epochs} DEEPMATH-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
