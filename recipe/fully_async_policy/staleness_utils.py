@@ -425,6 +425,61 @@ def compute_grad_info(batch: DataProto, scope: Literal["group", "minibatch"] = "
     return batch
 
     
+def compute_opob_weights(
+    local_traj_records: List[TrajRecord],
+    group_uid: int,
+    use_is_weights: bool = True,
+    use_clipped_is_ratios: bool = False,
+    normalize_by_length: bool = False,
+    scope: str = "group",
+) -> tuple[list[float], list[float]]:
+    """Per-trajectory (value, weight) pairs entering the OPOB baseline of one scope.
+
+    value_i is the raw reward (group scope) or the GRPO advantage (minibatch scope);
+        W_i = ||g_i||^2 * (ratio_i^2 if use_is_weights) * (1/L_i^2 if normalize_by_length)
+    with ratio_i the unclipped (default) or clipped sequence IS ratio.
+    """
+    weights: list[float] = []
+    values: list[float] = []
+    for rec in local_traj_records:
+        if scope != "minibatch" and rec.group_uid != group_uid:
+            continue
+        rwd = rec.advantage_scalar if scope == "minibatch" else rec.reward_scalar
+        seq_is_ratio = rec.rollout_seq_is_clipped if use_clipped_is_ratios else rec.rollout_seq_is
+        weight = float(rec.grad_norm_unscaled) ** 2
+        if use_is_weights:
+            weight *= float(seq_is_ratio) ** 2
+        if normalize_by_length:
+            weight = weight / (float(rec.response_length) ** 2)
+        weights.append(weight)
+        values.append(float(rwd))
+    return values, weights
+
+
+def summarize_opob_group(values, weights, baseline, zero_tol: float = 0.1, eps: float = 1e-8) -> dict:
+    """Scalar diagnostics of one closed OPOB scope (the ``actor/opob_records`` entries).
+
+    weight_conc = max W_i / sum W_i (1.0: the baseline is an argmax over a single
+    trajectory), dominant_reward = value of that max-weight trajectory, zeroed_frac =
+    share of trajectories whose effective advantage |value_i - b*| < zero_tol.
+    """
+    n = len(values)
+    baseline = float(baseline)
+    if n == 0:
+        return {"baseline": baseline, "weight_conc": 0.0, "dominant_reward": 0.0, "zeroed_frac": 0.0, "n": 0}
+    total = float(sum(weights))
+    idx = max(range(n), key=lambda i: float(weights[i]))
+    weight_conc = float(weights[idx]) / (total + eps) if total > 0 else 1.0 / n
+    zeroed = sum(1 for v in values if abs(float(v) - baseline) < zero_tol)
+    return {
+        "baseline": baseline,
+        "weight_conc": weight_conc,
+        "dominant_reward": float(values[idx]),
+        "zeroed_frac": zeroed / n,
+        "n": n,
+    }
+
+
 def compute_opob_baseline(
     local_traj_records: List[TrajRecord],
     group_uid: int,
@@ -441,38 +496,14 @@ def compute_opob_baseline(
     where
         W_i = ||g_i||^2 * (ratio_i^2) * (1/L_i^2 if enabled)
     """
-    weights = []
-    values = []
-
-    def _in_scope(rec: TrajRecord):
-        if scope == "minibatch":
-            return True
-        return rec.group_uid == group_uid
-    
-    with torch.no_grad():
-        for rec in local_traj_records:
-            if _in_scope(rec):
-                if scope == "minibatch":
-                    rwd = rec.advantage_scalar
-                else:
-                    rwd = rec.reward_scalar
-    
-                if use_clipped_is_ratios:
-                    seq_is_ratio = rec.rollout_seq_is_clipped
-                else:
-                    seq_is_ratio = rec.rollout_seq_is
-                
-                grad_norm = rec.grad_norm_unscaled
-                weight = grad_norm ** 2
-                if use_is_weights:
-                    weight *= seq_is_ratio ** 2
-
-                if normalize_by_length:
-                    length = rec.response_length
-                    weight = weight / (length ** 2)
-
-                weights.append(weight)
-                values.append(rwd)
+    values, weights = compute_opob_weights(
+        local_traj_records,
+        group_uid,
+        use_is_weights=use_is_weights,
+        use_clipped_is_ratios=use_clipped_is_ratios,
+        normalize_by_length=normalize_by_length,
+        scope=scope,
+    )
 
     if agg_mode == "mean":
         baseline = get_weighted_mean(values, weights, eps=eps)

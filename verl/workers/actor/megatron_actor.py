@@ -46,7 +46,9 @@ from recipe.fully_async_policy.staleness_utils import (
     compute_grad_info,
     compute_is_info,
     compute_opob_baseline,
+    compute_opob_weights,
     compute_staleness_statistics,
+    summarize_opob_group,
 )
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
@@ -875,8 +877,13 @@ class MegatronPPOActor(BasePPOActor):
         norm_by_std: bool = False,
         is_last_traj_in_scope: bool = False,
         grad_baselining: bool = False,
+        opob_records: list[dict] | None = None,
     ):
-        """Gradient buffer update."""
+        """Gradient buffer update.
+
+        ``opob_records`` (OPOB only): one ``summarize_opob_group`` dict is appended per closed
+        scope; the trainer reduces them into the ``opob/*`` scalars.
+        """
         if grad_baselining:
             assert score_gradient_buffers is not None
             scale_reward = reward_scalar
@@ -909,6 +916,17 @@ class MegatronPPOActor(BasePPOActor):
 
             move_grad_buffers(src=score_gradient_buffers, dest=accum_buffers, scale=-opob_baseline)
             zero_grad_accum_buffers(score_gradient_buffers)
+
+            if opob_records is not None:
+                values, weights = compute_opob_weights(
+                    local_traj_records,
+                    group_uid,
+                    use_is_weights=self.config.grad_baselining.use_is_weights,
+                    use_clipped_is_ratios=self.config.grad_baselining.use_clipped_is_ratios,
+                    normalize_by_length=self.config.grad_baselining.normalize_by_length,
+                    scope=self.config.grad_baselining.scope,
+                )
+                opob_records.append(summarize_opob_group(values, weights, opob_baseline))
 
     def _optimizer_step_with_buffer(
         self,
@@ -1055,6 +1073,7 @@ class MegatronPPOActor(BasePPOActor):
             orig_finalize_func = disable_grad_finalize(self.actor_module)
 
         local_traj_records = []
+        opob_records = [] if grad_baselining else None
         for minibatch_idx, minibatch in enumerate(dataloader):
             self.actor_optimizer.zero_grad()
             for chunk in self.actor_module:
@@ -1170,6 +1189,7 @@ class MegatronPPOActor(BasePPOActor):
                         norm_by_std=self.config.grad_baselining.norm_by_std,
                         is_last_traj_in_scope=last_traj_in_scope,
                         grad_baselining=grad_baselining,
+                        opob_records=opob_records,
                     )
 
                     self.actor_optimizer.zero_grad()
@@ -1202,6 +1222,8 @@ class MegatronPPOActor(BasePPOActor):
             append_to_dict(metrics, minibatch_metrics)
 
         metrics["actor/local_traj_records"] = [asdict(rec) for rec in local_traj_records]
+        if opob_records is not None:
+            metrics["actor/opob_records"] = opob_records
 
         if not grad_baselining:
             restore_grad_finalize(self.actor_module, orig_finalize_func)

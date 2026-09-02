@@ -327,6 +327,28 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
             payload[key] = wandb.Image(fig)
             plt.close(fig)
 
+    # 1c) actor/opob_records: list[dict], one per closed OPOB scope (prompt group
+    # by default). Reduced to the opob/* scalars: the baseline level, how
+    # argmax-like the w^2||g||^2 weighting is, whether the dominant trajectory
+    # is a positive (the runaway quadrant OPOB neutralizes) and how many
+    # trajectories end up with a ~zero effective advantage.
+    if "actor/opob_records" in structured_metrics:
+        opob_entries = [entry for entry in structured_metrics["actor/opob_records"] if isinstance(entry, dict)]
+        baselines = [float(e["baseline"]) for e in opob_entries if e.get("baseline") is not None]
+        if baselines:
+            payload["opob/baseline_mean"] = float(np.mean(baselines))
+            payload["opob/baseline_abs_mean"] = float(np.mean(np.abs(baselines)))
+            payload["opob/groups"] = len(baselines)
+        weight_conc = [float(e["weight_conc"]) for e in opob_entries if e.get("weight_conc") is not None]
+        if weight_conc:
+            payload["opob/weight_conc_mean"] = float(np.mean(weight_conc))
+        dominant = [float(e["dominant_reward"]) for e in opob_entries if e.get("dominant_reward") is not None]
+        if dominant:
+            payload["opob/dominant_pos_frac"] = float(np.mean([d > 0 for d in dominant]))
+        zeroed = [float(e["zeroed_frac"]) for e in opob_entries if e.get("zeroed_frac") is not None]
+        if zeroed:
+            payload["opob/zeroed_frac"] = float(np.mean(zeroed))
+
     # 2) actor/minibatch_grad_info: list[dict]
     # grad_info_entries = []
     # if "actor/minibatch_grad_info" in self.structured_metrics:

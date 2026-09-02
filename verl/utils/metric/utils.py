@@ -48,6 +48,7 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
         "staleness/ess",
         "actor/minibatch_grad_info",
         "actor/local_traj_records",
+        "actor/opob_records",
     }
 
     for key, val in metrics.items():

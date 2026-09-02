@@ -146,6 +146,7 @@ def _make_actor(grad_baselining: bool) -> tuple[MegatronPPOActor, dict]:
         "step_accum_buffers": [],
         "grad_norm_uids": [],
         "update_grad_buffer_advs": [],
+        "update_grad_buffer_records": [],
     }
 
     def fake_forward_backward_batch(data, **kwargs):
@@ -164,6 +165,9 @@ def _make_actor(grad_baselining: bool) -> tuple[MegatronPPOActor, dict]:
     def fake_update_grad_buffers(**kwargs):
         assert grad_baselining, "buffer update must never run in buffer-free mode"
         calls["update_grad_buffer_advs"].append(kwargs["adv_scalar"])
+        calls["update_grad_buffer_records"].append(kwargs["opob_records"])
+        if kwargs["is_last_traj_in_scope"]:
+            kwargs["opob_records"].append({"baseline": 0.5, "n": len(TRAJ_UIDS)})
 
     actor.forward_backward_batch = fake_forward_backward_batch
     actor._optimizer_step_with_buffer = fake_optimizer_step
@@ -245,8 +249,22 @@ class TestBufferFreeMode:
             assert rec["grad_norm"] is None
             assert rec["grad_norm_unscaled"] is None
 
+    def test_no_opob_records_metric(self, patched_env):
+        actor, _ = _make_actor(grad_baselining=False)
+        metrics = actor.update_policy_per_traj([_make_minibatch()], grad_baselining=False)
+        assert "actor/opob_records" not in metrics
+
 
 class TestOpobMode:
+    def test_opob_records_collected_across_the_minibatch(self, patched_env):
+        """One shared list is handed to every buffer update and returned as the
+        structured actor/opob_records metric (one entry per closed scope)."""
+        actor, calls = _make_actor(grad_baselining=True)
+        metrics = actor.update_policy_per_traj([_make_minibatch()], grad_baselining=True)
+        assert len(calls["update_grad_buffer_records"]) == len(TRAJ_UIDS)
+        assert all(r is calls["update_grad_buffer_records"][0] for r in calls["update_grad_buffer_records"])
+        assert metrics["actor/opob_records"] == [{"baseline": 0.5, "n": len(TRAJ_UIDS)}]
+
     def test_two_buffer_allocations(self, patched_env):
         actor, _ = _make_actor(grad_baselining=True)
         actor.update_policy_per_traj([_make_minibatch()], grad_baselining=True)
