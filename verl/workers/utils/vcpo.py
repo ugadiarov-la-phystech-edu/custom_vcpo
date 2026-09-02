@@ -55,7 +55,10 @@ def grad_buffers_norm(buffers: Sequence[torch.Tensor]) -> float:
     if not buffers:
         return 0.0
     with torch.no_grad():
-        norms = torch.stack([n.float() for n in torch._foreach_norm(buffers)])
+        # dtype=float32 forces fp32 accumulation: a bf16 reduction over ~1e10
+        # elements plateaus (ulp > increment) and returns a content-independent
+        # constant (observed ~1.16e3 for the Qwen3-8B TP=2 grad buffer).
+        norms = torch.stack([torch.linalg.vector_norm(b, dtype=torch.float32) for b in buffers])
         return float(torch.linalg.vector_norm(norms).item())
 
 

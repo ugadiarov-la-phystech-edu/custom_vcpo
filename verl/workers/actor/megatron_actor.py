@@ -881,6 +881,7 @@ class MegatronPPOActor(BasePPOActor):
         is_last_traj_in_scope: bool = False,
         grad_baselining: bool = False,
         opob_records: list[dict] | None = None,
+        traj_uid=None,
     ):
         """Gradient buffer update.
 
@@ -901,6 +902,26 @@ class MegatronPPOActor(BasePPOActor):
 
             accumulate_grad_buffers(self.actor_module, accum_buffers, scale=scale_reward)
             accumulate_grad_buffers(self.actor_module, score_gradient_buffers, scale=scale_baseline)
+
+            if _opob_debug_enabled():
+                # Per-trajectory trace: what just entered the buffers. ``scaled`` is the
+                # norm of the gradient as it sits in the main buffer (loss scale and the
+                # seq-mean-token-mean 1/L folded back in); typical values are O(0.1).
+                self._opob_dbg_count = getattr(self, "_opob_dbg_count", 0) + 1
+                rec = local_traj_records[traj_uid] if traj_uid is not None else None
+                if rec is not None:
+                    length = max(int(rec.response_length or 0), 1)
+                    unscaled = float(rec.grad_norm_unscaled or 0.0)
+                    scaled = unscaled * microbatch_loss_scale
+                    if self.config.loss_agg_mode == "seq-mean-token-mean":
+                        scaled /= length
+                    print(
+                        f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} traj={traj_uid} group={group_uid} "
+                        f"L={length} R={reward_scalar:.3f} seq_is={rec.rollout_seq_is} "
+                        f"|g_i| unscaled={unscaled:.4e} scaled={scaled:.4e} "
+                        f"scale_reward={scale_reward:.4f} scale_baseline={scale_baseline:.4f} "
+                        f"|main_grad|={grad_buffers_norm(list(_iter_grad_buffers(self.actor_module))):.4e}"
+                    )
         else:
             accumulate_grad_buffers(self.actor_module, accum_buffers, scale=adv_scalar)
 
@@ -927,8 +948,11 @@ class MegatronPPOActor(BasePPOActor):
             zero_grad_accum_buffers(score_gradient_buffers)
 
             if _opob_debug_enabled():
+                n_since_close = getattr(self, "_opob_dbg_count", 0)
+                self._opob_dbg_count = 0
                 print(
                     f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} group={group_uid} close: "
+                    f"n_traj_accumulated={n_since_close} "
                     f"b*={float(opob_baseline):.4f} last_scale_reward={scale_reward:.4f} "
                     f"last_scale_baseline={scale_baseline:.4f} reward_std={reward_std} "
                     f"|score|={score_norm:.4e} |accum| before={accum_before:.4e} "
@@ -1232,6 +1256,7 @@ class MegatronPPOActor(BasePPOActor):
                         is_last_traj_in_scope=last_traj_in_scope,
                         grad_baselining=grad_baselining,
                         opob_records=opob_records,
+                        traj_uid=traj_uid,
                     )
 
                     self.actor_optimizer.zero_grad()
