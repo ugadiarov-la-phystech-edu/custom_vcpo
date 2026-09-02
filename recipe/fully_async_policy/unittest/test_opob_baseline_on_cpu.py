@@ -236,6 +236,39 @@ class TestOpobDebugHelpers:
         assert grad_buffers_norm(bufs) == pytest.approx((4 + 16) ** 0.5)
         assert grad_buffers_norm([]) == 0.0
 
+    def test_chunked_add_matches_foreach(self, monkeypatch):
+        import torch
+
+        from verl.workers.utils import vcpo
+
+        monkeypatch.setattr(vcpo, "_ADD_CHUNK", 5)  # force several chunks per tensor
+        dest = [torch.arange(12, dtype=torch.float32), torch.ones(3)]
+        src = [torch.ones(12), torch.arange(3, dtype=torch.float32)]
+        ref = [d.clone() for d in dest]
+        torch._foreach_add_(ref, src, alpha=-1.5)
+        vcpo._add_lists_(dest, src, alpha=-1.5)
+        for d, r in zip(dest, ref, strict=True):
+            assert torch.equal(d, r)
+
+    def test_chunked_add_switch_is_used_by_accumulate_and_move(self, monkeypatch):
+        import torch
+        from types import SimpleNamespace
+
+        from verl.workers.utils import vcpo
+
+        monkeypatch.setenv("VCPO_OPOB_CHUNKED_ADD", "1")
+        called = []
+        monkeypatch.setattr(vcpo, "_add_lists_", lambda d, s, alpha: called.append(("add", alpha)))
+        monkeypatch.setattr(vcpo.torch, "_foreach_add_", lambda *a, **k: called.append(("foreach",)))
+        buf = SimpleNamespace(grad_data=torch.zeros(4))
+        module = SimpleNamespace(buffers=[buf])
+        vcpo.accumulate_grad_buffers([module], [torch.zeros(4)], scale=2.0)
+        vcpo.move_grad_buffers([torch.zeros(4)], [torch.zeros(4)], scale=-0.5)
+        assert called == [("add", 2.0), ("add", -0.5)]
+        monkeypatch.setenv("VCPO_OPOB_CHUNKED_ADD", "0")
+        vcpo.move_grad_buffers([torch.zeros(4)], [torch.zeros(4)], scale=1.0)
+        assert called[-1] == ("foreach",)
+
     def test_debug_flag_reads_env(self, monkeypatch):
         from verl.workers.utils.vcpo import _opob_debug_enabled
 

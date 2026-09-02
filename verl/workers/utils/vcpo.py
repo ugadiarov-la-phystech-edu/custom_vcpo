@@ -104,29 +104,58 @@ def find_param(modules: Iterable[torch.nn.Module], name_suffix: str):
     return None, None
 
 
-def param_slice_norm(modules: Iterable[torch.nn.Module], buffers: Sequence[torch.Tensor], param) -> float:
-    """Diagnostics: L2 norm of ``param``'s slice inside ``buffers`` (laid out like the grad buffers)."""
+def param_slice(modules: Iterable[torch.nn.Module], buffers: Sequence[torch.Tensor], param):
+    """Diagnostics: the view of ``param``'s slice inside ``buffers`` (laid out like the grad
+    buffers), or None when the offsets are unavailable."""
     buffers = list(buffers)
     idx = 0
+    for module in modules:
+        mod_buffers = []
+        if hasattr(module, "buffers"):
+            mod_buffers.extend(module.buffers)
+        if hasattr(module, "expert_parallel_buffers"):
+            mod_buffers.extend(module.expert_parallel_buffers)
+        if not mod_buffers and hasattr(module, "param_and_grad_buffer"):
+            mod_buffers.append(module.param_and_grad_buffer)
+        for buffer in mod_buffers:
+            if idx >= len(buffers):
+                return None
+            data = buffers[idx]
+            idx += 1
+            index_map = getattr(buffer, "param_index_map", None)
+            if index_map and param in index_map:
+                start, end = int(index_map[param][0]), int(index_map[param][1])
+                return data[start:end]
+    return None
+
+
+def param_slice_norm(modules: Iterable[torch.nn.Module], buffers: Sequence[torch.Tensor], param) -> float:
+    """Diagnostics: L2 norm of ``param``'s slice inside ``buffers`` (laid out like the grad buffers)."""
+    sl = param_slice(modules, buffers, param)
+    if sl is None:
+        return float("nan")
     with torch.no_grad():
-        for module in modules:
-            mod_buffers = []
-            if hasattr(module, "buffers"):
-                mod_buffers.extend(module.buffers)
-            if hasattr(module, "expert_parallel_buffers"):
-                mod_buffers.extend(module.expert_parallel_buffers)
-            if not mod_buffers and hasattr(module, "param_and_grad_buffer"):
-                mod_buffers.append(module.param_and_grad_buffer)
-            for buffer in mod_buffers:
-                if idx >= len(buffers):
-                    return float("nan")
-                data = buffers[idx]
-                idx += 1
-                index_map = getattr(buffer, "param_index_map", None)
-                if index_map and param in index_map:
-                    start, end = int(index_map[param][0]), int(index_map[param][1])
-                    return float(torch.linalg.vector_norm(data[start:end], dtype=torch.float32))
-    return float("nan")
+        return float(torch.linalg.vector_norm(sl, dtype=torch.float32))
+
+
+def slice_update_report(before, after, expected_delta, suspect) -> str:
+    """Diagnostics: decompose ``after - before`` of a buffer slice against the intended
+    update ``expected_delta`` and a ``suspect`` tensor (e.g. the other accumulator's slice).
+    Returns norms of the residual and cosines, all in fp32."""
+    with torch.no_grad():
+        delta = after.float() - before.float()
+        resid = delta - expected_delta.float()
+        s = suspect.float()
+
+        def cos(a, b):
+            na, nb = a.norm(), b.norm()
+            return float((a * b).sum() / (na * nb + 1e-12))
+
+        return (
+            f"|delta|={float(delta.norm()):.4e} |expected|={float(expected_delta.float().norm()):.4e} "
+            f"|delta-expected|={float(resid.norm()):.4e} cos(resid,suspect)={cos(resid, s):.4f} "
+            f"|resid|/|suspect|={float(resid.norm() / (s.norm() + 1e-12)):.4f}"
+        )
 
 
 def param_grad_state(param) -> str:
@@ -203,6 +232,27 @@ def zero_grad_accum_buffers(accum_buffers: Sequence[torch.Tensor]) -> None:
         for buffer in accum_buffers:
             buffer.zero_()
 
+_ADD_CHUNK = 2**28  # elements per chunked add_ (512 MiB of bf16)
+
+
+def _chunked_add_enabled() -> bool:
+    """VCPO_OPOB_CHUNKED_ADD=1: replace torch._foreach_add_ on the grad-sized buffers by
+    per-tensor, chunked ``add_`` (experiment: the OPOB score accumulator was seen receiving
+    +-alpha*accum instead of alpha*main_grad in the output_layer slice at 4.1e9 elements)."""
+    import os
+
+    return os.environ.get("VCPO_OPOB_CHUNKED_ADD", "0") not in ("", "0", "false", "False")
+
+
+def _add_lists_(dest: Sequence[torch.Tensor], src: Sequence[torch.Tensor], alpha: float) -> None:
+    """dest[i] += alpha * src[i], chunked so no single kernel spans > 2^28 elements."""
+    with torch.no_grad():
+        for d, s in zip(dest, src, strict=True):
+            d_flat, s_flat = d.view(-1), s.view(-1)
+            for start in range(0, d_flat.numel(), _ADD_CHUNK):
+                d_flat[start : start + _ADD_CHUNK].add_(s_flat[start : start + _ADD_CHUNK], alpha=alpha)
+
+
 def accumulate_grad_buffers(
     modules: Iterable[torch.nn.Module],
     accum_buffers: Sequence[torch.Tensor],
@@ -212,6 +262,10 @@ def accumulate_grad_buffers(
     Move accum_buffers into grad buffers of modules
     """
     grad_buffers = list(_iter_grad_buffers(modules))
+    assert len(grad_buffers) == len(accum_buffers), (len(grad_buffers), len(accum_buffers))
+    if _chunked_add_enabled():
+        _add_lists_(accum_buffers, grad_buffers, float(scale))
+        return
     with torch.no_grad():
         try:
             torch._foreach_add_(accum_buffers, grad_buffers, alpha=scale)
@@ -242,6 +296,9 @@ def move_grad_buffers(
     """
     Move into src into dest grad buffer
     """
+    if _chunked_add_enabled():
+        _add_lists_(dest, src, float(scale))
+        return
     with torch.no_grad():
         try:
             torch._foreach_add_(dest, src, alpha=scale)

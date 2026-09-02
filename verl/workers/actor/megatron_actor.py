@@ -77,8 +77,10 @@ from verl.workers.utils.vcpo import (
     grad_buffers_norm,
     move_grad_buffers,
     param_grad_state,
+    param_slice,
     param_slice_norm,
     restore_dp_sync,
+    slice_update_report,
     top_param_slices,
     restore_grad_finalize,
     zero_grad_accum_buffers,
@@ -904,8 +906,40 @@ class MegatronPPOActor(BasePPOActor):
                 scale_reward = adv_scalar
                 scale_baseline = 1
 
+            dbg_param = getattr(self, "_opob_dbg_param", None) if _opob_debug_enabled() else None
+            if dbg_param is not None:
+                # Decompose what the two accumulates actually add to the watched
+                # parameter's slice: intended = scale * main_grad slice; suspect = the
+                # other accumulator's slice (the content seen leaking in).
+                main_bufs = list(_iter_grad_buffers(self.actor_module))
+                w_main = param_slice(self.actor_module, main_bufs, dbg_param)
+                w_acc = param_slice(self.actor_module, accum_buffers, dbg_param)
+                w_sc = param_slice(self.actor_module, score_gradient_buffers, dbg_param)
+                w_main_before = w_main.clone()
+                w_acc_before = w_acc.clone()
+                w_sc_before = w_sc.clone()
+
             accumulate_grad_buffers(self.actor_module, accum_buffers, scale=scale_reward)
+
+            if dbg_param is not None:
+                w_acc_mid = w_acc.clone()
+                w_main_mid = w_main.clone()
+
             accumulate_grad_buffers(self.actor_module, score_gradient_buffers, scale=scale_baseline)
+
+            if dbg_param is not None:
+                rank = torch.distributed.get_rank()
+                print(
+                    f"[vcpo][opob-debug] rank={rank} traj={traj_uid} decompose accum-add: "
+                    f"{slice_update_report(w_acc_before, w_acc_mid, w_main_before * scale_reward, w_sc_before)} "
+                    f"| main changed by accum-add: {float((w_main_mid.float() - w_main_before.float()).norm()):.3e}"
+                )
+                print(
+                    f"[vcpo][opob-debug] rank={rank} traj={traj_uid} decompose score-add: "
+                    f"{slice_update_report(w_sc_before, w_sc, w_main_mid * scale_baseline, w_acc_mid)} "
+                    f"| main changed by score-add: {float((w_main.float() - w_main_mid.float()).norm()):.3e}"
+                )
+                del w_main_before, w_acc_before, w_sc_before, w_acc_mid, w_main_mid
 
             if _opob_debug_enabled():
                 # Per-trajectory trace: what just entered the buffers. ``scaled`` is the
