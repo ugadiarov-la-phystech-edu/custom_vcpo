@@ -213,6 +213,39 @@ class TestSummarizeOpobGroup:
         s = summarize_opob_group([1.0], [1.0], baseline=torch.tensor(1.0))
         assert isinstance(s["baseline"], float) and s["baseline"] == 1.0
 
+    def test_grad_norm_stats_reported_when_given(self):
+        s = summarize_opob_group([1.0, -1.0, -1.0], [1.0] * 3, baseline=0.0, grad_norms=[0.5, 4.0, None])
+        assert s["traj_grad_norm_max"] == 4.0
+        assert s["traj_grad_norm_mean"] == pytest.approx(2.25)  # None entries skipped
+        s = summarize_opob_group([1.0], [1.0], baseline=0.0)
+        assert "traj_grad_norm_max" not in s and "traj_grad_norm_mean" not in s
+        s = summarize_opob_group([], [], baseline=0.0, grad_norms=[3.0])
+        assert s["n"] == 0 and s["traj_grad_norm_max"] == 3.0
+
+
+# ------------------------------------------------------------------ debug helpers
+
+
+class TestOpobDebugHelpers:
+    def test_grad_buffers_norm_combines_per_buffer_norms(self):
+        import torch
+
+        from verl.workers.utils.vcpo import grad_buffers_norm
+
+        bufs = [torch.ones(4, dtype=torch.bfloat16), torch.full((4,), 2.0, dtype=torch.bfloat16)]
+        assert grad_buffers_norm(bufs) == pytest.approx((4 + 16) ** 0.5)
+        assert grad_buffers_norm([]) == 0.0
+
+    def test_debug_flag_reads_env(self, monkeypatch):
+        from verl.workers.utils.vcpo import _opob_debug_enabled
+
+        monkeypatch.delenv("VCPO_OPOB_DEBUG", raising=False)
+        assert not _opob_debug_enabled()
+        monkeypatch.setenv("VCPO_OPOB_DEBUG", "0")
+        assert not _opob_debug_enabled()
+        monkeypatch.setenv("VCPO_OPOB_DEBUG", "1")
+        assert _opob_debug_enabled()
+
 
 # ------------------------------------------------------------------ actor._update_grad_buffers
 
@@ -318,7 +351,16 @@ class TestUpdateGradBuffersOpob:
         _run_group(actor, calls, accum, score, nbs, records, reward_std=0.5, opob_records=opob_records)
         assert len(opob_records) == 1
         rec = opob_records[0]
-        assert set(rec) == {"baseline", "weight_conc", "dominant_reward", "zeroed_frac", "n"}
+        assert set(rec) == {
+            "baseline",
+            "weight_conc",
+            "dominant_reward",
+            "zeroed_frac",
+            "n",
+            "traj_grad_norm_max",
+            "traj_grad_norm_mean",
+        }
+        assert rec["traj_grad_norm_max"] == 1.0 and rec["traj_grad_norm_mean"] == 1.0  # all records: norm 1.0
         assert rec["baseline"] == pytest.approx(1.0, abs=1e-9)
         assert rec["weight_conc"] == pytest.approx(1.0, abs=1e-9)
         assert rec["dominant_reward"] == 1.0
@@ -393,6 +435,17 @@ class TestOpobMetricsPlumbing:
         )
         assert "opob/baseline_mean" not in payload
         assert payload["opob/weight_conc_mean"] == 0.5
+
+    def test_process_structured_metrics_reduces_traj_grad_norms(self):
+        entries = [
+            {"baseline": 0.0, "traj_grad_norm_max": 2.0, "traj_grad_norm_mean": 1.0},
+            {"baseline": 0.0, "traj_grad_norm_max": 8.0, "traj_grad_norm_mean": 3.0},
+            {"baseline": 0.0},  # a group without norms is skipped for the norm scalars
+        ]
+        payload = process_structured_metrics({"actor/opob_records": entries}, allow_media=False)
+        assert payload["opob/traj_grad_norm_max"] == 8.0  # max over groups
+        assert payload["opob/traj_grad_norm_mean"] == pytest.approx(2.0)  # mean of group means
+        assert payload["opob/groups"] == 3
 
     def test_process_structured_metrics_without_opob_key_emits_nothing(self):
         payload = process_structured_metrics({"staleness/ess": []}, allow_media=False)

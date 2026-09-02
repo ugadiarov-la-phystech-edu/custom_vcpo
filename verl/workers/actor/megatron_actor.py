@@ -65,12 +65,15 @@ from verl.workers.actor import BasePPOActor
 from verl.workers.actor.entropy_utils import log_entropy_and_apply_to_loss, should_calculate_entropy
 from verl.workers.utils.vcpo import (
     _get_local_model_grads_for_norm,
+    _iter_grad_buffers,
+    _opob_debug_enabled,
     accumulate_grad_buffers,
     allocate_grad_accum_buffers,
     copy_accum_buffers_to_grad_buffers,
     disable_dp_sync,
     disable_grad_finalize,
     finalize_model_grads_ignore_dp,
+    grad_buffers_norm,
     move_grad_buffers,
     restore_dp_sync,
     restore_grad_finalize,
@@ -914,8 +917,24 @@ class MegatronPPOActor(BasePPOActor):
                 scope=self.config.grad_baselining.scope,
             )
 
+            if _opob_debug_enabled():
+                # VCPO_OPOB_DEBUG=1: trace the buffer arithmetic of every scope close
+                # (norms are cheap: per-buffer foreach norms, no fp32 copies).
+                accum_before = grad_buffers_norm(accum_buffers)
+                score_norm = grad_buffers_norm(score_gradient_buffers)
+
             move_grad_buffers(src=score_gradient_buffers, dest=accum_buffers, scale=-opob_baseline)
             zero_grad_accum_buffers(score_gradient_buffers)
+
+            if _opob_debug_enabled():
+                print(
+                    f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} group={group_uid} close: "
+                    f"b*={float(opob_baseline):.4f} last_scale_reward={scale_reward:.4f} "
+                    f"last_scale_baseline={scale_baseline:.4f} reward_std={reward_std} "
+                    f"|score|={score_norm:.4e} |accum| before={accum_before:.4e} "
+                    f"after={grad_buffers_norm(accum_buffers):.4e} "
+                    f"|main_grad|={grad_buffers_norm(list(_iter_grad_buffers(self.actor_module))):.4e}"
+                )
 
             if opob_records is not None:
                 values, weights = compute_opob_weights(
@@ -926,7 +945,13 @@ class MegatronPPOActor(BasePPOActor):
                     normalize_by_length=self.config.grad_baselining.normalize_by_length,
                     scope=self.config.grad_baselining.scope,
                 )
-                opob_records.append(summarize_opob_group(values, weights, opob_baseline))
+                in_scope = self.config.grad_baselining.scope == "minibatch"
+                grad_norms = [
+                    rec.grad_norm_unscaled
+                    for rec in local_traj_records
+                    if in_scope or rec.group_uid == group_uid
+                ]
+                opob_records.append(summarize_opob_group(values, weights, opob_baseline, grad_norms=grad_norms))
 
     def _optimizer_step_with_buffer(
         self,
@@ -951,6 +976,12 @@ class MegatronPPOActor(BasePPOActor):
 
         # ================ Optimizer Step ================
         if accum_buffers is not None:
+            if _opob_debug_enabled():
+                main_norm = grad_buffers_norm(list(_iter_grad_buffers(self.actor_module)))
+                print(
+                    f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} step: "
+                    f"|accum|={grad_buffers_norm(accum_buffers):.4e} |main_grad| before copy={main_norm:.4e}"
+                )
             copy_accum_buffers_to_grad_buffers(self.actor_module, accum_buffers)
         else:
             # Buffer-free path (no OPOB): gradients accumulated directly in the
@@ -977,6 +1008,17 @@ class MegatronPPOActor(BasePPOActor):
                 else:
                     # finish_grad_sync will call start_grad_sync internally for non-overlap
                     chunk.finish_grad_sync()
+
+        if accum_buffers is not None and _opob_debug_enabled():
+            local_shard_norm = get_grad_norm_fp32(
+                _get_local_model_grads_for_norm(self.actor_module),
+                grad_stats_parallel_group=mpu.get_tensor_model_parallel_group(),
+            )
+            print(
+                f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} step: after grad sync "
+                f"|main_grad|={grad_buffers_norm(list(_iter_grad_buffers(self.actor_module))):.4e} "
+                f"local_model_grads_norm(TP-reduced)={local_shard_norm:.4e}"
+            )
 
         base_lrs = self.get_lr()
         ess_base = resolve_ess_base(self.config.ess_scaling.get("base_ess_ratio", None), ess_base_override)

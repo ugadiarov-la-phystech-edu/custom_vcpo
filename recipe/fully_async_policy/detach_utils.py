@@ -348,6 +348,19 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
         zeroed = [float(e["zeroed_frac"]) for e in opob_entries if e.get("zeroed_frac") is not None]
         if zeroed:
             payload["opob/zeroed_frac"] = float(np.mean(zeroed))
+        # Per-trajectory unscaled gradient norms (||g_i||, loss-scale removed): the
+        # max over all groups and the mean of the per-group means. An exploding
+        # single trajectory shows up in the max long before it reaches actor/grad_norm.
+        norm_max = [
+            float(e["traj_grad_norm_max"]) for e in opob_entries if e.get("traj_grad_norm_max") is not None
+        ]
+        if norm_max:
+            payload["opob/traj_grad_norm_max"] = float(np.max(norm_max))
+        norm_mean = [
+            float(e["traj_grad_norm_mean"]) for e in opob_entries if e.get("traj_grad_norm_mean") is not None
+        ]
+        if norm_mean:
+            payload["opob/traj_grad_norm_mean"] = float(np.mean(norm_mean))
 
     # 2) actor/minibatch_grad_info: list[dict]
     # grad_info_entries = []

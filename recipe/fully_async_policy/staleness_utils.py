@@ -456,28 +456,38 @@ def compute_opob_weights(
     return values, weights
 
 
-def summarize_opob_group(values, weights, baseline, zero_tol: float = 0.1, eps: float = 1e-8) -> dict:
+def summarize_opob_group(
+    values, weights, baseline, zero_tol: float = 0.1, eps: float = 1e-8, grad_norms=None
+) -> dict:
     """Scalar diagnostics of one closed OPOB scope (the ``actor/opob_records`` entries).
 
     weight_conc = max W_i / sum W_i (1.0: the baseline is an argmax over a single
     trajectory), dominant_reward = value of that max-weight trajectory, zeroed_frac =
     share of trajectories whose effective advantage |value_i - b*| < zero_tol.
+    ``grad_norms`` (optional): the scope's per-trajectory unscaled gradient norms;
+    their max/mean are reported so an exploding trajectory gradient is visible.
     """
     n = len(values)
     baseline = float(baseline)
     if n == 0:
-        return {"baseline": baseline, "weight_conc": 0.0, "dominant_reward": 0.0, "zeroed_frac": 0.0, "n": 0}
-    total = float(sum(weights))
-    idx = max(range(n), key=lambda i: float(weights[i]))
-    weight_conc = float(weights[idx]) / (total + eps) if total > 0 else 1.0 / n
-    zeroed = sum(1 for v in values if abs(float(v) - baseline) < zero_tol)
-    return {
-        "baseline": baseline,
-        "weight_conc": weight_conc,
-        "dominant_reward": float(values[idx]),
-        "zeroed_frac": zeroed / n,
-        "n": n,
-    }
+        summary = {"baseline": baseline, "weight_conc": 0.0, "dominant_reward": 0.0, "zeroed_frac": 0.0, "n": 0}
+    else:
+        total = float(sum(weights))
+        idx = max(range(n), key=lambda i: float(weights[i]))
+        weight_conc = float(weights[idx]) / (total + eps) if total > 0 else 1.0 / n
+        zeroed = sum(1 for v in values if abs(float(v) - baseline) < zero_tol)
+        summary = {
+            "baseline": baseline,
+            "weight_conc": weight_conc,
+            "dominant_reward": float(values[idx]),
+            "zeroed_frac": zeroed / n,
+            "n": n,
+        }
+    norms = [float(g) for g in (grad_norms or []) if g is not None]
+    if norms:
+        summary["traj_grad_norm_max"] = max(norms)
+        summary["traj_grad_norm_mean"] = sum(norms) / len(norms)
+    return summary
 
 
 def compute_opob_baseline(

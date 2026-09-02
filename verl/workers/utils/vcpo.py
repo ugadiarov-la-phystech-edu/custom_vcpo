@@ -40,6 +40,25 @@ def _iter_grad_buffers(modules: Iterable[torch.nn.Module]) -> Iterable[torch.Ten
         for buffer in buffers:
             yield buffer.grad_data
 
+
+def _opob_debug_enabled() -> bool:
+    """VCPO_OPOB_DEBUG=1 turns on per-scope-close / per-step buffer-norm tracing in the OPOB path."""
+    import os
+
+    return os.environ.get("VCPO_OPOB_DEBUG", "0") not in ("", "0", "false", "False")
+
+
+def grad_buffers_norm(buffers: Sequence[torch.Tensor]) -> float:
+    """L2 norm over a list of grad-sized buffers without materializing fp32 copies
+    (per-tensor foreach norms combined in fp32). Diagnostics only."""
+    buffers = list(buffers)
+    if not buffers:
+        return 0.0
+    with torch.no_grad():
+        norms = torch.stack([n.float() for n in torch._foreach_norm(buffers)])
+        return float(torch.linalg.vector_norm(norms).item())
+
+
 def allocate_grad_accum_buffers(
     modules: Iterable[torch.nn.Module],
 ) -> list[torch.Tensor]:
