@@ -275,3 +275,16 @@ grad_baselining:
 
   # Whether to normalize reward signal by reward std
   norm_by_std: false
+
+  # Where the two OPOB accumulators (reward-weighted G_R and score G_S, each grad-buffer sized)
+  # live: "cuda" (single-backward Algorithm 1, two extra grad-sized GPU buffers) or "cpu"
+  # (pinned host memory: each trajectory's gradient is copied to the host once and accumulated
+  # there; the result is copied back at the optimizer step; no extra GPU memory)
+  accum_device: cuda
+
+  # Accumulator dtype: "auto" = same as the grad buffer, or "float32" (recommended with
+  # accum_device=cpu: fp32 accumulation over the whole mini-batch)
+  accum_dtype: auto
+
+  # CPU threads for the host-side accumulation when accum_device=cpu
+  accum_cpu_threads: 16

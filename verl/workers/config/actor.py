@@ -86,6 +86,17 @@ class GradBaselineConfig(BaseConfig):
     use_clipped_is_ratios: bool = False
     normalize_by_length: bool = False
     norm_by_std: bool = False
+    # Where the two OPOB accumulators (G_R, G_S; each the size of the model's grad buffer)
+    # live: "cuda" (paper's single-backward Algorithm 1, 2 extra grad-sized GPU buffers) or
+    # "cpu" (pinned host memory; every trajectory's gradient is copied d2h once and added on
+    # the CPU, the final accumulator is copied back at the step; no extra GPU memory).
+    accum_device: str = "cuda"
+    # Accumulator dtype: "auto" = the grad buffer's dtype (bf16 with grad_reduce_in_fp32=False),
+    # or "float32" (recommended with accum_device=cpu: fp32 accumulation over the mini-batch).
+    accum_dtype: str = "auto"
+    # torch CPU threads used for the host-side adds when accum_device=cpu (Ray workers default
+    # to OMP_NUM_THREADS=1, which would make the 7.6e9-element adds single-threaded).
+    accum_cpu_threads: int = 16
 
 
 @dataclass
