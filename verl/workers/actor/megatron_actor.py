@@ -901,10 +901,13 @@ class MegatronPPOActor(BasePPOActor):
         staging_buffers = None
         if accum_device == "cpu":
             staging_buffers = allocate_staging_buffers(self.actor_module)
-            # Ray workers start with OMP_NUM_THREADS=1: the host-side adds over ~1e10
-            # elements per trajectory would be single-threaded.
+            # Pin torch's intra-op pool for the host-side adds (~1e10 elements per
+            # trajectory). Left alone, a Ray worker either has OMP_NUM_THREADS=1
+            # (single-threaded adds) or torch's default of one thread per core
+            # (measured 112 on the 2-socket H100 node), and with several trainer
+            # ranks the latter oversubscribes the job's CPU quota; set it exactly.
             threads = int(getattr(gb_cfg, "accum_cpu_threads", 0) or 0)
-            if threads > 0 and torch.get_num_threads() < threads:
+            if threads > 0 and torch.get_num_threads() != threads:
                 torch.set_num_threads(threads)
         return accum_buffers, score_gradient_buffers, staging_buffers
 

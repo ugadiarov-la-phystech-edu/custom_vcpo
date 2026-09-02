@@ -157,6 +157,52 @@ class TestAccumulateMulti:
             vcpo.accumulate_grad_buffers_multi([m], [([torch.zeros(2), torch.zeros(2)], 1.0)])
 
 
+class TestAddIntoMulti:
+    def test_shared_conversion_matches_reference(self, monkeypatch):
+        monkeypatch.setattr(vcpo, "_COPY_CHUNK", 3)  # several chunks, last one partial
+        monkeypatch.setattr(vcpo, "_SCRATCH", {})
+        src = torch.tensor([1.0, -2.0, 0.5, 4.0, 3.0, -1.0, 2.0], dtype=torch.bfloat16)
+        a = torch.arange(7, dtype=torch.float32)
+        b = torch.ones(7, dtype=torch.float32)
+        same = torch.zeros(7, dtype=torch.bfloat16)  # same dtype as src: plain add_
+        vcpo._add_into_multi_([(a, 2.0), (b, -1.0), (same, 1.0)], src)
+        assert torch.equal(a, torch.arange(7, dtype=torch.float32) + 2.0 * src.float())
+        assert torch.equal(b, 1.0 - src.float())
+        assert torch.equal(same, src)
+        # one scratch of chunk size was allocated and is reused
+        assert len(vcpo._SCRATCH) == 1 and next(iter(vcpo._SCRATCH.values())).numel() == 3
+        vcpo._add_into_multi_([(a, 1.0)], src)
+        assert len(vcpo._SCRATCH) == 1
+
+    def test_scratch_grows_when_a_larger_chunk_is_needed(self, monkeypatch):
+        monkeypatch.setattr(vcpo, "_SCRATCH", {})
+        s = vcpo._conversion_scratch(torch.float32, torch.device("cpu"), 4)
+        assert s.numel() == 4
+        s2 = vcpo._conversion_scratch(torch.float32, torch.device("cpu"), 8)
+        assert s2.numel() == 8
+        s3 = vcpo._conversion_scratch(torch.float32, torch.device("cpu"), 2)
+        assert s3.numel() == 2 and len(vcpo._SCRATCH) == 1
+
+    def test_multi_targets_share_one_source_pass(self, monkeypatch):
+        """accumulate_grad_buffers_multi converts each grad chunk once for all CPU targets."""
+        monkeypatch.setattr(vcpo, "_COPY_CHUNK", 2)
+        monkeypatch.setattr(vcpo, "_SCRATCH", {})
+        copies = []
+        real_copy = torch.Tensor.copy_
+
+        def counting_copy(self, other, *a, **k):
+            copies.append(self.numel())
+            return real_copy(self, other, *a, **k)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", counting_copy)
+        g = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+        m = _module(g)
+        acc, score = torch.zeros(3), torch.zeros(3)
+        vcpo.accumulate_grad_buffers_multi([m], [([acc], 1.0), ([score], 0.5)])
+        assert torch.equal(acc, g.float()) and torch.equal(score, 0.5 * g.float())
+        assert copies == [2, 1]  # two chunks converted once each, not once per target
+
+
 class TestMoveAndCopyBack:
     def test_move_on_host_with_dtype_conversion(self):
         src = [torch.tensor([1.0, 2.0], dtype=torch.bfloat16)]
@@ -240,15 +286,21 @@ class TestActorAllocation:
         assert calls == [{"device": "cpu", "dtype": "float32"}] * 2
         assert staging == ["stage"] and threads == [8]
 
-    def test_cpu_path_does_not_lower_thread_count(self, monkeypatch):
+    def test_cpu_path_pins_the_thread_pool_exactly(self, monkeypatch):
+        """torch defaults to one thread per core (112 on the H100 node): several ranks would
+        oversubscribe the CPU quota, so the configured count is applied even when lower."""
         threads = []
         monkeypatch.setattr(megatron_actor, "allocate_grad_accum_buffers", lambda modules, **kw: ["b"])
         monkeypatch.setattr(megatron_actor, "allocate_staging_buffers", lambda modules: ["stage"])
-        monkeypatch.setattr(torch, "get_num_threads", lambda: 32)
+        monkeypatch.setattr(torch, "get_num_threads", lambda: 112)
         monkeypatch.setattr(torch, "set_num_threads", lambda n: threads.append(n))
         actor = _actor(SimpleNamespace(scope="group", accum_device="cpu", accum_dtype="auto", accum_cpu_threads=8))
         actor._allocate_opob_buffers()
-        assert threads == []
+        assert threads == [8]
+        # already at the configured count -> no call
+        monkeypatch.setattr(torch, "get_num_threads", lambda: 8)
+        actor._allocate_opob_buffers()
+        assert threads == [8]
 
     def test_cuda_with_explicit_dtype_passes_kwargs(self, monkeypatch):
         calls = []
