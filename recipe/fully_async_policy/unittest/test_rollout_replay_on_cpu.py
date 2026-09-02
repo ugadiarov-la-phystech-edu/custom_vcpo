@@ -66,13 +66,32 @@ def make_rows(n_rows, uid_prefix="g", scores=None, advantages=None, base_token=0
     return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors)
 
 
+_BATCH_COUNTER = [0]
+
+
 def make_batch(groups, meta=None):
-    """groups: list of (uid, [scores...], [advantages...])."""
+    """groups: list of (uid, [scores...], [advantages...]).
+
+    Every batch carries the meta_info a real pull has -- a batch-shaped
+    ``global_token_num`` plus per-pull stats that differ from pull to pull --
+    because DataProto.concat asserts equality of shared meta keys: the first
+    live run died at the first replay draw (update 20) exactly on
+    ``global_token_num`` conflicting across birth steps.
+    """
+    _BATCH_COUNTER[0] += 1
     parts = []
     for i, (uid, scores, advs) in enumerate(groups):
         parts.append(make_rows(len(scores), uid_prefix=uid, scores=scores, advantages=advs, base_token=1000 * i))
     batch = DataProto.concat(parts)
-    batch.meta_info.update(meta or {"temperature": 1.0})
+    batch.meta_info.update(
+        {
+            "temperature": 1.0,
+            "global_token_num": torch.sum(batch.batch["attention_mask"], dim=-1).tolist(),
+            "fully_async/processing_time/avg": 100.0 + _BATCH_COUNTER[0],
+            "rollout_param_versions": [_BATCH_COUNTER[0]] * len(groups),
+        }
+    )
+    batch.meta_info.update(meta or {})
     return batch
 
 
@@ -406,6 +425,34 @@ class TestComposeTrainingBatch:
         out = trainer._compose_training_batch(make_batch([mixed_group("c"), mixed_group("d")]), metrics)
         assert metrics["replay/draw_size"] == 4
         assert len(out) == 12
+
+    def test_replay_draw_spanning_birth_steps_with_conflicting_meta(self):
+        """Regression for the update-20 crash of the first live run: rows born
+        in different pulls carry different global_token_num / per-pull stats,
+        and a draw that spans two blocks must not trip DataProto.concat's
+        meta_info-equality assertion. The composed batch carries the CURRENT
+        pull's meta with a global_token_num re-derived for its own rows."""
+        trainer = make_trainer(dp_size=2)
+        trainer._compose_training_batch(make_batch([mixed_group("a"), mixed_group("b")]), {})
+        trainer._compose_training_batch(make_batch([mixed_group("c"), mixed_group("d")]), {})
+        third = make_batch([mixed_group("e"), mixed_group("f")])
+        metrics = {}
+        out = trainer._compose_training_batch(third, metrics)
+        # 8 fresh + draw 4 from a 16-row buffer spanning two birth blocks.
+        assert metrics["replay/draw_size"] == 4
+        assert len(out) == 12
+        assert len(out.meta_info["global_token_num"]) == 12
+        assert out.meta_info["fully_async/processing_time/avg"] == third.meta_info["fully_async/processing_time/avg"]
+        assert out.meta_info["temperature"] == 1.0
+
+    def test_buffer_rows_do_not_carry_birth_meta(self):
+        buf = AdvantagePrioritizedReplayBuffer(seed=1)
+        for step in range(2):
+            b = make_batch([mixed_group(f"g{step}")])
+            buf.add(b, np.ones(len(b)), birth_version=step)
+        drawn, _ = buf.sample(8, current_version=2)  # whole buffer, both blocks
+        assert len(drawn) == 8
+        assert drawn.meta_info == {}
 
     def test_age_eviction_runs_before_the_draw(self):
         trainer = make_trainer(dp_size=2, version=0)

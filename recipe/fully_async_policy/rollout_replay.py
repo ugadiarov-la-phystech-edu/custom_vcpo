@@ -190,6 +190,13 @@ class AdvantagePrioritizedReplayBuffer:
         if len(rows) == 0:
             return
         assert (priorities > 0.0).all(), "PER priorities must be positive (use |A_i| + eps)"
+        # Store the rows WITHOUT their birth batch's meta_info: it carries
+        # batch-shaped and per-pull values (global_token_num, fully_async/*
+        # stats, timings) that DataProto.concat asserts equal across parts, so
+        # a draw spanning two birth steps -- or the fresh+replay composition --
+        # would fail on the first conflict. The trainer re-stamps the composed
+        # batch's meta from the current pull.
+        rows = DataProto(batch=rows.batch, non_tensor_batch=rows.non_tensor_batch, meta_info={})
         self._blocks.append({"data": rows, "birth": int(birth_version), "priorities": priorities})
         self._size += len(rows)
         self._enforce_capacity()
