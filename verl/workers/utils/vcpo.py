@@ -95,6 +95,58 @@ def top_param_slices(modules: Iterable[torch.nn.Module], buffers: Sequence[torch
     return out[:k]
 
 
+def find_param(modules: Iterable[torch.nn.Module], name_suffix: str):
+    """Diagnostics: (name, param) of the first parameter whose name ends with ``name_suffix``."""
+    for module in modules:
+        for name, param in module.named_parameters():
+            if name.endswith(name_suffix):
+                return name, param
+    return None, None
+
+
+def param_slice_norm(modules: Iterable[torch.nn.Module], buffers: Sequence[torch.Tensor], param) -> float:
+    """Diagnostics: L2 norm of ``param``'s slice inside ``buffers`` (laid out like the grad buffers)."""
+    buffers = list(buffers)
+    idx = 0
+    with torch.no_grad():
+        for module in modules:
+            mod_buffers = []
+            if hasattr(module, "buffers"):
+                mod_buffers.extend(module.buffers)
+            if hasattr(module, "expert_parallel_buffers"):
+                mod_buffers.extend(module.expert_parallel_buffers)
+            if not mod_buffers and hasattr(module, "param_and_grad_buffer"):
+                mod_buffers.append(module.param_and_grad_buffer)
+            for buffer in mod_buffers:
+                if idx >= len(buffers):
+                    return float("nan")
+                data = buffers[idx]
+                idx += 1
+                index_map = getattr(buffer, "param_index_map", None)
+                if index_map and param in index_map:
+                    start, end = int(index_map[param][0]), int(index_map[param][1])
+                    return float(torch.linalg.vector_norm(data[start:end], dtype=torch.float32))
+    return float("nan")
+
+
+def param_grad_state(param) -> str:
+    """Diagnostics: norms/pointers of ``param.main_grad`` and ``param.grad`` plus Megatron's fusion flag."""
+    with torch.no_grad():
+        mg = getattr(param, "main_grad", None)
+        g = getattr(param, "grad", None)
+        mg_s = (
+            f"main_grad|={float(torch.linalg.vector_norm(mg, dtype=torch.float32)):.4e}@{hex(mg.data_ptr())}"
+            if mg is not None
+            else "main_grad=None"
+        )
+        g_s = (
+            f"grad|={float(torch.linalg.vector_norm(g, dtype=torch.float32)):.4e}@{hex(g.data_ptr())}"
+            if g is not None
+            else "grad=None"
+        )
+    return f"|{mg_s} |{g_s} added_to_main={getattr(param, 'grad_added_to_main_grad', None)}"
+
+
 def allocate_grad_accum_buffers(
     modules: Iterable[torch.nn.Module],
 ) -> list[torch.Tensor]:

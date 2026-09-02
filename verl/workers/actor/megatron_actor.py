@@ -73,8 +73,11 @@ from verl.workers.utils.vcpo import (
     disable_dp_sync,
     disable_grad_finalize,
     finalize_model_grads_ignore_dp,
+    find_param,
     grad_buffers_norm,
     move_grad_buffers,
+    param_grad_state,
+    param_slice_norm,
     restore_dp_sync,
     top_param_slices,
     restore_grad_finalize,
@@ -925,6 +928,16 @@ class MegatronPPOActor(BasePPOActor):
                         f"|accum|={grad_buffers_norm(accum_buffers):.4e} "
                         f"|score|={grad_buffers_norm(score_gradient_buffers):.4e}"
                     )
+                    p = getattr(self, "_opob_dbg_param", None)
+                    if p is not None:
+                        main_bufs = list(_iter_grad_buffers(self.actor_module))
+                        print(
+                            f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} traj={traj_uid} watch "
+                            f"after_accumulate: {param_grad_state(p)} | "
+                            f"accum_slice={param_slice_norm(self.actor_module, accum_buffers, p):.4e} "
+                            f"score_slice={param_slice_norm(self.actor_module, score_gradient_buffers, p):.4e} "
+                            f"main_slice={param_slice_norm(self.actor_module, main_bufs, p):.4e}"
+                        )
         else:
             accumulate_grad_buffers(self.actor_module, accum_buffers, scale=adv_scalar)
 
@@ -1147,6 +1160,13 @@ class MegatronPPOActor(BasePPOActor):
                     f"main={describe(list(_iter_grad_buffers(self.actor_module)))} "
                     f"accum={describe(accum_buffers)} score={describe(score_gradient_buffers)}"
                 )
+                # The parameter whose accumulator slice was seen exploding: trace its
+                # main_grad / grad state at three points of every trajectory.
+                self._opob_dbg_name, self._opob_dbg_param = find_param(self.actor_module, "output_layer.weight")
+                print(
+                    f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} watch param {self._opob_dbg_name}: "
+                    f"{param_grad_state(self._opob_dbg_param) if self._opob_dbg_param is not None else 'not found'}"
+                )
 
         # [NOTE]: Megatron's DDP grad sync is over the DP×CP domain if using distributed optimizer.
         with_context_parallel = self.use_distributed_opt
@@ -1238,6 +1258,9 @@ class MegatronPPOActor(BasePPOActor):
                         mini_batch_size=self.config.ppo_mini_batch_size,
                     )
 
+                if grad_baselining and _opob_debug_enabled() and getattr(self, "_opob_dbg_param", None) is not None:
+                    self._opob_dbg_after_bwd = param_grad_state(self._opob_dbg_param)
+
                 metric_micro_batch = metric_micro_batch["output"]
                 for metric in metric_micro_batch:
                     # o[0] metrics, o[1] entropy, o[2] rollout_log_probs, o[3] old_log_probs/policy_log_probs
@@ -1263,6 +1286,18 @@ class MegatronPPOActor(BasePPOActor):
                     traj_record = local_traj_records[traj_uid]
                     traj_record.grad_norm = grad_norm
                     traj_record.grad_norm_unscaled = unscaled_grad_norm
+
+                    if _opob_debug_enabled() and getattr(self, "_opob_dbg_param", None) is not None:
+                        p = self._opob_dbg_param
+                        main_bufs = list(_iter_grad_buffers(self.actor_module))
+                        print(
+                            f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} traj={traj_uid} watch "
+                            f"after_bwd: {getattr(self, '_opob_dbg_after_bwd', '?')} | "
+                            f"after_norms: {param_grad_state(p)} | "
+                            f"accum_slice={param_slice_norm(self.actor_module, accum_buffers, p):.4e} "
+                            f"score_slice={param_slice_norm(self.actor_module, score_gradient_buffers, p):.4e} "
+                            f"main_slice={param_slice_norm(self.actor_module, main_bufs, p):.4e}"
+                        )
 
                     last_traj_in_scope = minibatch.meta_info["is_last_traj_in_scope"][traj_uid]
                     reward_std = minibatch.meta_info["reward_std_by_traj_uid"][traj_uid]
