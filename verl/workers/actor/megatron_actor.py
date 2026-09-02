@@ -76,6 +76,7 @@ from verl.workers.utils.vcpo import (
     grad_buffers_norm,
     move_grad_buffers,
     restore_dp_sync,
+    top_param_slices,
     restore_grad_finalize,
     zero_grad_accum_buffers,
 )
@@ -920,7 +921,9 @@ class MegatronPPOActor(BasePPOActor):
                         f"L={length} R={reward_scalar:.3f} seq_is={rec.rollout_seq_is} "
                         f"|g_i| unscaled={unscaled:.4e} scaled={scaled:.4e} "
                         f"scale_reward={scale_reward:.4f} scale_baseline={scale_baseline:.4f} "
-                        f"|main_grad|={grad_buffers_norm(list(_iter_grad_buffers(self.actor_module))):.4e}"
+                        f"|main_grad|={grad_buffers_norm(list(_iter_grad_buffers(self.actor_module))):.4e} "
+                        f"|accum|={grad_buffers_norm(accum_buffers):.4e} "
+                        f"|score|={grad_buffers_norm(score_gradient_buffers):.4e}"
                     )
         else:
             accumulate_grad_buffers(self.actor_module, accum_buffers, scale=adv_scalar)
@@ -943,6 +946,15 @@ class MegatronPPOActor(BasePPOActor):
                 # (norms are cheap: per-buffer foreach norms, no fp32 copies).
                 accum_before = grad_buffers_norm(accum_buffers)
                 score_norm = grad_buffers_norm(score_gradient_buffers)
+                # The score buffer is zeroed right after the move; keep the slice norms
+                # computed on it before that (cheap: a few hundred small reductions).
+                score_snapshot = score_gradient_buffers
+
+            if _opob_debug_enabled():
+                top = [(n, f"{v:.3e}", c) for n, v, c in top_param_slices(self.actor_module, score_snapshot, k=5)]
+                print(
+                    f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} group={group_uid} score top slices: {top}"
+                )
 
             move_grad_buffers(src=score_gradient_buffers, dest=accum_buffers, scale=-opob_baseline)
             zero_grad_accum_buffers(score_gradient_buffers)
@@ -1038,6 +1050,8 @@ class MegatronPPOActor(BasePPOActor):
                 _get_local_model_grads_for_norm(self.actor_module),
                 grad_stats_parallel_group=mpu.get_tensor_model_parallel_group(),
             )
+            top = [(n, f"{v:.3e}", c) for n, v, c in top_param_slices(self.actor_module, accum_buffers, k=5)]
+            print(f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} step: accum top slices: {top}")
             print(
                 f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} step: after grad sync "
                 f"|main_grad|={grad_buffers_norm(list(_iter_grad_buffers(self.actor_module))):.4e} "
@@ -1123,6 +1137,16 @@ class MegatronPPOActor(BasePPOActor):
             ]
             accum_buffers = allocate_grad_accum_buffers(self.actor_module)
             score_gradient_buffers = allocate_grad_accum_buffers(self.actor_module)
+            if _opob_debug_enabled():
+                # Memory layout check: the three buffer sets must not overlap.
+                describe = lambda bufs: [  # noqa: E731
+                    (hex(b.data_ptr()), b.numel(), str(b.dtype), b.is_contiguous()) for b in bufs
+                ]
+                print(
+                    f"[vcpo][opob-debug] rank={torch.distributed.get_rank()} buffers: "
+                    f"main={describe(list(_iter_grad_buffers(self.actor_module)))} "
+                    f"accum={describe(accum_buffers)} score={describe(score_gradient_buffers)}"
+                )
 
         # [NOTE]: Megatron's DDP grad sync is over the DP×CP domain if using distributed optimizer.
         with_context_parallel = self.use_distributed_opt

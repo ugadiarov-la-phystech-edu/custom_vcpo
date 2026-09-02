@@ -62,6 +62,39 @@ def grad_buffers_norm(buffers: Sequence[torch.Tensor]) -> float:
         return float(torch.linalg.vector_norm(norms).item())
 
 
+def top_param_slices(modules: Iterable[torch.nn.Module], buffers: Sequence[torch.Tensor], k: int = 5) -> list:
+    """Diagnostics: the k parameter slices of ``buffers`` (laid out like the modules' grad
+    buffers) with the largest L2 norm, as (name, norm, numel). Uses Megatron's
+    ``_ParamAndGradBuffer.param_index_map`` for the offsets; returns [] when unavailable."""
+    out = []
+    buffers = list(buffers)
+    idx = 0
+    with torch.no_grad():
+        for module in modules:
+            names = {p: n for n, p in module.named_parameters()}
+            mod_buffers = []
+            if hasattr(module, "buffers"):
+                mod_buffers.extend(module.buffers)
+            if hasattr(module, "expert_parallel_buffers"):
+                mod_buffers.extend(module.expert_parallel_buffers)
+            if not mod_buffers and hasattr(module, "param_and_grad_buffer"):
+                mod_buffers.append(module.param_and_grad_buffer)
+            for buffer in mod_buffers:
+                if idx >= len(buffers):
+                    return out
+                data = buffers[idx]
+                idx += 1
+                index_map = getattr(buffer, "param_index_map", None)
+                if not index_map:
+                    continue
+                for param, entry in index_map.items():
+                    start, end = int(entry[0]), int(entry[1])
+                    sl_norm = float(torch.linalg.vector_norm(data[start:end], dtype=torch.float32))
+                    out.append((names.get(param, "?"), sl_norm, end - start))
+    out.sort(key=lambda t: -t[1])
+    return out[:k]
+
+
 def allocate_grad_accum_buffers(
     modules: Iterable[torch.nn.Module],
 ) -> list[torch.Tensor]:

@@ -55,6 +55,11 @@ mkdir -p "$(dirname "${LOG}")"
 # ([vcpo] alloc, [Replay] global_steps) sit in worker pipes for many minutes
 # and the log-based assertions below misfire even though the run is healthy.
 export PYTHONUNBUFFERED=1
+# Ray collapses "similar" worker lines ("[repeated Nx across cluster]"), which
+# swallows most of the VCPO_OPOB_DEBUG per-trajectory/per-close traces in the
+# driver log (the un-deduplicated copies only live in
+# /tmp/ray/session_latest/logs/worker-*.out). Keep every line.
+export RAY_DEDUP_LOGS=0
 
 # The launch script honors these env overrides. Full-size model, TP=2 layout
 # and sequence lengths stay (they set the memory peak); small mini-batch +
