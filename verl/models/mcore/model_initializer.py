@@ -96,6 +96,47 @@ class BaseModelInitializer(ABC):
         return model
 
 
+_MLP_BIAS_ATTRS = ("linear_fc1", "linear_fc2")
+
+
+def freeze_absent_mlp_biases(model, tfconfig, hf_config) -> list[str]:
+    """Freeze the MLP biases Megatron creates that the HF checkpoint does not have.
+
+    Megatron's ``add_bias_linear`` is one switch for the attention output projection AND both MLP
+    projections, so a Llama-style checkpoint with ``attention_bias=True`` (q/k/v/o biases, e.g. the
+    re-aliased openPangu-7B) but ``mlp_bias=False`` gets MLP biases it never had. Transformer Engine
+    initialises them to exactly zero; left trainable they would drift from the first AdamW step,
+    while the weight converter/saver (correctly) never hand them to vLLM or the hf_model checkpoint -
+    the trainer and rollout policies would then silently diverge. Setting ``requires_grad=False``
+    here keeps them at zero for good, and the forward stays identical to HF Llama with
+    ``mlp_bias=False``.
+
+    Must run BEFORE DDP wrapping and optimizer construction: Megatron's DistributedDataParallel
+    only buffers grads for ``requires_grad`` params and ``_get_param_groups`` skips the rest, so the
+    frozen biases cost nothing and never reach the optimizer. ``DenseModel.initialize`` is inside the
+    model provider, which is before both.
+
+    Returns the parameter names that were frozen (empty when nothing applies).
+    """
+    if not getattr(tfconfig, "add_bias_linear", False) or bool(getattr(hf_config, "mlp_bias", False)):
+        return []
+    decoder = getattr(model, "decoder", None)
+    layers = getattr(decoder, "layers", None)
+    if layers is None:
+        return []
+    frozen = []
+    for i, layer in enumerate(layers):
+        mlp = getattr(layer, "mlp", None)
+        for attr in _MLP_BIAS_ATTRS:
+            linear = getattr(mlp, attr, None)
+            bias = getattr(linear, "bias", None)
+            if bias is None:
+                continue
+            bias.requires_grad_(False)
+            frozen.append(f"decoder.layers.{i}.mlp.{attr}.bias")
+    return frozen
+
+
 class DenseModel(BaseModelInitializer):
     """Initializer for dense models like Llama and Qwen2."""
 
@@ -103,6 +144,16 @@ class DenseModel(BaseModelInitializer):
         assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
         return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+
+    def initialize(self, **kwargs):
+        model = super().initialize(**kwargs)
+        frozen = freeze_absent_mlp_biases(model, self.tfconfig, self.hf_config)
+        if frozen:
+            print(
+                f"[DenseModel] add_bias_linear=True with mlp_bias=False: froze {len(frozen)} MLP bias "
+                f"tensors at zero (first: {frozen[0]})"
+            )
+        return model
 
 
 class Qwen2MoEModel(BaseModelInitializer):

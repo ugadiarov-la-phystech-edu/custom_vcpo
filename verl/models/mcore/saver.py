@@ -416,6 +416,18 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
                 src_pp_rank=src_pp_rank,
             )
 
+            # o_proj.bias exists (and trains) when add_bias_linear=True was derived from the HF
+            # attention_bias flag (re-aliased openPangu). Without this line the hf_model checkpoint
+            # lacks 34 tensors: vLLM refuses to load it and HF silently zero-inits them. The MLP
+            # biases add_bias_linear also creates are frozen zeros the HF model does not have, and
+            # are deliberately not exported.
+            if getattr(gpt_model_module.config, "add_bias_linear", False):
+                _broadcast_tensor(
+                    sync_layer.self_attention.linear_proj.bias,
+                    f"{layer_name}.self_attn.o_proj.bias",
+                    src_pp_rank=src_pp_rank,
+                )
+
             _broadcast_tensor(
                 sync_layer.mlp.linear_fc1.layer_norm_weight,
                 f"{layer_name}.post_attention_layernorm.weight",

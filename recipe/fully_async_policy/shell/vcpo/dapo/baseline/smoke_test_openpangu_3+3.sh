@@ -115,5 +115,8 @@ done
 CKPTS_DIR="logs/${exp_name//\//_}"
 set +x
 echo "==================== checkpoint verification ===================="
-# --dtype F32: FSDP2 at the default model_dtype=fp32 writes fp32 weights.
-python "${HERE}/verify_checkpoints.py" "${CKPTS_DIR}" --expect 2 --dtype F32 --base-model "${MODEL_PATH}"
+# --dtype F32: FSDP2 at the default model_dtype=fp32 writes fp32 weights. The Megatron wrapper
+# (smoke_test_openpangu_megatron_3+3.sh) sets VERIFY_DTYPE=BF16: its hf_model saves are bf16.
+# --base-model makes the verifier diff parameter NAMES against the base checkpoint, which is the
+# regression check for the Megatron saver exporting o_proj.bias.
+python "${HERE}/verify_checkpoints.py" "${CKPTS_DIR}" --expect 2 --dtype "${VERIFY_DTYPE:-F32}" --base-model "${MODEL_PATH}"

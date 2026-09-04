@@ -129,3 +129,13 @@ datagen:
 
 # Additional kwargs when calling tokenizer.apply_chat_template
 apply_chat_template_kwargs: {}
+
+# Prepend the tokenizer's BOS token to every rendered chat prompt (dataset input_ids /
+# raw_prompt_ids and the single-turn agent loops). verl tokenizes chat templates with
+# add_special_tokens=False, which drops BOS for tokenizers that rely on add_bos_token=True instead
+# of emitting it from the template (openPangu: the official recipe is apply_chat_template(...,
+# tokenize=False) followed by tokenizer(text), i.e. prompts start with <s>). Applied only when the
+# tokenizer has a BOS token, add_bos_token is true and the rendered text does not already start
+# with it, so Llama-3/Mistral-style templates cannot get a double BOS and Qwen (no BOS) is a no-op.
+# Default False keeps every existing run byte-identical.
+add_bos_token_to_prompt: false
