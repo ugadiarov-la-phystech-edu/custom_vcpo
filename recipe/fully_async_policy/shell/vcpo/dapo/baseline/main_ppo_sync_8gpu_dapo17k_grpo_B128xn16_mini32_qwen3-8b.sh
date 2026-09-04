@@ -108,6 +108,28 @@
 #     the peak (micro-batch 1, gradient accumulation). Never set
 #     PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
 #
+# SEEDS. One SEED variable (default 1, the async arms' seed) feeds every seed
+# knob verl.trainer.main_ppo exposes:
+#   * data.seed                              -> torch.Generator of the training
+#     RandomSampler (prompt order; main_ppo.py create_rl_sampler) and the
+#     max_samples subset rng of RLHFDataset;
+#   * actor_rollout_ref.actor.megatron.seed  -> set_random_seed on every trainer
+#     worker: torch / numpy / random + Megatron's model-parallel CUDA rng
+#     (megatron_workers.py); ref.megatron.seed resolves from it via oc.select
+#     and follows automatically, critic.megatron.seed does NOT (literal 42 in
+#     the generated config) and is set explicitly — inert here (no critic
+#     under GRPO) but keeps "one SEED everywhere" true;
+#   * actor_rollout_ref.actor.data_loader_seed -> the Megatron actor's mini-batch
+#     shuffle seed (megatron_actor.py; only used if actor.shuffle=True, set for
+#     completeness).
+#   NOT covered: vLLM's own sampling seed. vllm_async_server.py passes
+#   `self.config.get("seed", 0)`, but RolloutConfig has no `seed` field, so an
+#   extra `+actor_rollout_ref.rollout.seed` key raises at worker init
+#   ("unexpected keyword argument 'seed'") and the engine seed is always 0.
+#   Making it settable needs a dataclass field (verl/workers/config/rollout.py
+#   + rollout.yaml + regenerated _generated_*.yaml), not a script change.
+#   The seed is part of exp_name ("seed-N") so repeats get their own log dir.
+#
 # ENTROPY WATCH. No stabilizer by design. actor/entropy is logged every step
 # (calculate_entropy=True); Qwen3-8B starts at ~0.28. The async post-mortems'
 # earliest divergence signal is a monotone actor/grad_norm ramp (healthy: flat
@@ -133,6 +155,11 @@ TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k
 # aime-2025 (data_source=aime2025_dapo -> val-core/aime2025_dapo/acc/mean@1),
 # the same validation files and metric keys as the Qwen3-8B async arms.
 TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+
+# ================= Seeds =================
+# Every seed knob main_ppo exposes (see the SEEDS header block). vLLM's sampling
+# seed is not among them: it is hard-wired to 0 by RolloutConfig.
+SEED=${SEED:-1}
 
 # ================= Data =================
 max_prompt_length=$((1024 * 2))
@@ -216,7 +243,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -232,6 +259,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
+    data.seed=${SEED} \
     data.filter_overlong_prompts=${filter_overlong_prompts} \
     data.filter_overlong_prompts_workers=8 \
     algorithm.adv_estimator=${adv_estimator} \
@@ -254,6 +282,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+    actor_rollout_ref.actor.data_loader_seed=${SEED} \
+    actor_rollout_ref.actor.megatron.seed=${SEED} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \
@@ -297,6 +327,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    critic.megatron.seed=${SEED} \
     trainer.logger="['console','tensorboard']" \
     trainer.project_name=vcpo \
     trainer.experiment_name="${exp_name}" \
