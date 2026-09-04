@@ -99,12 +99,15 @@ def _first_tensor(hf_dir, key):
     return None
 
 
-def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
+def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None, check_timing=True):
     """Everything one global_step_N directory must contain. Returns its parsed timing state.
 
     expect_dtype pins the weight dtype ("BF16"/"F32"); the megatron arms save bf16, while an FSDP2
     arm at the default fsdp_config.model_dtype=fp32 writes fp32 (get_fsdp_full_state_dict does not
     cast). None only requires that one dtype is used throughout.
+
+    check_timing=False is for verl.trainer.main_ppo checkpoints (the synchronous arms): only the
+    fully-async trainer writes timing_state.json, so those checks are skipped and {} is returned.
     """
     name = os.path.basename(step_dir)
     hf_dir = os.path.join(step_dir, "actor", "huggingface")
@@ -173,7 +176,9 @@ def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
     except Exception as exc:  # noqa: BLE001
         report.check(False, f"{name}: AutoTokenizer.from_pretrained failed: {exc}")
 
-    # timing state
+    # timing state (fully-async trainer only)
+    if not check_timing:
+        return {}
     timing_path = os.path.join(step_dir, "timing_state.json")
     if not report.check(os.path.exists(timing_path), f"{name}: timing_state.json written"):
         return None
@@ -201,6 +206,12 @@ def main():
         default="BF16",
         help="expected weight dtype: BF16 (megatron / bf16 FSDP arms), F32 (FSDP at model_dtype=fp32), "
         'or "any" to only require that one dtype is used throughout',
+    )
+    parser.add_argument(
+        "--no-timing-state",
+        action="store_true",
+        help="checkpoints from verl.trainer.main_ppo (sync arms): skip the timing_state.json checks, which only "
+        "the fully-async trainer writes",
     )
     args = parser.parse_args()
 
@@ -232,6 +243,7 @@ def main():
             report,
             base_state=base_state,
             expect_dtype=None if args.dtype.lower() == "any" else args.dtype.upper(),
+            check_timing=not args.no_timing_state,
         )
         timings.append((step, timing))
 

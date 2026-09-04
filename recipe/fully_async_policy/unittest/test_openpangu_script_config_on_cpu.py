@@ -258,5 +258,338 @@ class TestQwenArmNeedsNoRemoteCode(unittest.TestCase):
         self.assertIs(cfg.data.trust_remote_code, False)
 
 
+# ============================================================================ Megatron arms
+
+OPENPANGU_MEGATRON = "grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_megatron_offload_openpangu7b_ppo-epochs=2_B33x1_is-pg.sh"
+QWEN_MEGATRON = "grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg.sh"
+SMOKE_MEGATRON_3P3 = "smoke_test_openpangu_megatron_3+3.sh"
+OPENPANGU_SYNC = "main_ppo_sync_8gpu_dapo17k_grpo_B128xn16_mini32_openpangu7b.sh"
+QWEN_SYNC = "main_ppo_sync_8gpu_dapo17k_grpo_B128xn16_mini32_qwen3-8b.sh"
+
+
+class _OpenPanguMegatronArmMixin:
+    """What every openPangu arm on strategy=megatron must set, whichever trainer it uses."""
+
+    def test_is_megatron(self):
+        self.assertEqual(self.cfg.actor_rollout_ref.actor.strategy, "megatron")
+
+    def test_points_at_a_realiased_local_checkpoint(self):
+        path = self.cfg.actor_rollout_ref.model.path
+        self.assertFalse(path.startswith("FreedomIntelligence/"), f"{path} is the stock hub checkpoint")
+        self.assertIn("openPangu", path)
+
+    def test_sets_both_trust_remote_code_keys(self):
+        self.assertIs(self.cfg.actor_rollout_ref.model.trust_remote_code, True)
+        self.assertIs(self.cfg.data.trust_remote_code, True)
+
+    def test_prepends_bos_like_the_official_recipe(self):
+        """The decision for the Megatron arms: train on prompts that start with <s>."""
+        self.assertIs(self.cfg.data.add_bos_token_to_prompt, True)
+
+    def test_no_attention_backend_override_and_no_memory_cap(self):
+        """Not ported from the AsyncRL scripts: forced TE fused attention (auto already picks it on
+        Hopper, and forcing removes the flash fallback) and the H200 per-process memory cap, which
+        would throttle an 80 GB H100 trainer to 72 GB."""
+        otc = OmegaConf.select(self.cfg, "actor_rollout_ref.actor.megatron.override_transformer_config") or {}
+        # the stock megatron config carries attention_backend=flash (TE picks fused on Hopper anyway);
+        # what must not appear is the forced "fused" of the AsyncRL scripts
+        self.assertNotEqual(otc.get("attention_backend"), "fused")
+        qwen = compose(QWEN_MEGATRON, TEST_FILE="/tmp/test.parquet")
+        qwen_otc = OmegaConf.select(qwen, "actor_rollout_ref.actor.megatron.override_transformer_config") or {}
+        self.assertEqual(otc.get("attention_backend"), qwen_otc.get("attention_backend"))
+        with open(os.path.join(BASELINE, self.SCRIPT)) as f:
+            text = f.read()
+        self.assertNotIn("VERL_GPU_MEM_CAP_GB", text)
+        self.assertNotIn("attention_backend=fused", text)
+
+    def test_uses_the_bf16_hdo_recipe(self):
+        opt = OmegaConf.select(self.cfg, "actor_rollout_ref.actor.optim.override_optimizer_config")
+        self.assertTrue(opt.optimizer_cpu_offload)
+        self.assertEqual(opt.main_params_dtype, "bfloat16")
+        self.assertEqual(self.cfg.actor_rollout_ref.actor.megatron.dtype, "bfloat16")
+
+    def test_checkpoints_are_hf_model_only_and_not_resumable(self):
+        self.assertEqual(list(self.cfg.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
+        self.assertEqual(self.cfg.trainer.resume_mode, "disable")
+
+
+class TestOpenPanguMegatronIsPgArm(_OpenPanguMegatronArmMixin, unittest.TestCase):
+    SCRIPT = OPENPANGU_MEGATRON
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform.startswith("win"):
+            raise unittest.SkipTest("bash-only")
+        cls.cfg = compose(OPENPANGU_MEGATRON, TEST_FILE="/tmp/test.parquet")
+
+    def test_keeps_the_arm_identical_to_the_qwen_megatron_twin(self):
+        """Only the model, the remote-code flags, BOS and the name may differ."""
+        qwen = compose(QWEN_MEGATRON, TEST_FILE="/tmp/test.parquet")
+        for path in (
+            "actor_rollout_ref.actor.strategy",
+            "actor_rollout_ref.actor.ppo_mini_batch_size",
+            "actor_rollout_ref.actor.ppo_epochs",
+            "actor_rollout_ref.actor.policy_loss.loss_mode",
+            "actor_rollout_ref.actor.policy_loss.rollout_correction",
+            "actor_rollout_ref.actor.calculate_entropy",
+            "actor_rollout_ref.actor.loss_agg_mode",
+            "actor_rollout_ref.actor.optim.lr",
+            "actor_rollout_ref.actor.optim.weight_decay",
+            "actor_rollout_ref.actor.optim.override_optimizer_config",
+            "actor_rollout_ref.actor.megatron.tensor_model_parallel_size",
+            "actor_rollout_ref.actor.megatron.override_transformer_config",
+            "actor_rollout_ref.rollout.n",
+            "actor_rollout_ref.rollout.gpu_memory_utilization",
+            "actor_rollout_ref.rollout.val_kwargs.temperature",
+            "actor_rollout_ref.rollout.val_kwargs.top_p",
+            "data.max_prompt_length",
+            "data.max_response_length",
+            "trainer.save_freq",
+            "trainer.resume_mode",
+            "trainer.n_gpus_per_node",
+            "rollout.n_gpus_per_node",
+            "rollout.test_freq",
+            "rollout.total_rollout_steps",
+            "async_training.staleness_threshold",
+            "async_training.use_rollout_log_probs",
+            "async_training.serialize_validation",
+            "async_training.pause_generation_during_save",
+        ):
+            with self.subTest(key=path):
+                self.assertEqual(
+                    OmegaConf.select(self.cfg, path),
+                    OmegaConf.select(qwen, path),
+                    f"{path} differs between the openPangu Megatron arm and its Qwen twin",
+                )
+
+    def test_differs_from_the_fsdp2_openpangu_arm_only_where_documented(self):
+        """Backend, BOS and validation sampling: three documented differences, nothing else in the
+        experiment definition."""
+        fsdp2 = compose(OPENPANGU, TEST_FILE="/tmp/test.parquet")
+        self.assertEqual(fsdp2.actor_rollout_ref.actor.strategy, "fsdp2")
+        self.assertIs(fsdp2.data.add_bos_token_to_prompt, False)
+        fsdp2_val_t = fsdp2.actor_rollout_ref.rollout.val_kwargs.temperature
+        self.assertNotEqual(fsdp2_val_t, self.cfg.actor_rollout_ref.rollout.val_kwargs.temperature)
+        for path in (
+            "actor_rollout_ref.model.path",
+            "actor_rollout_ref.actor.ppo_mini_batch_size",
+            "actor_rollout_ref.actor.ppo_epochs",
+            "actor_rollout_ref.actor.policy_loss.loss_mode",
+            "actor_rollout_ref.rollout.n",
+            "data.max_prompt_length",
+            "data.max_response_length",
+            "async_training.staleness_threshold",
+            "rollout.total_rollout_steps",
+        ):
+            with self.subTest(key=path):
+                self.assertEqual(OmegaConf.select(self.cfg, path), OmegaConf.select(fsdp2, path))
+
+    def test_batch_shape_divides_across_the_trainer_gpus(self):
+        cfg = self.cfg
+        seqs = cfg.actor_rollout_ref.actor.ppo_mini_batch_size * cfg.actor_rollout_ref.rollout.n
+        self.assertEqual(seqs % cfg.trainer.n_gpus_per_node, 0, f"{seqs} seqs over {cfg.trainer.n_gpus_per_node} GPUs")
+
+
+class TestOpenPanguMegatronSmoke3plus3(_OpenPanguMegatronArmMixin, unittest.TestCase):
+    """The wrapper must run the MEGATRON arm through the FSDP2 smoke's shortening, unchanged."""
+
+    SCRIPT = OPENPANGU_MEGATRON  # the wrapper's env overrides do not touch the arm's text
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform.startswith("win"):
+            raise unittest.SkipTest("bash-only")
+        cls.cfg = compose(SMOKE_MEGATRON_3P3)
+
+    def test_layout_is_three_plus_three_and_two_steps(self):
+        cfg = self.cfg
+        self.assertEqual(cfg.rollout.n_gpus_per_node, 3)
+        self.assertEqual(cfg.trainer.n_gpus_per_node, 3)
+        per_step = cfg.actor_rollout_ref.actor.ppo_mini_batch_size * cfg.async_training.require_batches
+        self.assertEqual(cfg.rollout.total_rollout_steps, 2 * per_step)
+        self.assertEqual(cfg.trainer.save_freq, 1)
+        self.assertEqual(cfg.rollout.test_freq, 1)
+
+    def test_same_shortening_as_the_fsdp2_smoke(self):
+        fsdp2 = compose(SMOKE_3P3)
+        for path in (
+            "actor_rollout_ref.rollout.n",
+            "actor_rollout_ref.actor.ppo_mini_batch_size",
+            "actor_rollout_ref.actor.entropy_coeff",
+            "actor_rollout_ref.actor.optim.lr",
+            "data.max_response_length",
+            "trainer.val_before_train",
+            "rollout.total_rollout_steps",
+        ):
+            with self.subTest(key=path):
+                self.assertEqual(OmegaConf.select(self.cfg, path), OmegaConf.select(fsdp2, path))
+
+    def test_wrapper_verifies_bf16_checkpoints(self):
+        with open(os.path.join(BASELINE, SMOKE_MEGATRON_3P3)) as f:
+            text = f.read()
+        self.assertIn("VERIFY_DTYPE=${VERIFY_DTYPE:-BF16}", text)
+        with open(os.path.join(BASELINE, SMOKE_3P3)) as f:
+            base = f.read()
+        self.assertIn('--dtype "${VERIFY_DTYPE:-F32}"', base, "the FSDP2 smoke must keep verifying fp32 by default")
+        self.assertIn("--base-model", base, "parameter-name diff against the base model is the o_proj.bias check")
+
+
+class TestOpenPanguSyncArm(_OpenPanguMegatronArmMixin, unittest.TestCase):
+    SCRIPT = OPENPANGU_SYNC
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform.startswith("win"):
+            raise unittest.SkipTest("bash-only")
+        cls.cfg = compose(OPENPANGU_SYNC, TEST_FILE="/tmp/test.parquet")
+
+    def test_keeps_the_arm_identical_to_the_qwen_sync_twin(self):
+        qwen = compose(QWEN_SYNC, TEST_FILE="/tmp/test.parquet")
+        for path in (
+            "actor_rollout_ref.hybrid_engine",
+            "actor_rollout_ref.actor.strategy",
+            "actor_rollout_ref.actor.ppo_mini_batch_size",
+            "actor_rollout_ref.actor.ppo_epochs",
+            "actor_rollout_ref.actor.policy_loss.loss_mode",
+            "actor_rollout_ref.actor.clip_ratio",
+            "actor_rollout_ref.actor.clip_ratio_c",
+            "actor_rollout_ref.actor.loss_agg_mode",
+            "actor_rollout_ref.actor.optim.lr",
+            "actor_rollout_ref.actor.optim.weight_decay",
+            "actor_rollout_ref.actor.optim.override_optimizer_config",
+            "actor_rollout_ref.actor.megatron.seed",
+            "actor_rollout_ref.actor.data_loader_seed",
+            "actor_rollout_ref.rollout.n",
+            "actor_rollout_ref.rollout.gpu_memory_utilization",
+            "actor_rollout_ref.rollout.max_num_batched_tokens",
+            "actor_rollout_ref.rollout.val_kwargs.temperature",
+            "actor_rollout_ref.rollout.val_kwargs.top_p",
+            "data.train_batch_size",
+            "data.seed",
+            "data.max_prompt_length",
+            "data.max_response_length",
+            "trainer.test_freq",
+            "trainer.save_freq",
+            "trainer.resume_mode",
+            "trainer.n_gpus_per_node",
+            "trainer.total_epochs",
+            "critic.megatron.seed",
+        ):
+            with self.subTest(key=path):
+                self.assertEqual(
+                    OmegaConf.select(self.cfg, path),
+                    OmegaConf.select(qwen, path),
+                    f"{path} differs between the openPangu sync arm and its Qwen twin",
+                )
+
+    def test_seed_is_in_the_experiment_name(self):
+        self.assertIn("seed-", self.cfg.trainer.experiment_name)
+        self.assertIn("bos", self.cfg.trainer.experiment_name)
+
+
+class TestBosFlagDefaultsOffEverywhereElse(unittest.TestCase):
+    """The flag exists for openPangu; every other script composes with it off, exactly as before."""
+
+    def test_existing_scripts_do_not_prepend_bos(self):
+        for name, env in (
+            (OPENPANGU, {"TEST_FILE": "/tmp/test.parquet"}),
+            (QWEN_FSDP2, {"TEST_FILE": "/tmp/test.parquet"}),
+            (QWEN_MEGATRON, {"TEST_FILE": "/tmp/test.parquet"}),
+            (QWEN_SYNC, {"TEST_FILE": "/tmp/test.parquet"}),
+            (SMOKE_3P3, {}),
+        ):
+            with self.subTest(script=name):
+                cfg = compose(name, **env)
+                self.assertIs(cfg.data.add_bos_token_to_prompt, False)
+
+
+class TestMegatronScriptsExportTheHfModulesCache(unittest.TestCase):
+    def test_all_openpangu_scripts_prepend_the_hf_modules_cache(self):
+        for name in (OPENPANGU_MEGATRON, OPENPANGU_SYNC, SMOKE_OOM_SYNC):
+            with self.subTest(script=name):
+                with open(os.path.join(BASELINE, name)) as f:
+                    text = f.read()
+                self.assertIn('case ":${PYTHONPATH:-}:" in', text)
+                self.assertIn('export PYTHONPATH="${HF_MODULES_CACHE}', text)
+
+
+SMOKE_OOM_SYNC = "smoke_test_oom_openpangu7b_sync.sh"
+SMOKE_OOM_QWEN_SYNC = "smoke_test_oom_qwen3-8b_sync.sh"
+
+
+class TestOpenPanguSyncOomSmoke(_OpenPanguMegatronArmMixin, unittest.TestCase):
+    """The fast check of the sync openPangu arm: the Qwen OOM-smoke protocol on the openPangu arm,
+    plus a checkpoint verification against the base model. Composed as a launch would."""
+
+    SCRIPT = OPENPANGU_SYNC  # the wrapper's env overrides do not touch the arm's text
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform.startswith("win"):
+            raise unittest.SkipTest("bash-only")
+        cls.cfg = compose(SMOKE_OOM_SYNC)
+
+    def test_runs_two_steps_on_the_real_8_gpu_layout(self):
+        cfg = self.cfg
+        self.assertEqual(cfg.trainer.total_training_steps, 2)
+        self.assertEqual(cfg.trainer.n_gpus_per_node, 8)
+        self.assertIs(cfg.actor_rollout_ref.hybrid_engine, True)
+        self.assertIs(cfg.trainer.val_before_train, False)
+
+    def test_same_shortening_as_the_qwen_oom_smoke(self):
+        """Batch 16 / mini 8 (two updates per step), the arm's own 8192 tokens and memory knobs."""
+        qwen = compose(SMOKE_OOM_QWEN_SYNC)
+        for path in (
+            "data.train_batch_size",
+            "actor_rollout_ref.actor.ppo_mini_batch_size",
+            "actor_rollout_ref.rollout.n",
+            "data.max_response_length",
+            "actor_rollout_ref.rollout.gpu_memory_utilization",
+            "actor_rollout_ref.rollout.max_num_batched_tokens",
+            "actor_rollout_ref.actor.megatron.param_offload",
+            "trainer.total_training_steps",
+            "trainer.val_before_train",
+        ):
+            with self.subTest(key=path):
+                self.assertEqual(OmegaConf.select(self.cfg, path), OmegaConf.select(qwen, path))
+        self.assertEqual(self.cfg.data.train_batch_size, 16)
+        self.assertEqual(self.cfg.actor_rollout_ref.actor.ppo_mini_batch_size, 8)
+        self.assertEqual(self.cfg.data.max_response_length, 8192)
+
+    def test_memory_settings_are_the_arm_s_own(self):
+        arm = compose(OPENPANGU_SYNC, TEST_FILE="/tmp/test.parquet")
+        for path in (
+            "actor_rollout_ref.rollout.gpu_memory_utilization",
+            "actor_rollout_ref.rollout.max_num_batched_tokens",
+            "data.max_response_length",
+            "data.max_prompt_length",
+            "actor_rollout_ref.actor.megatron.param_offload",
+            "actor_rollout_ref.actor.optim.override_optimizer_config",
+        ):
+            with self.subTest(key=path):
+                self.assertEqual(OmegaConf.select(self.cfg, path), OmegaConf.select(arm, path))
+
+    def test_wrapper_verifies_the_checkpoint_against_the_base_model(self):
+        with open(os.path.join(BASELINE, SMOKE_OOM_SYNC)) as f:
+            text = f.read()
+        self.assertIn("verify_checkpoints.py", text)
+        self.assertIn("--base-model", text, "the parameter-name diff is the o_proj.bias check")
+        self.assertIn("--dtype BF16", text)
+        self.assertIn("--no-timing-state", text, "main_ppo writes no timing_state.json")
+        self.assertIn("froze .* MLP bias tensors at zero", text)
+
+    def test_verifier_accepts_the_no_timing_state_switch(self):
+        import subprocess
+
+        proc = subprocess.run(
+            [sys.executable, os.path.join(BASELINE, "verify_checkpoints.py"), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        self.assertIn("--no-timing-state", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

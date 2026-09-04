@@ -195,6 +195,46 @@ class TestOpenPanguCheckpointContract(unittest.TestCase):
         with_fix = run(HF_MODULES_CACHE)
         self.assertIn("GOT PanguTokenizer", with_fix.stdout, with_fix.stderr[-400:])
 
+    # ---------------------------------------------------------------- BOS
+
+    def test_tokenizer_relies_on_add_bos_token(self):
+        """Why data.add_bos_token_to_prompt exists: the Pangu tokenizer adds <s> through
+        add_bos_token=True, not through the chat template."""
+        self.assertTrue(getattr(self.tok, "add_bos_token", False))
+        self.assertEqual(self.tok.bos_token, "<s>")
+        self.assertEqual(self.tok.bos_token_id, 1)
+        self.assertEqual(self.cfg.bos_token_id, 1)
+
+    def test_chat_template_never_emits_bos(self):
+        """So prepending cannot double it, and verl's default path really does drop it."""
+        messages = [{"role": "user", "content": "1+1"}]
+        text = self.tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        self.assertFalse(text.startswith(self.tok.bos_token))
+        self.assertNotIn(self.tok.bos_token, text)
+
+    def test_verl_default_path_drops_the_bos_the_official_recipe_keeps(self):
+        """README: apply_chat_template(tokenize=False) then tokenizer(text) -> starts with <s>.
+        apply_chat_template(tokenize=True) (verl's agent loops before the flag) does not."""
+        messages = [{"role": "user", "content": "1+1"}]
+        text = self.tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        official = self.tok(text)["input_ids"]
+        verl_default = self.tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        self.assertEqual(official[0], self.tok.bos_token_id)
+        self.assertEqual(official[1:], verl_default)
+
+    def test_helper_reproduces_the_official_prompt_ids_exactly(self):
+        """The flag's whole contract on the real tokenizer: encode(add_special_tokens=False) + helper
+        == tokenizer(text), token for token, and a second application is a no-op."""
+        from verl.utils.dataset.prompt_utils import maybe_prepend_bos
+
+        messages = [{"role": "user", "content": "Compute 2+2."}]
+        text = self.tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        ids = self.tok.encode(text, add_special_tokens=False)
+        with_bos = maybe_prepend_bos(self.tok, text, ids, True)
+        self.assertEqual(with_bos, self.tok(text)["input_ids"])
+        self.assertEqual(maybe_prepend_bos(self.tok, text, with_bos, True), with_bos)
+        self.assertEqual(maybe_prepend_bos(self.tok, text, ids, False), ids)
+
     # ---------------------------------------------------------------- the datasets
 
     def test_every_prompt_fits_under_max_prompt_length(self):

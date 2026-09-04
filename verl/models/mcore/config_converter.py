@@ -168,12 +168,20 @@ def hf_to_mcore_config_dense(
     # for LlamaForCausalLM or Qwen2ForCausalLM
     qkv_bias = True if "Qwen2" in hf_config.architectures[0] else getattr(hf_config, "attention_bias", False)
     qk_layernorm = True if "Qwen3" in hf_config.architectures[0] else False
+    # HF Llama's attention_bias puts a bias on q/k/v AND o_proj (modeling_llama.py). Megatron has
+    # no o_proj-only switch: add_qkv_bias covers the fused qkv, and add_bias_linear is the single
+    # flag for linear_proj (o_proj) plus both MLP projections. So a checkpoint with attention (or
+    # MLP) bias needs add_bias_linear=True; the MLP biases this also creates when the HF model has
+    # mlp_bias=False are frozen at their zero init by DenseModel.initialize (model_initializer.py)
+    # and skipped by the weight converter/saver, keeping the forward equal to HF's. Qwen2/Qwen3
+    # (attention_bias absent or False) keep add_bias_linear=False, as before.
+    add_bias_linear = bool(getattr(hf_config, "attention_bias", False)) or bool(getattr(hf_config, "mlp_bias", False))
 
     args: dict = _get_base_transformer_config(
         hf_config=hf_config,
         dtype=dtype,
         use_cpu_initialization=False,
-        add_bias_linear=False,
+        add_bias_linear=add_bias_linear,
         add_qkv_bias=qkv_bias,
         qk_layernorm=qk_layernorm,
     )
