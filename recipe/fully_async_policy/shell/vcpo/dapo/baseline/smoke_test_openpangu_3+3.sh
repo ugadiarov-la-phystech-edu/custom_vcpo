@@ -49,4 +49,4 @@ done
 CKPTS_DIR="logs/${exp_name//\//_}"
 set +x
 echo "==================== checkpoint verification ===================="
-python "${HERE}/verify_checkpoints.py" "${CKPTS_DIR}" --expect 2 --dtype F32 --base-model "${MODEL_PATH}"
+python "${HERE}/verify_checkpoints.py" "${CKPTS_DIR}" --expect 2 --dtype "${VERIFY_DTYPE:-F32}" --base-model "${MODEL_PATH}"

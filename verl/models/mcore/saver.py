@@ -416,6 +416,13 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
                 src_pp_rank=src_pp_rank,
             )
 
+            if getattr(gpt_model_module.config, "add_bias_linear", False):
+                _broadcast_tensor(
+                    sync_layer.self_attention.linear_proj.bias,
+                    f"{layer_name}.self_attn.o_proj.bias",
+                    src_pp_rank=src_pp_rank,
+                )
+
             _broadcast_tensor(
                 sync_layer.mlp.linear_fc1.layer_norm_weight,
                 f"{layer_name}.post_attention_layernorm.weight",

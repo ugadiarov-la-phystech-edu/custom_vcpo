@@ -168,12 +168,13 @@ def hf_to_mcore_config_dense(
     # for LlamaForCausalLM or Qwen2ForCausalLM
     qkv_bias = True if "Qwen2" in hf_config.architectures[0] else getattr(hf_config, "attention_bias", False)
     qk_layernorm = True if "Qwen3" in hf_config.architectures[0] else False
+    add_bias_linear = bool(getattr(hf_config, "attention_bias", False)) or bool(getattr(hf_config, "mlp_bias", False))
 
     args: dict = _get_base_transformer_config(
         hf_config=hf_config,
         dtype=dtype,
         use_cpu_initialization=False,
-        add_bias_linear=False,
+        add_bias_linear=add_bias_linear,
         add_qkv_bias=qkv_bias,
         qk_layernorm=qk_layernorm,
     )

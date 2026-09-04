@@ -96,6 +96,29 @@ class BaseModelInitializer(ABC):
         return model
 
 
+_MLP_BIAS_ATTRS = ("linear_fc1", "linear_fc2")
+
+
+def freeze_absent_mlp_biases(model, tfconfig, hf_config) -> list[str]:
+    if not getattr(tfconfig, "add_bias_linear", False) or bool(getattr(hf_config, "mlp_bias", False)):
+        return []
+    decoder = getattr(model, "decoder", None)
+    layers = getattr(decoder, "layers", None)
+    if layers is None:
+        return []
+    frozen = []
+    for i, layer in enumerate(layers):
+        mlp = getattr(layer, "mlp", None)
+        for attr in _MLP_BIAS_ATTRS:
+            linear = getattr(mlp, attr, None)
+            bias = getattr(linear, "bias", None)
+            if bias is None:
+                continue
+            bias.requires_grad_(False)
+            frozen.append(f"decoder.layers.{i}.mlp.{attr}.bias")
+    return frozen
+
+
 class DenseModel(BaseModelInitializer):
     """Initializer for dense models like Llama and Qwen2."""
 
@@ -103,6 +126,16 @@ class DenseModel(BaseModelInitializer):
         assert self.tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
         return get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
+
+    def initialize(self, **kwargs):
+        model = super().initialize(**kwargs)
+        frozen = freeze_absent_mlp_biases(model, self.tfconfig, self.hf_config)
+        if frozen:
+            print(
+                f"[DenseModel] add_bias_linear=True with mlp_bias=False: froze {len(frozen)} MLP bias "
+                f"tensors at zero (first: {frozen[0]})"
+            )
+        return model
 
 
 class Qwen2MoEModel(BaseModelInitializer):

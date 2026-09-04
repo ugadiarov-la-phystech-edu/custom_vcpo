@@ -77,7 +77,7 @@ def _first_tensor(hf_dir, key):
     return None
 
 
-def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
+def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None, check_timing=True):
     name = os.path.basename(step_dir)
     hf_dir = os.path.join(step_dir, "actor", "huggingface")
 
@@ -136,6 +136,8 @@ def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
     except Exception as exc:  # noqa: BLE001
         report.check(False, f"{name}: AutoTokenizer.from_pretrained failed: {exc}")
 
+    if not check_timing:
+        return {}
     timing_path = os.path.join(step_dir, "timing_state.json")
     if not report.check(os.path.exists(timing_path), f"{name}: timing_state.json written"):
         return None
@@ -163,6 +165,12 @@ def main():
         default="BF16",
         help="expected weight dtype: BF16 (megatron / bf16 FSDP arms), F32 (FSDP at model_dtype=fp32), "
         'or "any" to only require that one dtype is used throughout',
+    )
+    parser.add_argument(
+        "--no-timing-state",
+        action="store_true",
+        help="checkpoints from verl.trainer.main_ppo (sync arms): skip the timing_state.json checks, which only "
+        "the fully-async trainer writes",
     )
     args = parser.parse_args()
 
@@ -193,6 +201,7 @@ def main():
             report,
             base_state=base_state,
             expect_dtype=None if args.dtype.lower() == "any" else args.dtype.upper(),
+            check_timing=not args.no_timing_state,
         )
         timings.append((step, timing))
 
