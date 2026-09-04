@@ -45,7 +45,7 @@
 #     is present but never binds.
 #   * one weight sync + one old_log_prob pass (2048 seqs) per 4 updates.
 #   * 17,398 prompts / 128 = 135 rollout steps = 540 optimizer updates per
-#     epoch. trainer.test_freq / save_freq count ROLLOUT steps: 10 = every 40
+#     epoch. trainer.test_freq / save_freq count ROLLOUT steps: 3 = every 12
 #     updates. 512 seqs per update / 8 DP ranks = 64 per rank (divisible).
 #
 # OTHER SCHEDULE. AdamW lr 1e-6 constant, no warmup, weight_decay 0.01 (verl's
@@ -67,8 +67,8 @@
 #   * each save writes global_step_N/actor/huggingface/ - config, tokenizer and bf16
 #     safetensors - directly loadable by vLLM / from_pretrained, no merge step. No
 #     optimizer state, no sharded dist_ckpt/ directory at all.
-#   * nothing is rotated away: ~16.4 GB per save for Qwen3-8B; at save_freq=10 over the
-#     135-step epoch that is ~13 saves, ~220 GB per epoch. Check free disk before launch
+#   * nothing is rotated away: ~16.4 GB per save for Qwen3-8B; at save_freq=3 over the
+#     135-step epoch that is 45 saves, ~740 GB per epoch. Check free disk before launch
 #     (remote_h100 was at 95% on 2026-08-23) and raise save_freq if it is tight.
 #   * the run is NOT resumable: 'hf_model' is written but never read back, so
 #     load_contents would restore nothing. resume_mode=disable makes that explicit,
@@ -98,11 +98,15 @@
 #   * max_num_batched_tokens=10240 is the chunked-prefill budget per scheduler
 #     step (= max_model_len 2048+8192); it bounds prefill activations (~2-3 GiB
 #     for 8B), not capacity — unchanged.
-#   * Training phase (vLLM asleep: KV freed, weights parked in host RAM): the
-#     same model/lengths/HDO/full-recompute trainer measured ~58 GB at TP=1 in
-#     the 5+3 async arms; + vLLM residual ~2-3 GiB -> ~61 GB, fits. The
-#     mini-batch size does not change peak memory (micro-batch 1, gradient
-#     accumulation). Never set PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
+#   * MEASURED (smoke_test_oom_qwen3-8b_sync.sh, 2026-09-04, 2 steps at 8192
+#     tokens, nvidia-smi every 2 s): trainer resident after init 35.9 GB; peak
+#     78.1 GB of 81.6 GB during vLLM's profiling pass at init (3.5 GB headroom,
+#     the tightest point); generation 73.5-74.5 GB; old_log_prob + updates
+#     75-76 GB (vLLM's sleep returns less than the KV+weights it holds). Every
+#     phase fits with 3-5 GB to spare; there is NO room to raise the
+#     utilization without param offload. The mini-batch size does not change
+#     the peak (micro-batch 1, gradient accumulation). Never set
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
 #
 # ENTROPY WATCH. No stabilizer by design. actor/entropy is logged every step
 # (calculate_entropy=True); Qwen3-8B starts at ~0.28. The async post-mortems'
@@ -196,8 +200,8 @@ val_top_p=${val_top_p:-0.7}
 calculate_log_probs=True
 
 # ================= Trainer =================
-test_freq=${test_freq:-10}   # rollout steps (= 40 optimizer updates)
-save_freq=${save_freq:-10}   # rollout steps
+test_freq=${test_freq:-3}    # rollout steps (= 12 optimizer updates)
+save_freq=${save_freq:-3}    # rollout steps
 total_epochs=${total_epochs:-3}
 val_before_train=${val_before_train:-True}
 # Weights only, in huggingface format: no optimizer state and no merge step

@@ -184,8 +184,8 @@ class TestSyncDapo17kQwen3ArmConfig(unittest.TestCase):
         self.assertEqual(list(c.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
         self.assertEqual(c.trainer.resume_mode, "disable")
         self.assertIsNone(c.trainer.max_actor_ckpt_to_keep)
-        self.assertEqual(c.trainer.save_freq, 10)
-        self.assertEqual(c.trainer.test_freq, 10)
+        self.assertEqual(c.trainer.save_freq, 3)
+        self.assertEqual(c.trainer.test_freq, 3)
         self.assertTrue(c.trainer.val_before_train)
 
 
