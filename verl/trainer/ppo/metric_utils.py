@@ -270,32 +270,49 @@ def compute_cumulative_timing_metrics(cumulative: dict[str, float], timing_raw: 
     """Accumulate the synchronous trainer's clean-training-time counters.
 
     ``cumulative`` is caller-owned mutable state (one dict per fit loop),
-    updated in place from this step's ``timing_raw`` and rendered as metrics.
-    "Clean training time" is the step's wall time minus validation
-    (``testing``) and checkpoint saving (``save_checkpoint``) — both timed
-    INSIDE the ``step`` timer in RayPPOTrainer.fit, which is what makes the
-    subtraction exact in the synchronous trainer (no pipeline overlap; the
-    fully-async recipe needs a virtual-timeline reconstruction for the same
-    quantity). ``val_before_train`` validation runs before the loop, outside
-    any step timer, so it is excluded by construction.
+    updated in place from this iteration's ``timing_raw`` and rendered as
+    metrics.
+
+    Timer layout this relies on (RayPPOTrainer.fit on this fork, identical on
+    the ``verl_0.7`` branch): the ``step`` timer covers generation, the
+    old-log-prob pass, reward/advantage computation and the optimizer updates
+    ONLY. Validation (``testing``) and checkpoint saving (``save_checkpoint``)
+    run AFTER the ``step`` block closes, in their own timers, so ``step`` never
+    contains them. (Upstream verl times the save inside the step and validation
+    outside; a helper written for that layout, or one that subtracts testing
+    and save from ``step``, under-counts here — that bug shipped in the first
+    version of this function and clamped training time to +0 on every
+    validation step.) ``tests/trainer/ppo/test_cumulative_timing_on_cpu.py``
+    pins the layout with an AST tripwire; if validation or saving is ever moved
+    back inside the ``step`` timer, subtract them here again.
+
+    Hence, per iteration:
+      wall       += step + testing + save_checkpoint
+      validation += testing
+      save       += save_checkpoint
+      training   += step
+    so ``training == wall - validation - save`` holds exactly, and clean
+    training time is what the val-vs-clean-time plots want: the time an
+    identical run with neither validation nor checkpointing would have needed
+    (no pipeline overlap in the sync trainer, so no virtual-timeline
+    reconstruction as in the fully-async recipe). ``val_before_train``
+    validation runs before the loop, outside any timer, and is excluded by
+    construction; ``wall_time_since_first_sample`` is the sum of per-iteration
+    durations, i.e. it excludes between-step dataloader/init gaps.
 
     The tags deliberately match FullyAsyncTrainer's fully_async/timing/*
     family: every val-vs-clean-time plot keys on
     ``fully_async/timing/cumulative_training_time`` and silently skips runs
     without it, so emitting the same names makes sync runs drop into the
-    existing cross-arm tooling unchanged. In the sync trainer
-    ``wall_time_since_first_sample`` is the sum of step durations (excludes
-    between-step dataloader/init gaps).
+    existing cross-arm tooling unchanged. Missing keys count as 0.
     """
     step = float(timing_raw.get("step", 0.0))
     testing = float(timing_raw.get("testing", 0.0))
     save = float(timing_raw.get("save_checkpoint", 0.0))
-    cumulative["wall"] = cumulative.get("wall", 0.0) + step
+    cumulative["wall"] = cumulative.get("wall", 0.0) + step + testing + save
     cumulative["validation"] = cumulative.get("validation", 0.0) + testing
     cumulative["save"] = cumulative.get("save", 0.0) + save
-    # max(0, .) guards a pathological clock (testing+save exceeding the step
-    # that contains them) from ever making training time run backwards
-    cumulative["training"] = cumulative.get("training", 0.0) + max(step - testing - save, 0.0)
+    cumulative["training"] = cumulative.get("training", 0.0) + step
     return {
         "fully_async/timing/wall_time_since_first_sample": cumulative["wall"],
         "fully_async/timing/cumulative_validation_time": cumulative["validation"],
