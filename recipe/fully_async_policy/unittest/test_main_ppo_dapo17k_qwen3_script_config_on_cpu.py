@@ -179,6 +179,43 @@ class TestSyncDapo17kQwen3ArmConfig(unittest.TestCase):
         self.assertTrue(c.actor_rollout_ref.rollout.enable_chunked_prefill)
         self.assertEqual(c.actor_rollout_ref.rollout.tensor_model_parallel_size, 1)
 
+    def test_single_seed_feeds_every_seed_knob(self):
+        """SEED (default 1) reaches every seed main_ppo exposes, and the derived
+        ref/critic megatron seeds follow via oc.select. vLLM's engine seed is not a
+        config field (RolloutConfig has none), so it is deliberately not asserted."""
+        c = self.cfg
+        self.assertEqual(c.data.seed, 1)
+        self.assertEqual(c.actor_rollout_ref.actor.megatron.seed, 1)
+        self.assertEqual(c.actor_rollout_ref.actor.data_loader_seed, 1)
+        self.assertEqual(c.actor_rollout_ref.ref.megatron.seed, 1)
+        self.assertEqual(c.critic.megatron.seed, 1)
+        self.assertNotIn("seed", c.actor_rollout_ref.rollout)
+        self.assertTrue(c.trainer.experiment_name.endswith(" seed-1"), c.trainer.experiment_name)
+
+    def test_seed_override_propagates(self):
+        """SEED=7 in the environment moves all three knobs and the exp_name tag together."""
+        env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", SEED="7")
+        path = os.path.join(BASELINE, SCRIPT)
+        with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
+            proc = subprocess.run(
+                ["bash", path, "--cfg", "job", "--resolve"],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=out,
+                stderr=subprocess.PIPE,
+                timeout=900,
+            )
+            if proc.returncode != 0:
+                raise unittest.SkipTest(f"could not compose with SEED=7: {proc.stderr.decode()[-300:]}")
+            out.flush()
+            out.seek(0)
+            c = OmegaConf.load(out.name)
+        self.assertEqual(c.data.seed, 7)
+        self.assertEqual(c.actor_rollout_ref.actor.megatron.seed, 7)
+        self.assertEqual(c.actor_rollout_ref.actor.data_loader_seed, 7)
+        self.assertEqual(c.actor_rollout_ref.ref.megatron.seed, 7)
+        self.assertTrue(c.trainer.experiment_name.endswith(" seed-7"), c.trainer.experiment_name)
+
     def test_checkpoint_policy(self):
         c = self.cfg
         self.assertEqual(list(c.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
