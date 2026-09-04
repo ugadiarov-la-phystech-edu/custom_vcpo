@@ -270,10 +270,10 @@ def compute_cumulative_timing_metrics(cumulative: dict[str, float], timing_raw: 
     step = float(timing_raw.get("step", 0.0))
     testing = float(timing_raw.get("testing", 0.0))
     save = float(timing_raw.get("save_checkpoint", 0.0))
-    cumulative["wall"] = cumulative.get("wall", 0.0) + step
+    cumulative["wall"] = cumulative.get("wall", 0.0) + step + testing + save
     cumulative["validation"] = cumulative.get("validation", 0.0) + testing
     cumulative["save"] = cumulative.get("save", 0.0) + save
-    cumulative["training"] = cumulative.get("training", 0.0) + max(step - testing - save, 0.0)
+    cumulative["training"] = cumulative.get("training", 0.0) + step
     return {
         "fully_async/timing/wall_time_since_first_sample": cumulative["wall"],
         "fully_async/timing/cumulative_validation_time": cumulative["validation"],

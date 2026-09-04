@@ -216,6 +216,15 @@ class TestSyncDapo17kQwen3ArmConfig(unittest.TestCase):
         self.assertEqual(c.actor_rollout_ref.ref.megatron.seed, 7)
         self.assertTrue(c.trainer.experiment_name.endswith(" seed-7"), c.trainer.experiment_name)
 
+    def test_cumulative_timing_metric_is_exercised(self):
+        """fully_async/timing/* on a sync run needs validation and saving to actually
+        happen inside the loop (test_freq / save_freq > 0); val_before_train runs
+        before the loop and is excluded from the counters by construction."""
+        c = self.cfg
+        self.assertGreater(c.trainer.test_freq, 0)
+        self.assertGreater(c.trainer.save_freq, 0)
+        self.assertFalse(c.algorithm.rollout_correction.bypass_mode)
+
     def test_checkpoint_policy(self):
         c = self.cfg
         self.assertEqual(list(c.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])

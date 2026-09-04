@@ -1163,3 +1163,121 @@ def test_log_validation_data_logs_every_drained_payload():
     assert steps == [1, 1, 2, 2], "each payload logs its metrics and its timing at its own version"
     # the newest payload wins for the cached bookkeeping
     assert trainer.rollouter_cumulative_validation_time == 3.0
+
+
+# ------------------------------------- stop-the-world identity / sync-arm parity
+#
+# The is-pg baseline scripts run with serialize_validation=True and
+# pause_generation_during_save=True: validation and checkpoint saves freeze the
+# whole pipeline, so they are pure time translations and the clean training time
+# must equal wall - validation - save exactly -- the same identity the sync
+# trainer's compute_cumulative_timing_metrics holds by construction. These tests
+# drive the production virtual-clock hooks through one such schedule and check
+# the four fully_async/timing/* totals against that identity and against the
+# sync helper fed the same per-iteration durations.
+#
+# The schedule (rollout-bound: a batch every 10 s of generation, 6 s of training):
+#   step 1: batch 1 ready t=10, trains 10..16; the sync at 16 triggers a
+#           serialized validation 16..24 (generation paused, trainer blocked on
+#           wait_last_valid inside the step) -> step 1 closes at 24
+#   step 2: batch 2 would have been ready at 20, lands at 28 (stamped pause 8),
+#           trains 28..34; a 5 s stop-the-world save 34..39 closes the step
+#   step 3: batch 3 would have been ready at 30, lands at 43 (stamped 8 + 5),
+#           trains 43..49
+# No-pause reference run: steps end at 16, 26, 36 -> clean training time 36 s.
+STW_WALL, STW_VALIDATION, STW_SAVE, STW_TRAINING = 49.0, 8.0, 5.0, 36.0
+
+
+def _stop_the_world_schedule(trainer, probe=None):
+    """Drive the schedule above; ``probe(trainer, now)`` is called after each closed step."""
+    _run_step(trainer, consumer_end=10.0, samples=[_sample(10.0)], step_end=24.0, wait_valid=8.0)
+    trainer.rollouter_cumulative_validation_time = 8.0  # what ValidateMetrics carries after the pause
+    if probe:
+        probe(trainer, 24.0)
+    _run_step(trainer, 28.0, [_sample(28.0, validation_pause_before=8.0)], step_end=39.0, save_time=5.0)
+    trainer.cumulative_save_time = 5.0  # what _check_save_checkpoint accumulates
+    if probe:
+        probe(trainer, 39.0)
+    _run_step(trainer, 43.0, [_sample(43.0, validation_pause_before=8.0, checkpoint_pause_before=5.0)], 49.0)
+    if probe:
+        probe(trainer, 49.0)
+    return 49.0
+
+
+def _timing(trainer, now):
+    step_data = {}
+    trainer._add_cumulative_time_metrics(step_data, now=now)
+    return {k[len(TIMING_PREFIX) :]: v for k, v in step_data.items() if k.startswith(TIMING_PREFIX)}
+
+
+def test_stop_the_world_identity_training_equals_wall_minus_validation_minus_save():
+    trainer = _make_trainer(first_sample_time=0.0)
+    now = _stop_the_world_schedule(trainer)
+    t = _timing(trainer, now)
+    assert t["wall_time_since_first_sample"] == STW_WALL
+    assert t["cumulative_validation_time"] == STW_VALIDATION
+    assert t["cumulative_save_time"] == STW_SAVE
+    assert t["cumulative_training_time"] == STW_TRAINING
+    assert abs(t["cumulative_training_time"] - (STW_WALL - STW_VALIDATION - STW_SAVE)) < 1e-6
+
+
+def test_stop_the_world_identity_holds_at_every_step_boundary():
+    """Not just at the end: the per-step logged series must be consistent with the
+    three component series at every point where a step closes."""
+    seen = []
+
+    def probe(trainer, now):
+        t = _timing(trainer, now)
+        seen.append(t["cumulative_training_time"])
+        assert (
+            abs(
+                t["cumulative_training_time"]
+                - (t["wall_time_since_first_sample"] - t["cumulative_validation_time"] - t["cumulative_save_time"])
+            )
+            < 1e-6
+        ), (now, t)
+
+    _stop_the_world_schedule(_make_trainer(first_sample_time=0.0), probe=probe)
+    assert seen == [16.0, 26.0, 36.0], "the no-validation-no-save run's step ends"
+
+
+def test_stop_the_world_totals_match_the_sync_helper():
+    """The sync trainer's compute_cumulative_timing_metrics, fed the same schedule as
+    per-iteration durations, must report the same four totals -- the property that
+    lets sync and async arms share one val-vs-clean-time axis. In the sync trainer
+    generation is part of the step, so each sync 'step' is (generation not hidden
+    by a pause) + training: 10+6, 4+6 and 4+6 seconds here."""
+    from verl.trainer.ppo.metric_utils import compute_cumulative_timing_metrics
+
+    trainer = _make_trainer(first_sample_time=0.0)
+    async_totals = _timing(trainer, _stop_the_world_schedule(trainer))
+
+    state = {}
+    compute_cumulative_timing_metrics(state, {"step": 16.0, "testing": 8.0})
+    compute_cumulative_timing_metrics(state, {"step": 10.0, "save_checkpoint": 5.0})
+    sync_out = compute_cumulative_timing_metrics(state, {"step": 10.0})
+    sync_totals = {k[len(TIMING_PREFIX) :]: v for k, v in sync_out.items()}
+
+    assert (
+        sync_totals
+        == async_totals
+        == {
+            "wall_time_since_first_sample": STW_WALL,
+            "cumulative_validation_time": STW_VALIDATION,
+            "cumulative_save_time": STW_SAVE,
+            "cumulative_training_time": STW_TRAINING,
+        }
+    )
+
+
+def test_overlapped_mode_does_not_claim_the_identity():
+    """Without serialize_validation the trainer keeps training from backlog during a
+    validation (trainer-bound regime): wall time is unchanged by the validation, so
+    wall - validation under-counts and the virtual clock is the only correct source.
+    The metric must come from the virtual clock, not from the subtraction."""
+    trainer = _make_trainer(first_sample_time=0.0, cumulative_validation_time=8.0)
+    _run_step(trainer, consumer_end=6.0, samples=[_sample(6.0)], step_end=16.0)
+    _run_step(trainer, consumer_end=16.0, samples=[_sample(12.0)], step_end=26.0)
+    t = _timing(trainer, 26.0)
+    assert t["cumulative_training_time"] == 26.0
+    assert t["wall_time_since_first_sample"] - t["cumulative_validation_time"] == 18.0  # the naive, wrong answer
