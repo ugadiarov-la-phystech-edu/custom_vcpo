@@ -45,7 +45,7 @@
 #     is present but never binds.
 #   * one weight sync + one old_log_prob pass (2048 seqs) per 4 updates.
 #   * 17,398 prompts / 128 = 135 rollout steps = 540 optimizer updates per
-#     epoch. trainer.test_freq / save_freq count ROLLOUT steps: 3 = every 12
+#     epoch. trainer.test_freq / save_freq count ROLLOUT steps: 2 = every 8
 #     updates. 512 seqs per update / 8 DP ranks = 64 per rank (divisible).
 #
 # OTHER SCHEDULE. AdamW lr 1e-6 constant, no warmup, weight_decay 0.01 (verl's
@@ -67,8 +67,8 @@
 #   * each save writes global_step_N/actor/huggingface/ - config, tokenizer and bf16
 #     safetensors - directly loadable by vLLM / from_pretrained, no merge step. No
 #     optimizer state, no sharded dist_ckpt/ directory at all.
-#   * nothing is rotated away: ~16.4 GB per save for Qwen3-8B; at save_freq=3 over the
-#     135-step epoch that is 45 saves, ~740 GB per epoch. Check free disk before launch
+#   * nothing is rotated away: ~16.4 GB per save for Qwen3-8B; at save_freq=2 over the
+#     135-step epoch that is 67 saves, ~1.1 TB per epoch. Check free disk before launch
 #     (remote_h100 was at 95% on 2026-08-23) and raise save_freq if it is tight.
 #   * the run is NOT resumable: 'hf_model' is written but never read back, so
 #     load_contents would restore nothing. resume_mode=disable makes that explicit,
@@ -227,8 +227,8 @@ val_top_p=${val_top_p:-0.7}
 calculate_log_probs=True
 
 # ================= Trainer =================
-test_freq=${test_freq:-3}    # rollout steps (= 12 optimizer updates)
-save_freq=${save_freq:-3}    # rollout steps
+test_freq=${test_freq:-2}    # rollout steps (= 8 optimizer updates)
+save_freq=${save_freq:-2}    # rollout steps
 total_epochs=${total_epochs:-3}
 val_before_train=${val_before_train:-True}
 # Weights only, in huggingface format: no optimizer state and no merge step
