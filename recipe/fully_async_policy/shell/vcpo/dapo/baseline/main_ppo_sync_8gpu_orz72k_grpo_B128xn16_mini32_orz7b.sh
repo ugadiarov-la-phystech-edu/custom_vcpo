@@ -81,11 +81,12 @@
 #   * each save writes global_step_N/actor/huggingface/ - config, tokenizer and bf16
 #     safetensors - directly loadable by vLLM / from_pretrained, no merge step. No
 #     optimizer state, no sharded dist_ckpt/ directory at all.
-#   * nothing is rotated away: ~15.2 GB per save for ORZ-7B; at save_freq=2 over the
-#     374-step epoch that is 187 saves, ~2.8 TB per epoch. Check free disk before
-#     launch (the shared cloud.ru volume was at 96% on 2026-09-04) and raise
-#     save_freq if it is tight. test_freq=2 (every 8 optimizer updates) matches
-#     the Qwen3-8B reference arm's cadence.
+#   * nothing is rotated away: ~15.2 GB per save for ORZ-7B; at save_freq=5 over the
+#     374-step epoch that is 74 saves, ~1.1 TB per epoch. Check free disk before
+#     launch (the shared cloud.ru volume was at 96% on 2026-09-05) and raise
+#     save_freq if it is tight. test_freq=5 (every 20 optimizer updates, ~22 min
+#     of training at the measured ~4.4 min/step) — the first launch at 2/2 spent
+#     ~25% of wall time on validation+saves and trained flat for 200 updates.
 #   * the run is NOT resumable: 'hf_model' is written but never read back, so
 #     load_contents would restore nothing. resume_mode=disable makes that explicit,
 #     and the trainer refuses the resume combination outright.
@@ -205,8 +206,8 @@ val_temperature=${val_temperature:-1.0}
 calculate_log_probs=True
 
 # ================= Trainer =================
-test_freq=${test_freq:-2}    # rollout steps (= 8 optimizer updates)
-save_freq=${save_freq:-2}    # rollout steps
+test_freq=${test_freq:-5}    # rollout steps (= 20 optimizer updates)
+save_freq=${save_freq:-5}    # rollout steps
 total_epochs=${total_epochs:-3}
 val_before_train=${val_before_train:-True}
 # Weights only, in huggingface format: no optimizer state (fp32 master + 2 adam
