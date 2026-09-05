@@ -108,6 +108,14 @@
 
 set -x
 export VLLM_USE_V1=1
+# vLLM 0.11 auto-selects the FlashInfer top-k/top-p sampler when flashinfer is
+# importable, and flashinfer 0.3.x JIT-compiles it with nvcc on first use — during
+# vLLM's memory-profiling dummy run, i.e. at engine init. The cloud.ru jobs have no
+# nvcc (2026-09-05 launch of this script on remote_2: "FileNotFoundError: 'nvcc'"
+# from flashinfer/jit/cpp_ext.py inside determine_available_memory, before step 1;
+# same failure as the 2026-09-03 Qwen3-8B smoke). The Qwen3-8B sync arm carries the
+# same export; it selects vLLM's native torch sampler instead.
+export VLLM_USE_FLASHINFER_SAMPLER=0
 export PYTHONUNBUFFERED=1
 
 # ================= Paths =================
