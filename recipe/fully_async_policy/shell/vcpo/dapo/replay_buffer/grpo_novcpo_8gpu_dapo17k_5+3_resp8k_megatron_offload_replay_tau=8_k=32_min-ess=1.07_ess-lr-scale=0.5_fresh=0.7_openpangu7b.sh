@@ -133,8 +133,8 @@ save_queue_state=False
 
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
-test_freq=${test_freq:-20}
-save_freq=${save_freq:-20}
+test_freq=${test_freq:-5}
+save_freq=${save_freq:-5}
 max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable
