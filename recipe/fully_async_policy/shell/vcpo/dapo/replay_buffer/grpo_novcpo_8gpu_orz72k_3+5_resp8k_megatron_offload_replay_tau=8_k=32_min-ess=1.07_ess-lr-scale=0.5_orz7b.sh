@@ -10,10 +10,39 @@
 
 # Open-Reasoner-Zero-7B variant of
 #   ..._megatron_offload_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh
-# Every replay, min-ESS, optimizer, parallelism and schedule setting below is
-# byte-identical to that arm; the only differences are the model, the experiment
-# name, the validation sampling, and THE REWARD FUNCTION -- see "ANSWER FORMAT",
-# which is the whole reason this file exists.
+# trained on ORZ's OWN RL data (orz-math-72k) with ORZ-prompt validation sets.
+# Every min-ESS, optimizer and schedule setting below is byte-identical to
+# that arm; the differences are the model, the experiment name, the validation
+# sampling, THE DATASETS (see "DATA"), THE REWARD FUNCTION (see "ANSWER FORMAT"
+# and "REWARD TIERS"), THE GPU LAYOUT (see "LAYOUT") and THE REPLAY DEPTH
+# (see "REPLAY DEPTH").
+#
+# REPLAY DEPTH. tau=8 / k=32, half the twin's tau=16 / k=64. ORZ-7B is a
+# low-entropy, already-RL-tuned checkpoint whose replay arms diverged under
+# deep staleness (the trig=0 arms: seq-ESS at the floor from step 5, grad-norm
+# ramp, terminal entropy explosion) and whose stale unseen-FIFO backlog
+# (staleness ~36 at new_ratio=1) killed the low-entropy arms — see the
+# ORZ-7B post-mortems. Halving both bounds the reuse depth: a staleness-32
+# group carries sampling weight 2^-4 = 1/16 at tau=8, the same weight the
+# twin gives a staleness-64 group, and the buffer holds half as many
+# updates' worth of groups. The rollouter's generation quota
+# (async_training.staleness_threshold) follows k so no group is generated
+# only to be evicted unseen.
+#
+# LAYOUT. 3 rollout + 5 trainer GPUs (the twin runs 5+3). ORZ-7B's responses are
+# short (~2.4k tokens mean on orz-math-72k, <1% at the 8k cap), so generation
+# needs fewer engines while the per-traj update path (micro-batch 1, one
+# sequence per step) is the bottleneck: 5 trainer GPUs at tp=1 give DP=5. The
+# mini-batch therefore moves from 33 to 35 groups (35*16=560 seqs, 112 per
+# rank; mini*n must divide by DP=5 and 528 does not) — the one batch-geometry
+# difference from the twin, chosen as the nearest divisible size. B in the
+# ESS arithmetic below is 560, and all "33" watermark/quota numbers become 35.
+#
+# This is the replay-arm counterpart of the synchronous baseline
+#   recipe/fully_async_policy/shell/vcpo/dapo/baseline/main_ppo_sync_8gpu_orz72k_grpo_B128xn16_mini32_orz7b.sh
+# (branch baselines_main-ppo): same parquets, same data.* prompt handling, same
+# tiered scorer, so prompt processing and reward calculation match that arm
+# exactly; only the training algorithm (replay + min-ESS vs sync PPO) differs.
 #
 # MODEL. Open-Reasoner-Zero/Open-Reasoner-Zero-7B is Qwen2.5-7B RL-tuned with PPO +
 # critic, no KL and no entropy bonus:
@@ -22,17 +51,34 @@
 #   max_position_embeddings 131072, bf16, eos=bos=<|endoftext|>=151643.
 # 'Qwen2ForCausalLM' is registered in verl's mcore registry (verl/models/mcore/registry.py:59,
 # marked "tested"), so strategy=megatron loads it natively -- no re-alias, unlike openPangu,
-# and no trust_remote_code. tp=1/pp=1/dp=3 is unchanged: 28 layers and 4 KV heads divide
+# and no trust_remote_code. tp=1/pp=1 with pure DP: 28 layers and 4 KV heads divide
 # trivially at TP=1. Tokenizer is Qwen2TokenizerFast with len(tokenizer)=151665 < vocab
 # 152064, so vLLM's logits[..., len(tokenizer):] mask is well-formed.
 #
-# PROMPTS. The parquets are byte-identical to the Qwen3-8B arm -- the DAPO wrapper is kept.
-# ORZ's own chat template (shipped in tokenizer_config.json) wraps every prompt in
+# DATA. Training: orz-math-72k.parquet (47,981 rows after conversion, prompt_key=prompt,
+# data_source=math_dapo, reward_model.ground_truth) -- Open-Reasoner-Zero's own RL training
+# set, i.e. what ORZ-7B was already trained on for 700+ steps. Each row's `prompt` column
+# carries ORZ's inner instruction ("You must put your answer inside <answer> </answer>
+# tags ... extracted automatically by the \boxed{} tag. This is the problem: ..."), NOT
+# the DAPO wrapper the Qwen twin trains with; there is no extra prompt code -- the
+# instruction is in the data and the data.* knobs (prompt_key, truncation=left,
+# max_prompt_length=2048, filter_overlong_prompts) are the twin's. ORZ's own chat
+# template (shipped in tokenizer_config.json) then wraps every prompt in
 #   <preamble demanding <think> ... </think> <answer> ... </answer>>
 #   User: {problem}
 #   Assistant: <think>
-# so add_generation_prompt=True primes the model mid-<think>. Prompt lengths are 160-913
-# tokens against max_prompt_length=2048; nothing is dropped.
+# so add_generation_prompt=True primes the model mid-<think>.
+# Validation: aime-2024-orz.parquet / aime-2025-orz.parquet (30 problems x 32 copies each,
+# same ORZ instruction, data_source aime2024_orz / aime2025_orz) -> the metric keys are
+#   val-core/aime2024_orz/acc/mean@1 and val-core/aime2025_orz/acc/mean@1
+# (NOT val-core/math_dapo/... as in the DAPO-17k arms -- plots keyed on the old names
+# will silently skip this run). Both sync ORZ-72k baselines (n=16 and n=32) trained FLAT
+# on this set for 200-540 updates at the 0.168 / 0.16 base level (2026-09-05/06).
+#
+# The 30-problem AIME-2024 measurement below was taken with the DAPO-format parquets
+# (the arm's original data); the ORZ-format sets carry the same problems with ORZ's
+# instruction instead of DAPO's, and the ORZ instruction is what the model was trained
+# on, so the answer-shape conclusions carry over unchanged.
 #
 # ANSWER FORMAT -- MEASURED, NOT ASSUMED. 30 deduplicated AIME-2024 problems, ORZ-7B on
 # one H100 at T=1.0/top_p=1.0, 8192 max tokens, run twice:
@@ -62,6 +108,18 @@
 # pipeline: the UNTRAINED checkpoint validated at 0.2333 (7/30) on these 30 problems,
 # against the offline vLLM probe's 5/30 at the same sampling.
 #
+# REWARD TIERS. dapo-math-17k ground truths are 100% plain integers, so string equality
+# after normalization was enough there. ~24% of the orz-math-72k ground truths are LaTeX
+# expressions (\frac{280}{83}, 8\sqrt{3}, ...), where string equality yields false
+# negatives ORZ's own training never had. The scorer (same file as the baselines_main-ppo
+# sync arm) therefore tries, first hit wins: (1) math_dapo normalized-string equality,
+# (2) ORZ's vendored is_equiv (_strip_string normalization + float compare: 280/83 vs
+# \frac{280}{83}, 0.5 vs \frac{1}{2}, units, percents), (3) ORZ's sympy parse_latex
+# symbolic/numeric equality, run in a forked child under a HARD wall-clock deadline
+# (ORZ_MATH_SYMPY_TIMEOUT, default 1.0 s) and killed on overrun. antlr4 is the wrong
+# version in the cloud.ru env, so tier 3 uses sympy's lark backend (auto-detected);
+# ORZ_MATH_SYMPY_TIER=0 disables the tier. Tiers apply to training AND validation.
+#
 # VALIDATION SAMPLING. val_kwargs is 1.0/1.0 here, not the twin's 0.8/0.7: ORZ was trained
 # and published at its "most basic sampling strategy", and 1.0/1.0 is what the probe used,
 # so the step-0 validation point should land near 5/30 ~ 0.167 on AIME-2024. That makes the
@@ -79,11 +137,11 @@
 # small entropy_coeff if it collapses. Note the min-ESS brake reacts to the ESS floor, not
 # to entropy, so it will not catch a collapse for you.
 #
-# ---- everything below this line is inherited from the Qwen3-8B arm ----
+# ---- everything below this line is inherited from the Qwen3-8B arm (data paths aside) ----
 
 # MIN-ESS-braked replay arm (mbs=1 per-traj path): the ESS brake is a floor
 # detector — brake (lr * ess_lr_scale) only when the mini-batch's global ESS
-# is <= min_ess (1.1) effective samples, i.e. within 10% of the structural
+# is <= min_ess (1.07 here; the twin brakes at 1.1) effective samples, i.e. within 7% of the structural
 # ESS = 1 floor a single dominant sequence produces; all other steps run at
 # FULL nominal lr. Replaces the auto-captured on-policy base + base/3
 # trigger + sqrt rule of the former
@@ -93,13 +151,13 @@
 # backend-independent. NOTE: the removed ess_scaling keys (scaling_rule,
 # base_ess_ratio, trigger_ratio) no longer exist in the dataclass — sibling
 # historical scripts that still set them fail fast at Hydra instantiation.
-# Inherited replay-arm mechanics (trainer-side replay buffer, tau=16,
-# eviction k=64, rmb=1, sync after every update, DAPO insertion gate, frozen
-# advantages / behavior log-probs):
+# Inherited replay-arm mechanics (trainer-side replay buffer, tau=8,
+# eviction k=32 — the twin runs 16/64, see REPLAY DEPTH — rmb=1, sync after
+# every update, DAPO insertion gate, frozen advantages / behavior log-probs):
 #   * update_policy_per_traj=True: every mini-batch's sequence-level IS
 #     ratios against the cached behavior log-probs are DP-all-reduced into
 #     ess_ratio = (sum w)^2 / (B * sum w^2), logged as staleness/ess_ratio
-#     (ESS in effective samples = ess_ratio * B, B = 528 here). This mbs=1
+#     (ESS in effective samples = ess_ratio * B, B = 560 here). This mbs=1
 #     path and the dynbsz arm now share the same max-shifted log-space
 #     computation (verl/workers/utils/ess.py), so ESS is exact at any drift
 #     and floored at 1 — the brake multiplier is exactly ess_lr_scale on
@@ -123,24 +181,26 @@
 #     actor/ess_scaled_lr + staleness/ess_ratio via structured metrics)
 #     every update.
 # Replay-arm notes that still apply:
-#   * Groups staler than replay_buffer.staleness_threshold=64 updates are
+#   * Groups staler than replay_buffer.staleness_threshold=32 updates are
 #     evicted after each update; scores are recomputed each update. With
-#     tau=16 a staleness-64 group still carries sampling weight 2^-4 = 1/16 —
-#     deep replay is intended. The buffer retains every kept group of the
-#     last 64 updates (~1000-1600 groups, roughly 7-12 GB driver RAM and the
-#     same for replay_buffer.pt in checkpoints).
+#     tau=8 a staleness-32 group still carries sampling weight 2^-4 = 1/16 —
+#     the same terminal weight as the twin's tau=16/k=64, at half the depth.
+#     The buffer retains every kept group of the last 32 updates (~500-800
+#     groups, roughly 4-6 GB driver RAM and the same for replay_buffer.pt in
+#     checkpoints).
 #   * Warm-up/watermark: requires_mini_batches=1 — the first update consumes
 #     a fresh mini-batch of unseen groups; afterwards training pauses only
-#     while the buffer holds < 1*33 = 33 groups.
-#   * async_training.staleness_threshold=64 aligns the rollouter's generation
-#     quota with the eviction horizon (33*(64+1)=2145 groups licensed; in
-#     practice a stall backstop — concurrency caps at 165 in-flight).
+#     while the buffer holds < 1*35 = 35 groups.
+#   * async_training.staleness_threshold=32 aligns the rollouter's generation
+#     quota with the eviction horizon (35*(32+1)=1155 groups licensed; in
+#     practice a stall backstop — concurrency caps at 105 in-flight with
+#     3 engines x 35).
 #   * Model versions tick once per UPDATE: test/save freq are in update units.
 #   * serialize_validation=True / pause_generation_during_save=True kept:
 #     stop-the-world validation and checkpoint saves — pure time translations
 #     excluded from cumulative_training_time.
-# Base-script notes that still apply: trainer tp=1/dp=3 (sequence_parallel
-# needs TP>1), 33*16=528 seqs divide by DP=3, HDO full CPU offload with bf16
+# Base-script notes that still apply: trainer tp=1, pure DP (sequence_parallel
+# needs TP>1), 35*16=560 seqs divide by DP=5, HDO full CPU offload with bf16
 # master weights (do NOT swap for use_precision_aware_optimizer without
 # optimizer_cpu_offload: silent stall, probe 2026-07-30). OPOB stays off.
 
@@ -159,22 +219,23 @@ export PYTHONUNBUFFERED=1
 
 # ================= Paths =================
 MODEL_PATH=${MODEL_PATH:-"Open-Reasoner-Zero/Open-Reasoner-Zero-7B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
+# ORZ-prompt parquets (see DATA in the header): ORZ's own RL training set and the
+# AIME-2024/2025 sets rewritten with ORZ's inner instruction, identical to the
+# baselines_main-ppo sync ORZ-72k arm.
+TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/orz-math-72k.parquet"}
 # Two validation sets, reported separately by data_source:
-#   aime-2024.parquet (data_source=math_dapo) -> val-core/math_dapo/acc/mean@1
-#   aime-2025.parquet (data_source=aime2025_dapo) -> val-core/aime2025_dapo/acc/mean@1
-# aime-2025 is built from MathArena/aime_2025 in the exact aime-2024 format
-# (30 problems x 32 copies, same DAPO prompt template and "Answer:"-line
-# scorer via the aime* dispatch), so both metrics measure the same objective;
-# the distinct data_source stamp keeps the 2025 curve separate.
-TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+#   aime-2024-orz.parquet (data_source=aime2024_orz) -> val-core/aime2024_orz/acc/mean@1
+#   aime-2025-orz.parquet (data_source=aime2025_orz) -> val-core/aime2025_orz/acc/mean@1
+# 30 problems x 32 copies each, same ORZ instruction as the training set; the
+# custom scorer ignores data_source, so both are scored by the tag-aware tiers.
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/orz/aime-2024-orz.parquet','/home/jovyan/datasets/math_datasets/orz/aime-2025-orz.parquet']"}
 
 project_name='vcpo'
 
 # ================= GPU Layout =================
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-n_gpus_rollout=${n_gpus_rollout:-5}
+n_gpus_rollout=${n_gpus_rollout:-3} # 3 engines + 5 trainer GPUs, see LAYOUT in the header
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 # ================= Rollout =================
@@ -193,7 +254,7 @@ max_response_length=${max_response_length:-8192}
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 # ================= Megatron Parallelism =================
-train_tp=1 # only valid TP for 3 trainer GPUs (pure DP, no TP comm)
+train_tp=1 # pure DP over the 5 trainer GPUs (no TP comm)
 train_pp=1
 train_cp=1
 sequence_parallel=False # requires TP>1
@@ -203,7 +264,7 @@ precision_dtype="bfloat16"
 # ================= Batch Sizes =================
 train_prompt_bsz=0
 gen_prompt_bsz=1
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3 (528/3=176)
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-35} # 35*16=560 seqs; mini*n must divide by trainer DP=5 (560/5=112); the 5+3 twin runs 33
 micro_bsz_per_gpu=1 # per-traj path REQUIRES micro batch size 1 and use_dynamic_bsz=False
 use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
@@ -221,12 +282,12 @@ use_kl_loss=False
 kl_loss_coef=0.0
 use_kl_in_reward=False
 kl_coef=0.0
-entropy_coeff=0
+entropy_coeff=${entropy_coeff:-0} # env-overridable for the smoke wrapper (reward-independent gradient); the arm runs 0
 calculate_entropy=True # log actor/entropy even with entropy_coeff=0
 grad_clip=1.0
 
 # ================= Optimizer =================
-lr=1e-6
+lr=${lr:-1e-6} # env-overridable for the smoke wrapper; the arm runs 1e-6
 lr_warmup_steps=0
 weight_decay=0.1
 
@@ -243,9 +304,9 @@ ess_enable=${ess_enable:-True}
 # Min-ESS rule (replaces the auto-captured-base + trigger + sqrt logic): a
 # mini-batch whose global ESS carries <= min_ess effective samples steps at
 # lr * ess_lr_scale; above it the update runs at full nominal lr. Equivalent
-# to ess_ratio <= min_ess/B (B = 528 here). No measured reference, no base
+# to ess_ratio <= min_ess/B (B = 560 here). No measured reference, no base
 # capture: the threshold is backend-independent, unlike the auto-base.
-min_ess=${min_ess:-1.1}
+min_ess=${min_ess:-1.07} # the twin: 1.1 — a tighter floor detector, brakes only within 7% of ESS=1
 ess_lr_scale=${ess_lr_scale:-0.5}
 ess_use_clipped=False # ESS from unclipped ratios (paper): the brake must see what truncation hides
 ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
@@ -271,7 +332,7 @@ compute_prox_log_prob=False
 # Generation quota aligned with the replay eviction horizon: groups older
 # than replay_staleness_threshold updates are deleted anyway, so licensing
 # generation beyond it would only produce evicted-unseen waste.
-staleness_threshold=${staleness_threshold:-64.0}
+staleness_threshold=${staleness_threshold:-32.0} # follows replay k (the twin: 64)
 updates_per_param_sync=1     # REQUIRED by replay mode: sync after every update
 num_minibatches_per_update=1 # REQUIRED by replay mode: one mini-batch per update
 partial_rollout=True
@@ -279,8 +340,8 @@ use_rollout_log_probs=True
 
 # ================= Replay buffer =================
 replay_enable=${replay_enable:-True}
-replay_tau=${replay_tau:-16}
-replay_staleness_threshold=${replay_staleness_threshold:-64}
+replay_tau=${replay_tau:-8} # the twin: 16 (see REPLAY DEPTH)
+replay_staleness_threshold=${replay_staleness_threshold:-32} # the twin: 64
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
@@ -322,8 +383,8 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Reward =================
-# Tag-aware scorer for ORZ's <think>/<answer> format -- see the ANSWER FORMAT block in the
-# header for the measurement that forces it. Same {score, acc, pred} contract as
+# Tag-aware, tiered scorer for ORZ's <think>/<answer> format -- see the ANSWER FORMAT and
+# REWARD TIERS blocks in the header. Same {score, acc, pred} contract as
 # verl.utils.reward_score.math_dapo.compute_score, so the reward manager, the rollout dumps
 # and the val-core metric names are all unchanged.
 #
@@ -339,7 +400,7 @@ val_temperature=${val_temperature:-1.0}
 val_top_p=${val_top_p:-1.0}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"

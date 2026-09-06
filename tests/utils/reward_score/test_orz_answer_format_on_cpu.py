@@ -24,6 +24,8 @@ decision rather than a silent reward shift. Nothing here needs the model: the st
 reward manager sees after ``decode(skip_special_tokens=True)``.
 """
 
+import os
+import time
 import unittest
 
 from recipe.fully_async_policy.reward import orz_tag_aware_math as orz
@@ -143,6 +145,161 @@ class TestOrzScorerContract(unittest.TestCase):
 
     def test_latex_ground_truths_normalize_on_both_sides(self):
         self.assertTrue(score("<answer> \\boxed{\\frac{1}{2}} </answer>", ground_truth="\\frac{1}{2}")["acc"])
+
+
+class TestOrzEqualityTierTwo(unittest.TestCase):
+    """ORZ's is_equiv tier (_strip_string + float compare), vendored for the 72k set's
+    LaTeX ground truths -- these pairs FAIL normalized-string equality (tier 1)."""
+
+    def test_slash_fraction_matches_latex_fraction(self):
+        self.assertTrue(score("<answer> \\boxed{280/83} </answer>", ground_truth="\\frac{280}{83}")["acc"])
+
+    def test_decimal_half_matches_latex_half(self):
+        self.assertTrue(score("<answer> \\boxed{0.5} </answer>", ground_truth="\\frac{1}{2}")["acc"])
+
+    def test_float_equal_decimals_match(self):
+        self.assertTrue(score("<answer> \\boxed{2.0} </answer>", ground_truth="2")["acc"])
+
+    def test_percent_sign_is_stripped(self):
+        self.assertTrue(score("<answer> \\boxed{45\\%} </answer>", ground_truth="45")["acc"])
+
+    def test_right_units_are_stripped(self):
+        self.assertTrue(score("<answer> \\boxed{5\\text{ cm}} </answer>", ground_truth="5")["acc"])
+
+    def test_left_right_and_spacing_normalize(self):
+        self.assertTrue(
+            score(
+                "<answer> \\boxed{(3, \\frac{\\pi}{2})} </answer>",
+                ground_truth="\\left( 3, \\frac{\\pi}{2} \\right)",
+            )["acc"]
+        )
+
+    def test_wrong_fraction_stays_wrong(self):
+        self.assertFalse(score("<answer> \\boxed{281/83} </answer>", ground_truth="\\frac{280}{83}")["acc"])
+
+    def test_is_equiv_directly(self):
+        self.assertTrue(orz._is_equiv_orz("\\frac{280}{83}", "280/83"))
+        self.assertFalse(orz._is_equiv_orz("\\frac{280}{83}", "280/84"))
+
+
+class TestOrzEqualityTierThree(unittest.TestCase):
+    """The sympy parse_latex tier (symbolic/numeric equality). Skipped when no latex
+    parser backend (antlr4/lark) is importable."""
+
+    def setUp(self):
+        if not orz._sympy_tier_enabled():
+            self.skipTest("no sympy latex parser backend available")
+
+    def test_unreduced_fraction_matches(self):
+        # tier 1: strings differ; tier 2: no float parse, strings differ; tier 3: 2/4 == 1/2
+        self.assertTrue(score("<answer> \\boxed{\\frac{2}{4}} </answer>", ground_truth="\\frac{1}{2}")["acc"])
+
+    def test_radical_forms_match(self):
+        self.assertTrue(score("<answer> \\boxed{\\sqrt{8}} </answer>", ground_truth="2\\sqrt{2}")["acc"])
+
+    def test_non_equal_pairs_stay_non_equal(self):
+        self.assertFalse(score("<answer> \\boxed{\\frac{1}{3}} </answer>", ground_truth="\\frac{1}{4}")["acc"])
+
+    def test_length_guard_rejects_long_inputs(self):
+        long_expr = "1+" * 100 + "1"
+        self.assertFalse(orz._is_latex_equal(long_expr, long_expr))
+
+    def test_flag_off_disables_the_tier(self):
+        import os
+
+        saved_state, saved_env = orz._sympy_tier_state, os.environ.get("ORZ_MATH_SYMPY_TIER")
+        try:
+            orz._sympy_tier_state = None
+            os.environ["ORZ_MATH_SYMPY_TIER"] = "0"
+            self.assertFalse(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+        finally:
+            orz._sympy_tier_state = saved_state
+            if saved_env is None:
+                os.environ.pop("ORZ_MATH_SYMPY_TIER", None)
+            else:
+                os.environ["ORZ_MATH_SYMPY_TIER"] = saved_env
+
+
+def _sleeping_worker(str1, str2, backend, send_conn):
+    """A worker that never answers -- stands in for a pathological evalf hang."""
+    import time
+
+    time.sleep(60)
+
+
+def _raising_worker(str1, str2, backend, send_conn):
+    raise RuntimeError("boom")
+
+
+def _crashing_worker(str1, str2, backend, send_conn):
+    import os
+
+    os._exit(1)
+
+
+class TestSympyTierHardTimeout(unittest.TestCase):
+    """The 2026-08-30 remote_mary stall: parse_latex/evalf can burn CPU for minutes on
+    short inputs; the tier must be bounded by a KILLED fork child, never waited on.
+    The worker is monkeypatched module-side -- fork children inherit the patch."""
+
+    def setUp(self):
+        if not orz._sympy_tier_enabled():
+            self.skipTest("no sympy latex parser backend available")
+        self._saved_worker = orz._latex_equal_worker
+        self._saved_timeout = os.environ.get("ORZ_MATH_SYMPY_TIMEOUT")
+
+    def tearDown(self):
+        orz._latex_equal_worker = self._saved_worker
+        if self._saved_timeout is None:
+            os.environ.pop("ORZ_MATH_SYMPY_TIMEOUT", None)
+        else:
+            os.environ["ORZ_MATH_SYMPY_TIMEOUT"] = self._saved_timeout
+
+    def test_hanging_comparison_returns_false_within_the_deadline(self):
+        orz._latex_equal_worker = _sleeping_worker
+        os.environ["ORZ_MATH_SYMPY_TIMEOUT"] = "0.5"
+        start = time.monotonic()
+        self.assertFalse(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 5.0, f"hard timeout did not bound the call ({elapsed:.1f}s)")
+
+    def test_timeout_env_override_is_respected(self):
+        orz._latex_equal_worker = _sleeping_worker
+        os.environ["ORZ_MATH_SYMPY_TIMEOUT"] = "0.2"
+        start = time.monotonic()
+        orz._is_latex_equal("1", "1")
+        self.assertLess(time.monotonic() - start, 3.0)
+
+    def test_raising_worker_returns_false(self):
+        orz._latex_equal_worker = _raising_worker
+        self.assertFalse(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+
+    def test_hard_crashing_worker_returns_false(self):
+        orz._latex_equal_worker = _crashing_worker
+        self.assertFalse(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+
+    def test_real_equivalence_still_passes_through_the_subprocess(self):
+        # No monkeypatch: the genuine worker, via fork + pipe + deadline.
+        self.assertTrue(orz._is_latex_equal("\\frac{2}{4}", "\\frac{1}{2}"))
+        self.assertFalse(orz._is_latex_equal("\\frac{1}{3}", "\\frac{1}{4}"))
+
+
+class TestOrzEqualityEdgeCases(unittest.TestCase):
+    def test_empty_ground_truth_never_matches(self):
+        self.assertFalse(score("<answer> \\boxed{} </answer>", ground_truth="")["acc"])
+        self.assertFalse(score("<answer> 42 </answer>", ground_truth=" ")["acc"])
+
+    def test_unparseable_response_never_reaches_the_tiers(self):
+        self.assertFalse(score("no tags, no markers, just prose", ground_truth="\\frac{1}{2}")["acc"])
+
+    def test_integer_fast_path_unchanged(self):
+        # dapo17k/AceReason regression: integers short-circuit at tier 1.
+        self.assertTrue(score("<answer> \\boxed{42} </answer>", ground_truth="42")["acc"])
+        self.assertFalse(score("<answer> \\boxed{43} </answer>", ground_truth="42")["acc"])
+
+    def test_verbal_ground_truth_exact_match_still_possible(self):
+        gt = "Jenna will win"
+        self.assertTrue(score(f"<answer> {gt} </answer>", ground_truth=gt)["acc"])
 
 
 if __name__ == "__main__":
