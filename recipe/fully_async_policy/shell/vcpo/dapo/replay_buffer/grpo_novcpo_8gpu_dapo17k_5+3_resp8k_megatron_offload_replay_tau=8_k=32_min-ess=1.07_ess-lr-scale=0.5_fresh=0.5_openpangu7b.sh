@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=grpo-novcpo-replay-ess-fresh0.7-openpangu7b
+#SBATCH --job-name=grpo-novcpo-replay-ess-fresh0.5-openpangu7b
 
 set -xeuo pipefail
 
@@ -118,7 +118,7 @@ replay_sampling_seed=${replay_sampling_seed:-1234}
 replay_reuse_halflife=${replay_reuse_halflife:-1}
 replay_reuse_tag=""
 if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${replay_reuse_halflife}"; fi
-replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.7}
+replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}
 replay_fresh_tag=""
 if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
 replay_save_state=False
