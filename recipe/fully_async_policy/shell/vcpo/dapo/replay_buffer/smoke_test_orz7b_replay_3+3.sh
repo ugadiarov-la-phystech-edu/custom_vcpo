@@ -14,11 +14,12 @@
 # long as the buffer holds >= requires_mini_batches x mini_bsz groups, and only stops once the
 # rollouter is done AND eviction (staleness > replay_buffer.staleness_threshold, staleness =
 # current_version - group_version) has drained the buffer below that watermark. With the arm's
-# k=64 a 3-prompt smoke would therefore run ~65 updates. So:
+# k=32 a 3-prompt smoke would therefore run ~33 updates. So:
 #
 #   * ONE fresh mini-batch: total_rollout_steps = 3 = mini_bsz 3 x require_batches 1, n=2
 #     -> 6 sequences per update, divisible by trainer DP=3 (tp=pp=1).
-#   * replay_staleness_threshold=1 (the ONLY replay knob changed; tau stays 16):
+#   * replay_staleness_threshold=1 (the ONLY replay knob changed; tau stays 8, reuse_halflife stays 1
+#     — inert here, no group is ever drawn with times_trained > 1):
 #       update 1 trains the 3 fresh version-0 groups         -> version 1, staleness 1, kept
 #       update 2 is a PURE-REPLAY mini-batch of those groups  -> version 2, staleness 2 > 1, evicted
 #       buffer 0 < watermark 3 and the rollouter is finished  -> the fit loop exits.

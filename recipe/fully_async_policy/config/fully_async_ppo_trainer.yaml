@@ -101,6 +101,15 @@ async_training:
     # Score half-life in model updates: score = 2^(-group_staleness / tau)
     tau: 4.0
 
+    # Reuse-decay half-life in TRAININGS (null = off): the replay draw weight
+    # becomes 2^(-staleness/tau) * 2^(-times_trained/reuse_halflife). It cannot
+    # change the mean number of trainings per group (fixed at mini-batch groups
+    # per update / kept groups arriving per update) but removes both tails of
+    # the reuse distribution and makes replayed picks younger
+    # (REPLAY_REUSE_PENALTY_DISCUSSION.md). ~1 for low-entropy models; 0.5 is
+    # the near-round-robin end; null keeps the staleness-only draw bit-for-bit
+    reuse_halflife: null
+
     # Evict groups whose version < current_model_version - staleness_threshold
     # (measured in model updates; align async_training.staleness_threshold
     # with this so generation is not licensed beyond what eviction keeps)

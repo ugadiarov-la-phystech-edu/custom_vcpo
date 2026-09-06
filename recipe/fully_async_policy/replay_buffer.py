@@ -31,6 +31,17 @@ unseen FIFO backlog whose head is many updates old — nominally "new"
 mini-batches were ~36 updates stale in the ORZ-7B run, which drove the
 off-policy collapse. With one-shot freshness the queue delay of prioritized
 data is bounded by a single update.
+
+Reuse decay (optional, ``reuse_halflife``): the replay draw can additionally
+down-weight groups by how often they were already trained on,
+``weight = 2^(-staleness/tau) * 2^(-times_trained/reuse_halflife)``. This
+cannot change the MEAN number of trainings per group — that is fixed by the
+economics, mini-batch groups consumed per update / kept groups arriving per
+update — but it removes both tails of the reuse distribution (groups trained
+4+ times, groups evicted after a single training) and, because the
+most-trained groups are the oldest, makes the replayed picks younger
+(REPLAY_REUSE_PENALTY_DISCUSSION.md). ``None`` keeps the staleness-only draw
+bit-for-bit.
 """
 
 from dataclasses import dataclass
@@ -60,6 +71,18 @@ def staleness_score(staleness: int, tau: float) -> float:
     return float(2.0 ** (-float(staleness) / float(tau)))
 
 
+def reuse_score(times_trained: int, reuse_halflife: Optional[float]) -> float:
+    """Reuse decay factor 2^(-times_trained / reuse_halflife); 1.0 when the decay is off."""
+    if reuse_halflife is None:
+        return 1.0
+    return float(2.0 ** (-float(times_trained) / float(reuse_halflife)))
+
+
+def sampling_weight(entry: "GroupEntry", reuse_halflife: Optional[float]) -> float:
+    """The replay-draw weight of one entry: staleness score times the reuse decay."""
+    return float(entry.score) * reuse_score(entry.times_trained, reuse_halflife)
+
+
 class ReplayBuffer:
     """Version-aware group buffer: add / compose / evict / rescore / mark-trained.
 
@@ -68,11 +91,26 @@ class ReplayBuffer:
     stores what the trainer has already drained.
     """
 
-    def __init__(self, tau: float, staleness_threshold: int, seed: int = 1234):
+    def __init__(
+        self,
+        tau: float,
+        staleness_threshold: int,
+        seed: int = 1234,
+        reuse_halflife: Optional[float] = None,
+    ):
         assert tau > 0, f"replay_buffer.tau must be positive, got {tau}"
         assert staleness_threshold >= 0, f"replay_buffer.staleness_threshold must be >= 0, got {staleness_threshold}"
         self.tau = float(tau)
         self.staleness_threshold = int(staleness_threshold)
+        # Reuse decay half-life in trainings (None / <= 0 = off). Config-driven
+        # only: never persisted, never restored.
+        if reuse_halflife is not None and float(reuse_halflife) > 0:
+            assert np.isfinite(float(reuse_halflife)), (
+                f"replay_buffer.reuse_halflife must be finite, got {reuse_halflife}"
+            )
+            self.reuse_halflife: Optional[float] = float(reuse_halflife)
+        else:
+            self.reuse_halflife = None
         self.rng = np.random.default_rng(seed)
         self.entries: list[GroupEntry] = []
         # Groups added since the last composition, in arrival order. Cleared
@@ -83,6 +121,9 @@ class ReplayBuffer:
         self.total_added = 0
         self.evicted_total = 0
         self.evicted_unseen_total = 0
+        # Groups evicted after exactly one training: under-used data, the
+        # other tail the reuse decay is meant to remove.
+        self.evicted_trained_once_total = 0
 
     # ---------------- mutation ----------------
 
@@ -111,11 +152,14 @@ class ReplayBuffer:
         kept: list[GroupEntry] = []
         evicted = 0
         evicted_unseen = 0
+        evicted_trained_once = 0
         for entry in self.entries:
             if entry.staleness(current_version) > self.staleness_threshold:
                 evicted += 1
                 if entry.times_trained == 0:
                     evicted_unseen += 1
+                elif entry.times_trained == 1:
+                    evicted_trained_once += 1
             else:
                 kept.append(entry)
         self.entries = kept
@@ -124,6 +168,7 @@ class ReplayBuffer:
             self.pending_fresh = [e for e in self.pending_fresh if id(e) in kept_ids]
         self.evicted_total += evicted
         self.evicted_unseen_total += evicted_unseen
+        self.evicted_trained_once_total += evicted_trained_once
         return evicted, evicted_unseen
 
     def recompute_scores(self, current_version: int) -> None:
@@ -150,8 +195,10 @@ class ReplayBuffer:
         reach the eviction horizon untrained (visible as evicted_unseen).
         The remainder is sampled without replacement from the non-selected
         groups with probability proportional to their staleness-decayed
-        score. Returned entries are ordered fresh-first, so
-        ``selected[:info["n_new"]]`` is exactly the fresh prefix.
+        score times the optional reuse decay (``sampling_weight``). Returned
+        entries are ordered fresh-first, so ``selected[:info["n_new"]]`` is
+        exactly the fresh prefix; ``info["times_trained"]`` carries each
+        selected entry's count BEFORE this composition's training.
         """
         if len(self.entries) < mini_size:
             raise ValueError(
@@ -166,7 +213,7 @@ class ReplayBuffer:
         if n_fill > 0:
             selected_set = set(id(e) for e in selected)
             pool = [e for e in self.entries if id(e) not in selected_set]
-            weights = np.asarray([e.score for e in pool], dtype=np.float64)
+            weights = np.asarray([sampling_weight(e, self.reuse_halflife) for e in pool], dtype=np.float64)
             total = weights.sum()
             if not np.isfinite(total) or total <= 0.0:
                 # All scores underflowed (extreme staleness): fall back to uniform.
@@ -180,6 +227,7 @@ class ReplayBuffer:
             "n_new": n_fresh,
             "n_replayed": mini_size - n_fresh,
             "staleness": staleness,
+            "times_trained": [e.times_trained for e in selected],
         }
         return selected, info
 
@@ -193,6 +241,9 @@ class ReplayBuffer:
 
     def staleness_list(self, current_version: int) -> list[int]:
         return [e.staleness(current_version) for e in self.entries]
+
+    def times_trained_list(self) -> list[int]:
+        return [e.times_trained for e in self.entries]
 
     def max_staleness(self, current_version: int) -> Optional[int]:
         if not self.entries:
@@ -209,6 +260,7 @@ class ReplayBuffer:
             "total_added": self.total_added,
             "evicted_total": self.evicted_total,
             "evicted_unseen_total": self.evicted_unseen_total,
+            "evicted_trained_once_total": self.evicted_trained_once_total,
             "rng_state": self.rng.bit_generator.state,
             "pending_seqs": [e.insert_seq for e in self.pending_fresh],
             "entries": [
@@ -224,11 +276,12 @@ class ReplayBuffer:
         }
 
     def load_state_dict(self, state: dict) -> None:
-        # tau / staleness_threshold stay config-driven; only dynamic state is restored.
+        # tau / staleness_threshold / reuse_halflife stay config-driven; only dynamic state is restored.
         self._next_insert_seq = int(state.get("next_insert_seq", 0))
         self.total_added = int(state.get("total_added", 0))
         self.evicted_total = int(state.get("evicted_total", 0))
         self.evicted_unseen_total = int(state.get("evicted_unseen_total", 0))
+        self.evicted_trained_once_total = int(state.get("evicted_trained_once_total", 0))
         rng_state = state.get("rng_state")
         if rng_state is not None:
             self.rng.bit_generator.state = rng_state

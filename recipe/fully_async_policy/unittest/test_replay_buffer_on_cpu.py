@@ -39,7 +39,13 @@ from recipe.fully_async_policy.detach_utils import RolloutSample, ValidateMetric
 from recipe.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter as _RollouterActor
 from recipe.fully_async_policy.fully_async_trainer import FullyAsyncTrainer as _TrainerActor
 from recipe.fully_async_policy.message_queue import MessageQueue as _MessageQueueActor
-from recipe.fully_async_policy.replay_buffer import GroupEntry, ReplayBuffer, staleness_score
+from recipe.fully_async_policy.replay_buffer import (
+    GroupEntry,
+    ReplayBuffer,
+    reuse_score,
+    sampling_weight,
+    staleness_score,
+)
 from verl.protocol import DataProto
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 
@@ -59,8 +65,8 @@ def _sample(group_version=0):
     return SimpleNamespace(group_version=group_version)
 
 
-def _make_buffer(tau=4.0, staleness_threshold=8, seed=1234):
-    return ReplayBuffer(tau=tau, staleness_threshold=staleness_threshold, seed=seed)
+def _make_buffer(tau=4.0, staleness_threshold=8, seed=1234, **kwargs):
+    return ReplayBuffer(tau=tau, staleness_threshold=staleness_threshold, seed=seed, **kwargs)
 
 
 # ---------------------------------------------------------------- score & add
@@ -102,6 +108,19 @@ def test_evict_boundary_and_unseen_counting():
     remaining = {e.insert_seq for e in buf.entries}
     assert remaining == {at_threshold.insert_seq, fresh.insert_seq}
     assert buf.evicted_total == 2 and buf.evicted_unseen_total == 1
+    assert buf.evicted_trained_once_total == 1  # over_trained was trained exactly once
+
+
+def test_evict_counts_trained_once_separately_from_unseen_and_multi():
+    buf = _make_buffer(staleness_threshold=0)
+    once = buf.add(_sample(group_version=0), current_version=0)
+    twice = buf.add(_sample(group_version=0), current_version=0)
+    buf.add(_sample(group_version=0), current_version=0)  # never trained
+    buf.mark_trained([once, twice])
+    buf.mark_trained([twice])
+    evicted, evicted_unseen = buf.evict(current_version=1)
+    assert (evicted, evicted_unseen) == (3, 1)
+    assert buf.evicted_trained_once_total == 1
 
 
 def test_evict_purges_pending_fresh():
@@ -237,6 +256,142 @@ def test_compose_sampling_prefers_high_scores():
     assert picks[0] > 190  # ~1000:1 odds per draw
 
 
+# ---------------------------------------------------------------- reuse decay
+
+
+def test_reuse_score_halves_every_halflife_and_is_one_when_off():
+    assert reuse_score(0, 2.0) == 1.0
+    assert reuse_score(2, 2.0) == pytest.approx(0.5)
+    assert reuse_score(4, 2.0) == pytest.approx(0.25)
+    assert reuse_score(7, 1.0) == pytest.approx(2.0**-7)
+    assert reuse_score(100, None) == 1.0
+
+
+def test_sampling_weight_is_staleness_score_times_reuse_score():
+    entry = GroupEntry(sample=_sample(), group_version=0, score=0.5, insert_seq=0, times_trained=3)
+    assert sampling_weight(entry, None) == pytest.approx(0.5)
+    assert sampling_weight(entry, 1.0) == pytest.approx(0.5 * 2.0**-3)
+    assert sampling_weight(entry, 3.0) == pytest.approx(0.25)
+
+
+def test_reuse_halflife_off_is_the_default_and_rejects_non_positive_or_non_finite():
+    assert _make_buffer().reuse_halflife is None
+    assert _make_buffer(reuse_halflife=None).reuse_halflife is None
+    assert _make_buffer(reuse_halflife=0).reuse_halflife is None  # <= 0 means off
+    assert _make_buffer(reuse_halflife=-1.0).reuse_halflife is None
+    assert _make_buffer(reuse_halflife=2).reuse_halflife == 2.0
+    with pytest.raises(AssertionError, match="finite"):
+        _make_buffer(reuse_halflife=float("inf"))
+
+
+def _fill_mixed_pool(buf, n=12, current_version=10):
+    """A pool with a spread of staleness AND reuse counts, freshness consumed."""
+    entries = [
+        buf.add(_sample(group_version=current_version - (i % 5)), current_version=current_version) for i in range(n)
+    ]
+    buf.compose_minibatch(n, current_version=current_version)  # consume freshness (all-fresh mini-batch)
+    for i, e in enumerate(entries):
+        for _ in range(i % 4):
+            buf.mark_trained([e])
+    return entries
+
+
+def _draw_sequence(buf, compositions=20, mini=4, current_version=10):
+    out = []
+    for _ in range(compositions):
+        selected, _info = buf.compose_minibatch(mini, current_version=current_version)
+        out.append([e.insert_seq for e in selected])
+    return out
+
+
+def test_reuse_halflife_off_reproduces_exact_draws():
+    """The knob defaults to off; off must be bit-for-bit today's staleness-only draw, and an enormous
+    half-life must converge to it (the decay factor -> 1)."""
+    baseline = _make_buffer(seed=3)
+    explicit_off = _make_buffer(seed=3, reuse_halflife=None)
+    limit = _make_buffer(seed=3, reuse_halflife=1e12)
+    for b in (baseline, explicit_off, limit):
+        _fill_mixed_pool(b)
+    reference = _draw_sequence(baseline)  # drawn once: each call advances that buffer's rng
+    assert _draw_sequence(explicit_off) == reference
+    assert _draw_sequence(limit) == reference
+
+
+def test_reuse_halflife_changes_the_draws_when_on():
+    baseline, decayed = _make_buffer(seed=3), _make_buffer(seed=3, reuse_halflife=1.0)
+    _fill_mixed_pool(baseline)
+    _fill_mixed_pool(decayed)
+    assert _draw_sequence(baseline) != _draw_sequence(decayed)
+
+
+def test_reuse_penalty_prefers_less_trained_at_equal_staleness():
+    """Mirror of test_compose_sampling_prefers_high_scores: same staleness, one group already
+    trained three times -> at nu=1 its weight is 1/8 of the untrained twin's."""
+    picks = {"untrained": 0, "trained3": 0}
+    for trial in range(300):
+        buf = _make_buffer(tau=4.0, staleness_threshold=100, seed=trial, reuse_halflife=1.0)
+        untrained = buf.add(_sample(group_version=10), current_version=10)
+        trained3 = buf.add(_sample(group_version=10), current_version=10)
+        buf.compose_minibatch(2, current_version=10)  # consume freshness
+        for _ in range(3):
+            buf.mark_trained([trained3])
+        selected, _ = buf.compose_minibatch(1, current_version=10)
+        picks["untrained" if selected[0] is untrained else "trained3"] += 1
+    # expected 8:1 odds -> ~33 of 300 for the trained group
+    assert 10 <= picks["trained3"] <= 65, picks
+
+
+def test_reuse_penalty_composes_with_staleness():
+    """One training at nu=1 costs the same weight as tau updates of age: a stale-but-untrained
+    group (staleness 4 = tau, score 2^-1) and a fresh-but-trained-once group (staleness 0, decay
+    2^-1) carry equal weight and split the draws ~50/50."""
+    picks = {"stale_untrained": 0, "fresh_trained": 0}
+    for trial in range(400):
+        buf = _make_buffer(tau=4.0, staleness_threshold=100, seed=trial, reuse_halflife=1.0)
+        stale_untrained = buf.add(_sample(group_version=6), current_version=10)
+        fresh_trained = buf.add(_sample(group_version=10), current_version=10)
+        buf.compose_minibatch(2, current_version=10)
+        buf.mark_trained([fresh_trained])
+        w_stale = sampling_weight(stale_untrained, buf.reuse_halflife)
+        w_fresh = sampling_weight(fresh_trained, buf.reuse_halflife)
+        assert w_stale == pytest.approx(w_fresh)
+        selected, _ = buf.compose_minibatch(1, current_version=10)
+        picks["stale_untrained" if selected[0] is stale_untrained else "fresh_trained"] += 1
+    assert 150 <= picks["stale_untrained"] <= 250, picks
+
+
+def test_reuse_penalty_never_starves_the_draw():
+    """Heavily re-trained pools still fill the mini-batch: the decay shrinks weights, never zeroes
+    them, and the existing underflow fallback covers the extreme."""
+    buf = _make_buffer(tau=1.0, staleness_threshold=10**6, seed=0, reuse_halflife=0.5)
+    entries = [buf.add(_sample(group_version=0), current_version=0) for _ in range(4)]
+    buf.compose_minibatch(4, current_version=0)
+    for _ in range(10):
+        buf.mark_trained(entries)
+    selected, info = buf.compose_minibatch(3, current_version=0)
+    assert len(selected) == 3 and info["n_replayed"] == 3
+    # underflow of BOTH factors -> uniform fallback still fills
+    buf.recompute_scores(current_version=5000)
+    for _ in range(3000):
+        buf.mark_trained(entries)
+    selected, info = buf.compose_minibatch(3, current_version=5000)
+    assert len(selected) == 3 and info["n_replayed"] == 3
+
+
+def test_compose_info_reports_times_trained_before_marking():
+    buf = _make_buffer(seed=1)
+    a = buf.add(_sample(group_version=0), current_version=0)
+    b = buf.add(_sample(group_version=0), current_version=0)
+    _, info = buf.compose_minibatch(2, current_version=0)
+    assert info["times_trained"] == [0, 0]
+    buf.mark_trained([a, b])
+    buf.mark_trained([a])
+    selected, info = buf.compose_minibatch(2, current_version=0)
+    assert info["times_trained"] == [e.times_trained for e in selected]
+    assert sorted(info["times_trained"]) == [1, 2]
+    assert buf.times_trained_list() == [2, 1]
+
+
 def test_compose_uniform_fallback_when_scores_underflow():
     buf = _make_buffer(tau=1.0, staleness_threshold=10**6)
     used = [buf.add(_sample(group_version=0), current_version=0) for _ in range(3)]
@@ -273,6 +428,7 @@ def test_state_dict_roundtrip_restores_entries_counters_and_rng():
     assert restored.untrained_count() == buf.untrained_count()
     assert restored.total_added == buf.total_added
     assert restored.evicted_total == buf.evicted_total
+    assert restored.evicted_trained_once_total == buf.evicted_trained_once_total
     assert [e.insert_seq for e in restored.entries] == [e.insert_seq for e in buf.entries]
     assert [e.score for e in restored.entries] == [e.score for e in buf.entries]
     assert [e.times_trained for e in restored.entries] == [e.times_trained for e in buf.entries]
@@ -282,6 +438,32 @@ def test_state_dict_roundtrip_restores_entries_counters_and_rng():
     sel_rest, info_rest = restored.compose_minibatch(4, current_version=8)
     assert [e.insert_seq for e in sel_orig] == [e.insert_seq for e in sel_rest]
     assert info_orig["n_new"] == info_rest["n_new"] == 1
+
+
+def test_reuse_halflife_stays_config_driven_across_restore():
+    """The half-life is a config knob like tau: a checkpoint written with one value must not
+    override the value the resumed run was launched with; the restored counts DO feed the weights."""
+    buf = _make_buffer(seed=7, reuse_halflife=1.0)
+    entries = [buf.add(_sample(group_version=8), current_version=8) for _ in range(4)]
+    buf.compose_minibatch(4, current_version=8)
+    buf.mark_trained(entries[:2])
+    state = ray.cloudpickle.loads(ray.cloudpickle.dumps(buf.state_dict()))
+    assert "reuse_halflife" not in state
+
+    restored_off = _make_buffer(seed=7)
+    restored_off.load_state_dict(state)
+    assert restored_off.reuse_halflife is None
+    restored_on = _make_buffer(seed=7, reuse_halflife=1.0)
+    restored_on.load_state_dict(state)
+    assert restored_on.reuse_halflife == 1.0
+    weights_on = [sampling_weight(e, restored_on.reuse_halflife) for e in restored_on.entries]
+    weights_off = [sampling_weight(e, restored_off.reuse_halflife) for e in restored_off.entries]
+    assert weights_on[:2] == pytest.approx([w / 2 for w in weights_off[:2]])
+    assert weights_on[2:] == pytest.approx(weights_off[2:])
+    # the original and its exact restore draw identically
+    sel_a, _ = buf.compose_minibatch(2, current_version=8)
+    sel_b, _ = restored_on.compose_minibatch(2, current_version=8)
+    assert [e.insert_seq for e in sel_a] == [e.insert_seq for e in sel_b]
 
 
 def test_load_state_dict_tolerates_legacy_is_new_payload():
@@ -452,9 +634,9 @@ class _QueueStub:
         return (self.blocking.pop(0), 0)
 
 
-def _make_replay_trainer(mini_size, requires_mini_batches, available=None, blocking=None):
+def _make_replay_trainer(mini_size, requires_mini_batches, available=None, blocking=None, reuse_halflife=None):
     t = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
-    t.replay_buffer = ReplayBuffer(tau=4.0, staleness_threshold=100, seed=0)
+    t.replay_buffer = ReplayBuffer(tau=4.0, staleness_threshold=100, seed=0, reuse_halflife=reuse_halflife)
     t.replay_updates_done = 0
     t.replay_requires_mini_batches = float(requires_mini_batches)
     t.required_samples = mini_size
@@ -614,6 +796,34 @@ def test_add_replay_metrics_reports_buffer_and_minibatch_stats():
     assert metrics["replay/minibatch_staleness_hist"] == [0, 0, 2, 4]
     assert metrics["replay/buffer_staleness_hist"] == [0, 0, 2, 4]
     assert "replay/ess_scaled_lr" not in metrics  # standard update path: no staleness/ess entries
+    # legacy info without times_trained: no per-mini-batch reuse stats, buffer-wide ones still present
+    assert "replay/minibatch_times_trained_mean" not in metrics
+    assert metrics["replay/minibatch_times_trained_hist"] == []
+    assert metrics["replay/buffer_times_trained_mean"] == 0.0
+    assert metrics["replay/evicted_trained_once_cum"] == 0
+
+
+def test_add_replay_metrics_reports_times_trained_stats():
+    trainer = _make_replay_trainer(mini_size=3, requires_mini_batches=1, reuse_halflife=1.0)
+    buf = trainer.replay_buffer
+    entries = [buf.add(_sample(group_version=9), current_version=10) for _ in range(4)]
+    buf.compose_minibatch(4, current_version=10)
+    buf.mark_trained(entries)
+    buf.mark_trained(entries[:2])
+    buf.add(_sample(group_version=0), current_version=10)  # will be evicted below, trained once
+    old = buf.entries[-1]
+    buf.mark_trained([old])
+    buf.staleness_threshold = 5
+    buf.evict(current_version=10)
+    selected, info = buf.compose_minibatch(3, current_version=10)
+    metrics = {}
+    trainer._add_replay_metrics(metrics, info, new_version=10)
+    counts = [e.times_trained for e in selected]
+    assert metrics["replay/minibatch_times_trained_hist"] == counts
+    assert metrics["replay/minibatch_times_trained_mean"] == pytest.approx(np.mean(counts))
+    assert metrics["replay/minibatch_times_trained_max"] == max(counts)
+    assert metrics["replay/buffer_times_trained_mean"] == pytest.approx(np.mean([2, 2, 1, 1]))
+    assert metrics["replay/evicted_trained_once_cum"] == 1
 
 
 def test_add_replay_metrics_surfaces_mean_ess_scaled_lr():
@@ -827,6 +1037,26 @@ def test_replay_save_state_defaults_to_true_in_recipe_configs():
         assert cfg.async_training.replay_buffer.save_state is True, name
 
 
+def test_reuse_halflife_defaults_to_null_in_recipe_configs():
+    # Off by default in both recipes: every existing replay arm keeps its draws bit-for-bit.
+    import os
+
+    cfg_dir = os.path.join(os.path.dirname(__file__), "..", "config")
+    for name in ("fully_async_ppo_trainer.yaml", "fully_async_ppo_megatron_trainer.yaml"):
+        cfg = OmegaConf.load(os.path.join(cfg_dir, name))
+        assert cfg.async_training.replay_buffer.reuse_halflife is None, name
+
+
+def test_trainer_reads_reuse_halflife_from_config():
+    """The config value must reach the buffer (float), and null must mean off. Source-inspected: the
+    class is a ray actor, so __init__.__code__ points at ray's tracing wrapper, not this module."""
+    import os
+
+    src = open(os.path.join(os.path.dirname(__file__), "..", "fully_async_trainer.py")).read()
+    assert 'replay_cfg.get("reuse_halflife", None)' in src
+    assert "reuse_halflife=self.replay_reuse_halflife" in src
+
+
 def test_add_replay_metrics_reports_scaled_lr_not_base():
     trainer = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
     for _ in range(2):
@@ -918,6 +1148,7 @@ def test_tb_staleness_histograms_logged_to_tensorboard_backend_only():
     structured = {
         "replay/minibatch_staleness_hist": [0, 1, 2],
         "replay/buffer_staleness_hist": [1, 1, 4, 4],
+        "replay/minibatch_times_trained_hist": [1, 3, 1],
         "staleness/ess": [{"minibatch_ess": 1.0}],  # unrelated structured key ignored
     }
     trainer = _make_hist_trainer(["console", "tensorboard"], structured)
@@ -928,6 +1159,7 @@ def test_tb_staleness_histograms_logged_to_tensorboard_backend_only():
     assert data == {
         "replay/minibatch_staleness_hist": [0.0, 1.0, 2.0],
         "replay/buffer_staleness_hist": [1.0, 1.0, 4.0, 4.0],
+        "replay/minibatch_times_trained_hist": [1.0, 3.0, 1.0],
     }
 
 

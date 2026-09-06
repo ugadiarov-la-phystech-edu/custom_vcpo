@@ -164,6 +164,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         if self.replay_enable:
             self.replay_tau = float(replay_cfg.get("tau", 4.0))
             self.replay_staleness_threshold = int(replay_cfg.get("staleness_threshold", 8))
+            # Reuse-decay half-life in trainings (null = staleness-only draw);
+            # see replay_buffer.py / REPLAY_REUSE_PENALTY_DISCUSSION.md.
+            _reuse_halflife = replay_cfg.get("reuse_halflife", None)
+            self.replay_reuse_halflife = float(_reuse_halflife) if _reuse_halflife is not None else None
             # May be fractional (e.g. 1.5): the pause watermark is
             # requires_mini_batches * mini_size groups. The first composition
             # then happens on an all-pending buffer, so the first mini-batch
@@ -200,6 +204,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 tau=self.replay_tau,
                 staleness_threshold=self.replay_staleness_threshold,
                 seed=self.replay_sampling_seed,
+                reuse_halflife=self.replay_reuse_halflife,
             )
             self.replay_updates_done = 0
             self.rollout_done = False
@@ -633,6 +638,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         structured-metrics path (wandb images when enabled; scalars always)."""
         minibatch_staleness = info["staleness"]
         buffer_staleness = self.replay_buffer.staleness_list(new_version)
+        # Reuse counts of the selected groups BEFORE this update's training
+        # (compose_minibatch stamps them); the buffer-wide list is post-update.
+        minibatch_times_trained = list(info.get("times_trained", []))
+        buffer_times_trained = self.replay_buffer.times_trained_list()
         metrics.update(
             {
                 "replay/buffer_size": self.replay_buffer.size(),
@@ -645,14 +654,21 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 "replay/minibatch_staleness_max": float(np.max(minibatch_staleness)),
                 "replay/evicted_cum": self.replay_buffer.evicted_total,
                 "replay/evicted_unseen_cum": self.replay_buffer.evicted_unseen_total,
+                "replay/evicted_trained_once_cum": self.replay_buffer.evicted_trained_once_total,
                 "replay/total_added": self.replay_buffer.total_added,
                 # Histograms (lists -> structured metrics, not scalar-reduced)
                 "replay/minibatch_staleness_hist": [int(s) for s in minibatch_staleness],
                 "replay/buffer_staleness_hist": [int(s) for s in buffer_staleness],
+                "replay/minibatch_times_trained_hist": [int(t) for t in minibatch_times_trained],
             }
         )
         if buffer_staleness:
             metrics["replay/buffer_staleness_mean"] = float(np.mean(buffer_staleness))
+        if minibatch_times_trained:
+            metrics["replay/minibatch_times_trained_mean"] = float(np.mean(minibatch_times_trained))
+            metrics["replay/minibatch_times_trained_max"] = float(np.max(minibatch_times_trained))
+        if buffer_times_trained:
+            metrics["replay/buffer_times_trained_mean"] = float(np.mean(buffer_times_trained))
         # Per-traj actor updates report the effective (possibly ESS-scaled) lr
         # per mini-batch in the structured staleness/ess entries; surface the
         # mean next to the replay metrics so the brake is visible on the same
@@ -664,7 +680,11 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         if scaled_lrs:
             metrics["replay/ess_scaled_lr"] = float(np.mean(scaled_lrs))
 
-    REPLAY_HIST_KEYS = ("replay/minibatch_staleness_hist", "replay/buffer_staleness_hist")
+    REPLAY_HIST_KEYS = (
+        "replay/minibatch_staleness_hist",
+        "replay/buffer_staleness_hist",
+        "replay/minibatch_times_trained_hist",
+    )
 
     def _log_tb_staleness_histograms(self, step: int):
         """Send the raw per-group staleness lists to the tensorboard backend

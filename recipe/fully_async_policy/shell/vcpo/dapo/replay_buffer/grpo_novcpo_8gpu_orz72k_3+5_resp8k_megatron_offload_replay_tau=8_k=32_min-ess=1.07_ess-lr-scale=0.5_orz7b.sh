@@ -29,6 +29,19 @@
 # (async_training.staleness_threshold) follows k so no group is generated
 # only to be evicted unseen.
 #
+# REUSE DECAY. replay_buffer.reuse_halflife=1 (the twin runs none): the replay
+# draw weight is 2^(-staleness/tau) * 2^(-times_trained/1), so each training
+# halves a group's chance of being drawn again. This cannot change the mean
+# number of trainings per group (fixed at mini-batch groups per update / kept
+# groups arriving per update) but removes both tails — groups trained 4+ times
+# and groups evicted after a single training — and makes the replayed picks
+# younger (simulated on this geometry: replayed staleness mean 10 -> 8,
+# REPLAY_REUSE_PENALTY_DISCUSSION.md). nu=1 keeps a mild preference for
+# re-drawing the freshest groups; 0.5 is the near-round-robin end. Watch
+# replay/minibatch_times_trained_{mean,max,hist} and
+# replay/evicted_trained_once_cum; the penalty only acts once
+# replay/minibatch_new_ratio drops below 1.
+#
 # LAYOUT. 3 rollout + 5 trainer GPUs (the twin runs 5+3). ORZ-7B's responses are
 # short (~2.4k tokens mean on orz-math-72k, <1% at the 8k cap), so generation
 # needs fewer engines while the per-traj update path (micro-batch 1, one
@@ -344,6 +357,8 @@ replay_tau=${replay_tau:-8} # the twin: 16 (see REPLAY DEPTH)
 replay_staleness_threshold=${replay_staleness_threshold:-32} # the twin: 64
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
+# Reuse-decay half-life in trainings (see REUSE DECAY in the header); null = staleness-only draw
+replay_reuse_halflife=${replay_reuse_halflife:-1}
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
@@ -400,7 +415,7 @@ val_temperature=${val_temperature:-1.0}
 val_top_p=${val_top_p:-1.0}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife} ess-${ess_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -561,5 +576,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
+    async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
