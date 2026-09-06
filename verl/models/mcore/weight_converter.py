@@ -49,6 +49,11 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         elif "self_attention.linear_proj.weight" in name:
             convert_names.append(f"model.layers.{layer_number}.self_attn.o_proj.weight")
             assert len(params) == 1
+        elif "self_attention.linear_proj.bias" in name:
+            # add_bias_linear=True for an HF attention_bias=True checkpoint (re-aliased openPangu):
+            # o_proj.bias is a real HF/vLLM parameter and must be synced.
+            convert_names.append(f"model.layers.{layer_number}.self_attn.o_proj.bias")
+            assert len(params) == 1
         elif "self_attention.linear_qkv.layer_norm_weight" in name:
             convert_names.append(f"model.layers.{layer_number}.input_layernorm.weight")
             assert len(params) == 1
@@ -79,6 +84,11 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         elif "mlp.linear_fc2.weight" in name:
             convert_names.append(f"model.layers.{layer_number}.mlp.down_proj.weight")
             assert len(params) == 1
+        elif "mlp.linear_fc1.bias" in name or "mlp.linear_fc2.bias" in name:
+            # Side effect of add_bias_linear=True (needed for o_proj.bias): Megatron also gives both
+            # MLP projections a bias. The HF model has mlp_bias=False, so vLLM has no such tensors;
+            # the biases are frozen at zero (model_initializer.freeze_absent_mlp_biases) and skipped.
+            return [], []
         else:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
         return convert_names, params

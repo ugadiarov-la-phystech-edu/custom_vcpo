@@ -437,6 +437,16 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 f"{layer_name}.self_attn.o_proj.weight",
                 chunk_dim=1,
             )
+            # HF attention_bias=True (e.g. re-aliased openPangu) also carries o_proj.bias. Megatron
+            # allocates it through add_bias_linear (config_converter.py); the RowParallel bias is
+            # full hidden size on every TP rank, so it is a plain broadcast, not a shard. The MLP
+            # biases add_bias_linear creates alongside are deliberately NOT loaded: HF has none,
+            # they stay at their zero init and are frozen by DenseModel.initialize.
+            if f"{layer_name}.self_attn.o_proj.bias" in state_dict:
+                _broadcast_tensor(
+                    sync_layer.self_attention.linear_proj.bias if dst_pp_rank == pp_rank else None,
+                    f"{layer_name}.self_attn.o_proj.bias",
+                )
             _broadcast_tensor(
                 sync_layer.mlp.linear_fc1.layer_norm_weight if dst_pp_rank == pp_rank else None,
                 f"{layer_name}.post_attention_layernorm.weight",

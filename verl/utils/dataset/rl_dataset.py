@@ -30,6 +30,7 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
+from verl.utils.dataset.prompt_utils import maybe_prepend_bos
 from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,9 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        # See verl/utils/dataset/prompt_utils.py: prepend BOS for add_bos_token tokenizers whose
+        # template does not emit it (openPangu). Default False = today's behaviour.
+        self.add_bos_token_to_prompt = bool(config.get("add_bos_token_to_prompt", False))
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_schemas = None
@@ -237,6 +241,16 @@ class RLHFDataset(Dataset):
                         if self.tool_schemas is not None:
                             apply_kwargs["tools"] = self.tool_schemas
 
+                        if self.add_bos_token_to_prompt:
+                            # Count the BOS __getitem__ will prepend, so the filter and the
+                            # truncation agree on the length. Token-identical to the default
+                            # path otherwise (apply_chat_template(tokenize=True) is
+                            # encode(add_special_tokens=False) of the rendered text).
+                            raw_prompt = tokenizer.apply_chat_template(
+                                doc[prompt_key], add_generation_prompt=True, tokenize=False, **apply_kwargs
+                            )
+                            prompt_ids = tokenizer.encode(raw_prompt, add_special_tokens=False)
+                            return len(maybe_prepend_bos(tokenizer, raw_prompt, prompt_ids, True))
                         return len(
                             tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, **apply_kwargs)
                         )
@@ -366,6 +380,13 @@ class RLHFDataset(Dataset):
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
+            if self.add_bos_token_to_prompt:
+                # Same decision as the agent loops (prompt_utils.maybe_prepend_bos), applied before
+                # padding/truncation so max_prompt_length and the overlong filter count the BOS.
+                with_bos = maybe_prepend_bos(self.tokenizer, raw_prompt, input_ids[0].tolist(), True)
+                if len(with_bos) != input_ids.shape[1]:
+                    input_ids = torch.tensor([with_bos], dtype=input_ids.dtype)
+                    attention_mask = torch.ones_like(input_ids)
 
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
@@ -417,6 +438,7 @@ class RLHFDataset(Dataset):
         row_dict["position_ids"] = position_ids[0]
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        raw_prompt_ids = maybe_prepend_bos(self.tokenizer, raw_prompt, raw_prompt_ids, self.add_bos_token_to_prompt)
         if len(raw_prompt_ids) > self.max_prompt_length:
             if self.truncation == "left":
                 raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]

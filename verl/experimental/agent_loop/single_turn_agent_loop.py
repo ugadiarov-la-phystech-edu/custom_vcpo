@@ -18,6 +18,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.utils.dataset.prompt_utils import maybe_prepend_bos
 from verl.utils.profiler import simple_timer
 
 logger = logging.getLogger(__file__)
@@ -33,6 +34,17 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
         self.response_length = self.config.actor_rollout_ref.rollout.response_length
         self.apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        # Must agree with RLHFDataset (same flag, same helper), or the dataset's prompt lengths
+        # and the generated prompts would differ by one token.
+        self.add_bos_token_to_prompt = bool(self.config.data.get("add_bos_token_to_prompt", False))
+
+    def _tokenize_prompt(self, messages) -> list[int]:
+        """Rendered-template tokenization, with the optional BOS the dataset side also applies."""
+        raw_prompt = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+        )
+        prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        return maybe_prepend_bos(self.tokenizer, raw_prompt, prompt_ids, self.add_bos_token_to_prompt)
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
@@ -55,12 +67,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
             model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
             prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
         else:
-            prompt_ids = await self.loop.run_in_executor(
-                None,
-                lambda: self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=True, **self.apply_chat_template_kwargs
-                ),
-            )
+            # Render to text and encode(add_special_tokens=False): token-identical to the previous
+            # apply_chat_template(tokenize=True), plus the optional BOS (data.add_bos_token_to_prompt).
+            prompt_ids = await self.loop.run_in_executor(None, lambda: self._tokenize_prompt(messages))
 
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
