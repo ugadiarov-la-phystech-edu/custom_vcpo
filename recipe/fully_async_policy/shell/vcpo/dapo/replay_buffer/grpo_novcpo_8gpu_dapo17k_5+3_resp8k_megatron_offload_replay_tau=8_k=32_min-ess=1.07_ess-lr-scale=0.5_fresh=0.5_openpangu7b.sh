@@ -428,9 +428,16 @@ resume_mode=${resume_mode:-auto} # the base: disable
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos"}
 exp_name_safe=${exp_name//\//_}
-log_dir="logs/${exp_name_safe}"
-CKPTS_DIR="${log_dir}"
-mkdir -p -- "${log_dir}"
+# LOCATIONS, env-overridable. log_dir: TensorBoard (log_dir/tensorboard) and the rollout /
+# validation dumps (trainer.rollout_data_dir). CKPTS_DIR (trainer.default_local_dir): the
+# global_step_N/ checkpoints — hf exports at every save plus the newest full resumable one
+# (see CHECKPOINTS). Both default to logs/<exp_name> under the launch directory (the repo
+# root); absolute paths are fine, e.g. CKPTS_DIR on a volume with more room than the shared
+# filesystem. resume_mode=auto looks for a previous run in CKPTS_DIR, so keep it stable
+# across relaunches of the same exp_name.
+log_dir=${log_dir:-"logs/${exp_name_safe}"}
+CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
+mkdir -p -- "${log_dir}" "${CKPTS_DIR}"
 export TENSORBOARD_DIR="${log_dir}/tensorboard"
 
 trainer_logger="['console','tensorboard']"
