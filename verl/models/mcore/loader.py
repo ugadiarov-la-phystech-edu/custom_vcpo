@@ -437,6 +437,11 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 f"{layer_name}.self_attn.o_proj.weight",
                 chunk_dim=1,
             )
+            if f"{layer_name}.self_attn.o_proj.bias" in state_dict:
+                _broadcast_tensor(
+                    sync_layer.self_attention.linear_proj.bias if dst_pp_rank == pp_rank else None,
+                    f"{layer_name}.self_attn.o_proj.bias",
+                )
             _broadcast_tensor(
                 sync_layer.mlp.linear_fc1.layer_norm_weight if dst_pp_rank == pp_rank else None,
                 f"{layer_name}.post_attention_layernorm.weight",

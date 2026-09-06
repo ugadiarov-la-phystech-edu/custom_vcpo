@@ -49,6 +49,9 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         elif "self_attention.linear_proj.weight" in name:
             convert_names.append(f"model.layers.{layer_number}.self_attn.o_proj.weight")
             assert len(params) == 1
+        elif "self_attention.linear_proj.bias" in name:
+            convert_names.append(f"model.layers.{layer_number}.self_attn.o_proj.bias")
+            assert len(params) == 1
         elif "self_attention.linear_qkv.layer_norm_weight" in name:
             convert_names.append(f"model.layers.{layer_number}.input_layernorm.weight")
             assert len(params) == 1
@@ -79,6 +82,8 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         elif "mlp.linear_fc2.weight" in name:
             convert_names.append(f"model.layers.{layer_number}.mlp.down_proj.weight")
             assert len(params) == 1
+        elif "mlp.linear_fc1.bias" in name or "mlp.linear_fc2.bias" in name:
+            return [], []
         else:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
         return convert_names, params
