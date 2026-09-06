@@ -45,7 +45,7 @@ REPLAY = os.path.join(REPO_ROOT, "recipe/fully_async_policy/shell/vcpo/dapo/repl
 QWEN = "grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh"
 PANGU = QWEN.replace("tau=16_k=64_min-ess=1.1", "tau=8_k=32_min-ess=1.07").replace(".sh", "_openpangu7b.sh")
 SMOKE_3P3 = "smoke_test_openpangu7b_replay_3+3.sh"
-PANGU_FRESH = PANGU.replace("_openpangu7b.sh", "_fresh=0.7_openpangu7b.sh")
+PANGU_FRESH = PANGU.replace("_openpangu7b.sh", "_fresh=0.5_openpangu7b.sh")
 REALIASED_MODEL = "/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"
 
 _COMPOSED = {}
@@ -245,18 +245,18 @@ class TestOpenPanguReplayArmConfig(unittest.TestCase):
 
 
 class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
-    """The fresh=0.7 variant is the base arm plus exactly one knob: the trainer waits for
-    ceil(0.7 x mini) groups arrived from the rollouter since the last composition."""
+    """The fresh=0.5 variant is the base arm plus exactly one knob: the trainer waits for
+    ceil(0.5 x mini) groups arrived from the rollouter since the last composition."""
 
     @classmethod
     def setUpClass(cls):
         cls.base = compose(PANGU)
         cls.cfg = compose(PANGU_FRESH)
 
-    def test_gate_is_on_at_0_7_and_tagged(self):
-        self.assertAlmostEqual(self.cfg.async_training.replay_buffer.min_fresh_ratio, 0.7)
+    def test_gate_is_on_at_0_5_and_tagged(self):
+        self.assertAlmostEqual(self.cfg.async_training.replay_buffer.min_fresh_ratio, 0.5)
         self.assertEqual(self.base.async_training.replay_buffer.min_fresh_ratio, 0)
-        self.assertIn(" nu-1 fresh-0.7 ", self.cfg.trainer.experiment_name)
+        self.assertIn(" nu-1 fresh-0.5 ", self.cfg.trainer.experiment_name)
         self.assertNotIn("fresh-", self.base.trainer.experiment_name)
 
     def test_everything_else_equals_the_base(self):
@@ -269,12 +269,12 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         a["async_training"]["replay_buffer"].pop("min_fresh_ratio")
         b["async_training"]["replay_buffer"].pop("min_fresh_ratio")
         a_text = json.dumps(a, sort_keys=True)
-        self.assertIn(" fresh-0.7", a_text)
-        self.assertEqual(json.loads(a_text.replace(" fresh-0.7", "")), b)
+        self.assertIn(" fresh-0.5", a_text)
+        self.assertEqual(json.loads(a_text.replace(" fresh-0.5", "")), b)
 
     def test_knob_stays_env_overridable(self):
         text = script_text(PANGU_FRESH)
-        self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.7}", text)
+        self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}", text)
         self.assertIn("FRESH-SHARE GATE", text)
 
 

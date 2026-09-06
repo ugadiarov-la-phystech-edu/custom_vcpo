@@ -6,31 +6,35 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=grpo-novcpo-replay-ess-fresh0.7-openpangu7b
+#SBATCH --job-name=grpo-novcpo-replay-ess-fresh0.5-openpangu7b
 
 # FRESH-SHARE-GATED variant of the openPangu-Embedded-7B MEGATRON replay / min-ESS arm
 #   ..._replay_tau=8_k=32_min-ess=1.07_ess-lr-scale=0.5_openpangu7b.sh
-# (the base). The ONLY difference is replay_buffer.min_fresh_ratio=0.7 (base: 0,
-# never wait) and the ` fresh-0.7` tag in the experiment name; everything else —
+# (the base). The ONLY difference is replay_buffer.min_fresh_ratio=0.5 (base: 0,
+# never wait) and the ` fresh-0.5` tag in the experiment name; everything else —
 # model, BOS, trust flags, data, objective, layout, replay depth, brake, reuse
 # decay, lr, validation — is the base's, so the two runs differ in exactly one knob.
 #
-# FRESH-SHARE GATE. With f=0.7 and mini-batch 33 the trainer does not run an update
-# until ceil(0.7 x 33) = 24 groups have ARRIVED FROM THE ROLLOUTER since the previous
+# FRESH-SHARE GATE. With f=0.5 and mini-batch 33 the trainer does not run an update
+# until ceil(0.5 x 33) = 17 groups have ARRIVED FROM THE ROLLOUTER since the previous
 # mini-batch was composed (the fresh prefix of the next mini-batch; untrained groups
 # already in the buffer do not count — they lost their one-shot freshness). Why:
 # the FSDP2 openPangu replay arm's fresh share sank from ~0.4 to 0 as arrivals fell
 # to ~2 per update, and the unbraked Qwen replay arm recovered from its blow-up only
 # during runs of fresh-dominated updates (share 0.7-1.0) while stalling at 0.2-0.3.
-# The gate is a throttle: mean trainings per group become ~1/f = 1.4 instead of M/A,
+# The gate is a throttle: mean trainings per group become ~1/f = 2 instead of M/A,
 # and the trainer idles ~f x M/A - 1 update-times per update (at the FSDP2 arm's
-# mid-run 9 arrivals/update: ~1.6 update-times of idle per update; at its late 2.2:
-# ~10). Waiting does not age the fresh groups (no version is produced meanwhile) and
-# it shortens their arrival lag (fresh groups arrive 4-6 versions old on the 5+3
-# geometry because an 8k rollout spans several updates). The wait is capped by
-# replay_buffer.min_fresh_wait_timeout_s (yaml default 3600 s, more than the ~35 min
-# a late-run wait would take here); on the cap the update runs anyway and
-# replay/fresh_floor_waived logs 1. Watch replay/minibatch_new_ratio (>= 0.73 by
+# mid-run 9 arrivals/update: ~0.9 update-times of idle per update; at its late 2.2:
+# ~7). MEASURED at f=0.7 on this geometry (2026-09-06, updates 1-10): floor 24, gate
+# waits of 85-276 s against 175-215 s of actor work, trainer idle ratio alternating
+# between ~0 and 0.4-0.55 (mean ~0.3, ~40-45 % more wall time per update than the
+# base) for mean reuse ~1.3; f=0.5 here trades part of that idle for reuse ~2, the
+# regime of the no-knee Qwen k-2 ppo-epochs-2 arms. Waiting does not age the fresh
+# groups (no version is produced meanwhile) and it shortens their arrival lag (fresh
+# groups arrived 1-3 versions old under the gate vs 4-6 without). The wait is capped
+# by replay_buffer.min_fresh_wait_timeout_s (yaml default 3600 s, more than the
+# ~25 min a late-run wait would take here); on the cap the update runs anyway and
+# replay/fresh_floor_waived logs 1. Watch replay/minibatch_new_ratio (>= 0.52 by
 # construction), replay/minibatch_fresh_staleness_mean, replay/fresh_wait_s and
 # fully_async/timing/cumulative_training_time (the idle is charged to it, correctly).
 # Compare against the base at equal cumulative_training_time, not equal update count.
@@ -361,7 +365,7 @@ if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${repl
 # (yaml default 3600 s; on the cap the update runs anyway and
 # replay/fresh_floor_waived logs 1). Fresh groups are NOT on-policy — a long
 # rollout spans several updates — so watch replay/minibatch_fresh_staleness_mean.
-replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.7} # the base: 0 (see FRESH-SHARE GATE)
+replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5} # the base: 0 (see FRESH-SHARE GATE)
 replay_fresh_tag=""
 if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
