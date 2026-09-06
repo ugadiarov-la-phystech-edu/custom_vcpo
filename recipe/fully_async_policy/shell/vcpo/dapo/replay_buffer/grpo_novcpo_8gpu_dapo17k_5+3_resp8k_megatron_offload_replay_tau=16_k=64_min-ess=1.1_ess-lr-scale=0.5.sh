@@ -107,6 +107,9 @@ replay_tau=${replay_tau:-16}
 replay_staleness_threshold=${replay_staleness_threshold:-64}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
+replay_reuse_halflife=${replay_reuse_halflife:-null}
+replay_reuse_tag=""
+if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${replay_reuse_halflife}"; fi
 replay_save_state=False
 
 dynamic_filtering_enable=False
@@ -125,7 +128,7 @@ max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -282,5 +285,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
+    async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"

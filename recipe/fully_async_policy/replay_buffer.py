@@ -34,12 +34,35 @@ def staleness_score(staleness: int, tau: float) -> float:
     return float(2.0 ** (-float(staleness) / float(tau)))
 
 
+def reuse_score(times_trained: int, reuse_halflife: Optional[float]) -> float:
+    if reuse_halflife is None:
+        return 1.0
+    return float(2.0 ** (-float(times_trained) / float(reuse_halflife)))
+
+
+def sampling_weight(entry: "GroupEntry", reuse_halflife: Optional[float]) -> float:
+    return float(entry.score) * reuse_score(entry.times_trained, reuse_halflife)
+
+
 class ReplayBuffer:
-    def __init__(self, tau: float, staleness_threshold: int, seed: int = 1234):
+    def __init__(
+        self,
+        tau: float,
+        staleness_threshold: int,
+        seed: int = 1234,
+        reuse_halflife: Optional[float] = None,
+    ):
         assert tau > 0, f"replay_buffer.tau must be positive, got {tau}"
         assert staleness_threshold >= 0, f"replay_buffer.staleness_threshold must be >= 0, got {staleness_threshold}"
         self.tau = float(tau)
         self.staleness_threshold = int(staleness_threshold)
+        if reuse_halflife is not None and float(reuse_halflife) > 0:
+            assert np.isfinite(float(reuse_halflife)), (
+                f"replay_buffer.reuse_halflife must be finite, got {reuse_halflife}"
+            )
+            self.reuse_halflife: Optional[float] = float(reuse_halflife)
+        else:
+            self.reuse_halflife = None
         self.rng = np.random.default_rng(seed)
         self.entries: list[GroupEntry] = []
         self.pending_fresh: list[GroupEntry] = []
@@ -47,6 +70,7 @@ class ReplayBuffer:
         self.total_added = 0
         self.evicted_total = 0
         self.evicted_unseen_total = 0
+        self.evicted_trained_once_total = 0
 
     def add(self, sample: Any, current_version: int) -> GroupEntry:
         group_version = int(getattr(sample, "group_version", 0))
@@ -66,11 +90,14 @@ class ReplayBuffer:
         kept: list[GroupEntry] = []
         evicted = 0
         evicted_unseen = 0
+        evicted_trained_once = 0
         for entry in self.entries:
             if entry.staleness(current_version) > self.staleness_threshold:
                 evicted += 1
                 if entry.times_trained == 0:
                     evicted_unseen += 1
+                elif entry.times_trained == 1:
+                    evicted_trained_once += 1
             else:
                 kept.append(entry)
         self.entries = kept
@@ -79,6 +106,7 @@ class ReplayBuffer:
             self.pending_fresh = [e for e in self.pending_fresh if id(e) in kept_ids]
         self.evicted_total += evicted
         self.evicted_unseen_total += evicted_unseen
+        self.evicted_trained_once_total += evicted_trained_once
         return evicted, evicted_unseen
 
     def recompute_scores(self, current_version: int) -> None:
@@ -103,7 +131,7 @@ class ReplayBuffer:
         if n_fill > 0:
             selected_set = set(id(e) for e in selected)
             pool = [e for e in self.entries if id(e) not in selected_set]
-            weights = np.asarray([e.score for e in pool], dtype=np.float64)
+            weights = np.asarray([sampling_weight(e, self.reuse_halflife) for e in pool], dtype=np.float64)
             total = weights.sum()
             if not np.isfinite(total) or total <= 0.0:
                 probs = np.full(len(pool), 1.0 / len(pool))
@@ -116,6 +144,7 @@ class ReplayBuffer:
             "n_new": n_fresh,
             "n_replayed": mini_size - n_fresh,
             "staleness": staleness,
+            "times_trained": [e.times_trained for e in selected],
         }
         return selected, info
 
@@ -127,6 +156,9 @@ class ReplayBuffer:
 
     def staleness_list(self, current_version: int) -> list[int]:
         return [e.staleness(current_version) for e in self.entries]
+
+    def times_trained_list(self) -> list[int]:
+        return [e.times_trained for e in self.entries]
 
     def max_staleness(self, current_version: int) -> Optional[int]:
         if not self.entries:
@@ -141,6 +173,7 @@ class ReplayBuffer:
             "total_added": self.total_added,
             "evicted_total": self.evicted_total,
             "evicted_unseen_total": self.evicted_unseen_total,
+            "evicted_trained_once_total": self.evicted_trained_once_total,
             "rng_state": self.rng.bit_generator.state,
             "pending_seqs": [e.insert_seq for e in self.pending_fresh],
             "entries": [
@@ -160,6 +193,7 @@ class ReplayBuffer:
         self.total_added = int(state.get("total_added", 0))
         self.evicted_total = int(state.get("evicted_total", 0))
         self.evicted_unseen_total = int(state.get("evicted_unseen_total", 0))
+        self.evicted_trained_once_total = int(state.get("evicted_trained_once_total", 0))
         rng_state = state.get("rng_state")
         if rng_state is not None:
             self.rng.bit_generator.state = rng_state

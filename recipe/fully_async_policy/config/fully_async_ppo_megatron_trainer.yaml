@@ -57,6 +57,8 @@ async_training:
 
     tau: 4.0
 
+    reuse_halflife: null
+
     staleness_threshold: 8
 
     requires_mini_batches: 2

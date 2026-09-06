@@ -216,6 +216,15 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         self.assertAlmostEqual(compose(QWEN).actor_rollout_ref.actor.ess_scaling.min_ess, 1.1)
         self.assertIn("min-ess-1.07", self.cfg.trainer.experiment_name)
 
+    def test_reuse_halflife_is_one_and_the_twin_has_none(self):
+        """The reuse decay (REPLAY_REUSE_PENALTY_DISCUSSION.md) is on for this arm at nu=1 and off
+        (null) for the Qwen twin, whose draws must stay bit-for-bit what they were."""
+        self.assertEqual(self.cfg.async_training.replay_buffer.reuse_halflife, 1)
+        self.assertIn(" nu-1 ", self.cfg.trainer.experiment_name)
+        qwen = compose(QWEN)
+        self.assertIsNone(qwen.async_training.replay_buffer.reuse_halflife)
+        self.assertNotIn("nu-", qwen.trainer.experiment_name)
+
     def test_replay_depth_is_half_the_twins(self):
         """tau=8 / k=32 against the twin's 16 / 64: the ORZ-7B post-mortems tie its divergences to
         deep staleness, so this arm halves the reuse depth while keeping the terminal sampling
@@ -388,6 +397,11 @@ class TestOrzReplaySmoke3plus3(unittest.TestCase):
         self.assertIs(rb.enable, True)
         self.assertEqual(rb.staleness_threshold, 1)
         self.assertEqual(rb.tau, compose(ORZ).async_training.replay_buffer.tau)
+
+    def test_inherits_the_arms_reuse_decay(self):
+        """nu=1 is inert in a 2-update smoke (no group is drawn with times_trained > 1) but the
+        wrapper must not silently override it either."""
+        self.assertEqual(self.cfg.async_training.replay_buffer.reuse_halflife, 1)
 
     def test_batch_divides_across_the_trainer_gpus(self):
         cfg = self.cfg

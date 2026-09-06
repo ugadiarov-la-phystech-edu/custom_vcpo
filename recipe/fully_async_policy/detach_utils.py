@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import time
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -285,6 +285,7 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
     replay_hist_keys = {
         "replay/minibatch_staleness_hist": "Mini-batch group staleness",
         "replay/buffer_staleness_hist": "Replay buffer group staleness",
+        "replay/minibatch_times_trained_hist": "Mini-batch group prior trainings",
     }
     for key, title in replay_hist_keys.items():
         values = structured_metrics.get(key)
@@ -410,7 +411,7 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
                     olp = getattr(rec, "old_log_probs", None)
 
                 if isinstance(rlp, list) and isinstance(olp, list):
-                    for old_lp, rollout_lp in zip(olp, rlp):
+                    for old_lp, rollout_lp in zip(olp, rlp, strict=False):
                         if old_lp is not None and rollout_lp is not None:
                             old_probs.append(float(np.exp(float(old_lp))))
                             rollout_probs.append(float(np.exp(float(rollout_lp))))
@@ -435,6 +436,7 @@ def process_structured_metrics(structured_metrics: dict[str, list], allow_media:
                 plt.close(fig)
 
     return payload
+
 
 class MetricsAggregator:
     """Metrics aggregator, used to combine metrics from multiple training steps"""
@@ -472,7 +474,9 @@ class MetricsAggregator:
             ],
         }
 
-    def add_step_metrics(self, metrics: dict[str, Any], sample_count: int, timestamp: float = None, structured_metrics: dict = None):
+    def add_step_metrics(
+        self, metrics: dict[str, Any], sample_count: int, timestamp: float = None, structured_metrics: dict = None
+    ):
         """Adding a single-step metrics"""
         if timestamp is None:
             timestamp = time.time()
@@ -489,7 +493,7 @@ class MetricsAggregator:
                 self.metric_values[key].append(float(value.item()))
             elif structured_metrics is not None:
                 if isinstance(value, list):
-                    structured_metrics[key].extend(value) # Concat list[dict] together 
+                    structured_metrics[key].extend(value)  # Concat list[dict] together
                 else:
                     structured_metrics[key].append(value)
         return structured_metrics

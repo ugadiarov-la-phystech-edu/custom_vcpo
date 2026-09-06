@@ -107,6 +107,7 @@ replay_tau=${replay_tau:-8}
 replay_staleness_threshold=${replay_staleness_threshold:-32}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
+replay_reuse_halflife=${replay_reuse_halflife:-1}
 replay_save_state=False
 
 dynamic_filtering_enable=False
@@ -132,7 +133,7 @@ reward_fn_name=${reward_fn_name:-"compute_score"}
 val_temperature=${val_temperature:-1.0}
 val_top_p=${val_top_p:-1.0}
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife} ess-${ess_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -291,5 +292,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
+    async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
