@@ -155,6 +155,14 @@ class TestOpenPanguReplayArmConfig(unittest.TestCase):
         self.assertNotIn("Qwen3-8B", name)
         self.assertNotEqual(name, self.qwen.trainer.experiment_name)
 
+    def test_validates_and_saves_every_5_updates_unlike_the_twin(self):
+        """test_freq/save_freq 5 (the twin: 20): the openPangu curves are read at finer
+        granularity, in parameter-version units (one version per replay update)."""
+        self.assertEqual(self.cfg.rollout.test_freq, 5)
+        self.assertEqual(self.cfg.trainer.save_freq, 5)
+        self.assertEqual(self.qwen.rollout.test_freq, 20)
+        self.assertEqual(self.qwen.trainer.save_freq, 20)
+
     # ---- everything else is the twin's -----------------------------------------------------
 
     def test_keeps_everything_else_identical_to_the_qwen_twin(self):
@@ -202,11 +210,9 @@ class TestOpenPanguReplayArmConfig(unittest.TestCase):
             "algorithm.rollout_correction.rollout_is_threshold",
             "algorithm.rollout_correction.bypass_mode",
             "algorithm.rollout_correction.use_policy_gradient",
-            "trainer.save_freq",
             "trainer.resume_mode",
             "trainer.n_gpus_per_node",
             "rollout.n_gpus_per_node",
-            "rollout.test_freq",
             "rollout.total_rollout_steps",
             "async_training.replay_buffer.enable",
             "async_training.replay_buffer.requires_mini_batches",
