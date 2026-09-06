@@ -217,6 +217,20 @@ replay_sampling_seed=${replay_sampling_seed:-1234}
 replay_reuse_halflife=${replay_reuse_halflife:-null}
 replay_reuse_tag=""
 if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${replay_reuse_halflife}"; fi
+# Fresh-share gate (replay_buffer.min_fresh_ratio): with a value f > 0 the trainer
+# does not run an update until ceil(f x mini_bsz) groups have ARRIVED FROM THE
+# ROLLOUTER since the previous mini-batch was composed (the fresh prefix of the
+# next mini-batch; untrained groups already in the buffer do not count). Mean
+# trainings per group become ~1/f instead of M/A (mini-batch groups / arrivals per
+# update) at the cost of trainer idle time (~f x M/A - 1 update-times per update);
+# waiting does not age the fresh groups (no version is produced meanwhile). 0 keeps
+# the arm bit-for-bit. The wait is capped by replay_buffer.min_fresh_wait_timeout_s
+# (yaml default 3600 s; on the cap the update runs anyway and
+# replay/fresh_floor_waived logs 1). Fresh groups are NOT on-policy — a long
+# rollout spans several updates — so watch replay/minibatch_fresh_staleness_mean.
+replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}
+replay_fresh_tag=""
+if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
@@ -256,7 +270,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -416,5 +430,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"

@@ -42,6 +42,15 @@ update — but it removes both tails of the reuse distribution (groups trained
 most-trained groups are the oldest, makes the replayed picks younger
 (REPLAY_REUSE_PENALTY_DISCUSSION.md). ``None`` keeps the staleness-only draw
 bit-for-bit.
+
+The buffer itself never waits: whether a composition may happen now is the
+trainer's decision (``FullyAsyncTrainer._acquire_replay_minibatch``: the pause
+watermark on the buffer size and the optional fresh-share gate
+``replay_buffer.min_fresh_ratio`` on ``pending_fresh_count()``). ``info``
+returned by ``compose_minibatch`` carries the fresh prefix's staleness
+separately (``fresh_staleness``) because fresh groups are NOT on-policy: a
+long rollout spans several trainer updates, so arrivals are typically a few
+versions old, and that lag is invisible in the mixed mini-batch mean.
 """
 
 from dataclasses import dataclass
@@ -197,8 +206,10 @@ class ReplayBuffer:
         groups with probability proportional to their staleness-decayed
         score times the optional reuse decay (``sampling_weight``). Returned
         entries are ordered fresh-first, so ``selected[:info["n_new"]]`` is
-        exactly the fresh prefix; ``info["times_trained"]`` carries each
-        selected entry's count BEFORE this composition's training.
+        exactly the fresh prefix; ``info["fresh_staleness"]`` is that prefix's
+        staleness list (empty on a pure-replay composition) and
+        ``info["times_trained"]`` carries each selected entry's count BEFORE
+        this composition's training.
         """
         if len(self.entries) < mini_size:
             raise ValueError(
@@ -227,6 +238,7 @@ class ReplayBuffer:
             "n_new": n_fresh,
             "n_replayed": mini_size - n_fresh,
             "staleness": staleness,
+            "fresh_staleness": staleness[:n_fresh],
             "times_trained": [e.times_trained for e in selected],
         }
         return selected, info
@@ -235,6 +247,13 @@ class ReplayBuffer:
 
     def size(self) -> int:
         return len(self.entries)
+
+    def pending_fresh_count(self) -> int:
+        """Groups that arrived from the rollouter since the previous composition
+        (the fresh set the next composition would take, before the mini_size
+        cap). This is NOT the untrained count: an arrival not selected at its
+        one composition loses freshness while staying untrained."""
+        return len(self.pending_fresh)
 
     def untrained_count(self) -> int:
         return sum(1 for e in self.entries if e.times_trained == 0)

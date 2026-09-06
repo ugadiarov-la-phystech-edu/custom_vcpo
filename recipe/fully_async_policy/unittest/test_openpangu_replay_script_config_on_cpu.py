@@ -45,6 +45,7 @@ REPLAY = os.path.join(REPO_ROOT, "recipe/fully_async_policy/shell/vcpo/dapo/repl
 QWEN = "grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh"
 PANGU = QWEN.replace("tau=16_k=64_min-ess=1.1", "tau=8_k=32_min-ess=1.07").replace(".sh", "_openpangu7b.sh")
 SMOKE_3P3 = "smoke_test_openpangu7b_replay_3+3.sh"
+PANGU_FRESH = PANGU.replace("_openpangu7b.sh", "_fresh=0.7_openpangu7b.sh")
 REALIASED_MODEL = "/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"
 
 _COMPOSED = {}
@@ -142,6 +143,11 @@ class TestOpenPanguReplayArmConfig(unittest.TestCase):
         self.assertAlmostEqual(self.qwen.actor_rollout_ref.actor.ess_scaling.min_ess, 1.1)
         self.assertIsNone(qrb.reuse_halflife)
 
+    def test_fresh_share_gate_is_off_by_default_like_the_twin(self):
+        self.assertEqual(self.cfg.async_training.replay_buffer.min_fresh_ratio, 0)
+        self.assertEqual(self.qwen.async_training.replay_buffer.min_fresh_ratio, 0)
+        self.assertNotIn("fresh-", self.cfg.trainer.experiment_name)
+
     def test_experiment_name_identifies_model_bos_and_depth(self):
         name = self.cfg.trainer.experiment_name
         for tag in ("openPangu-7B", " bos", " nu-1 ", "tau-8 k-32", "min-ess-1.07"):
@@ -232,6 +238,40 @@ class TestOpenPanguReplayArmConfig(unittest.TestCase):
         self.assertEqual(self.cfg.trainer.resume_mode, "disable")
 
 
+class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
+    """The fresh=0.7 variant is the base arm plus exactly one knob: the trainer waits for
+    ceil(0.7 x mini) groups arrived from the rollouter since the last composition."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base = compose(PANGU)
+        cls.cfg = compose(PANGU_FRESH)
+
+    def test_gate_is_on_at_0_7_and_tagged(self):
+        self.assertAlmostEqual(self.cfg.async_training.replay_buffer.min_fresh_ratio, 0.7)
+        self.assertEqual(self.base.async_training.replay_buffer.min_fresh_ratio, 0)
+        self.assertIn(" nu-1 fresh-0.7 ", self.cfg.trainer.experiment_name)
+        self.assertNotIn("fresh-", self.base.trainer.experiment_name)
+
+    def test_everything_else_equals_the_base(self):
+        """Identical to the base once the one knob and the name tag (which the experiment name
+        propagates into the checkpoint / rollout-dump / validation-dump paths) are removed."""
+        import json
+
+        a = OmegaConf.to_container(self.cfg, resolve=True)
+        b = OmegaConf.to_container(self.base, resolve=True)
+        a["async_training"]["replay_buffer"].pop("min_fresh_ratio")
+        b["async_training"]["replay_buffer"].pop("min_fresh_ratio")
+        a_text = json.dumps(a, sort_keys=True)
+        self.assertIn(" fresh-0.7", a_text)
+        self.assertEqual(json.loads(a_text.replace(" fresh-0.7", "")), b)
+
+    def test_knob_stays_env_overridable(self):
+        text = script_text(PANGU_FRESH)
+        self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.7}", text)
+        self.assertIn("FRESH-SHARE GATE", text)
+
+
 class TestOpenPanguReplayArmScriptText(unittest.TestCase):
     """Source tripwires for things hydra composition cannot see."""
 
@@ -251,6 +291,8 @@ class TestOpenPanguReplayArmScriptText(unittest.TestCase):
         self.assertIn("actor_rollout_ref.model.trust_remote_code=${trust_remote_code}", self.text)
         self.assertIn("data.add_bos_token_to_prompt=${add_bos_token_to_prompt}", self.text)
         self.assertIn('async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}"', self.text)
+        self.assertIn('async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}"', self.text)
+        self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}", self.text)
 
     def test_no_asyncrl_style_divergences(self):
         """The AsyncRL port forced Transformer Engine fused attention and capped GPU memory through an env
@@ -289,6 +331,7 @@ class TestOpenPanguReplaySmoke3plus3(unittest.TestCase):
         self.assertEqual(rb.staleness_threshold, 1)
         self.assertEqual(rb.tau, self.arm.async_training.replay_buffer.tau)
         self.assertEqual(rb.reuse_halflife, self.arm.async_training.replay_buffer.reuse_halflife)
+        self.assertEqual(rb.min_fresh_ratio, 0)  # the gate would only add idle time to a 2-update smoke
 
     def test_batch_divides_across_the_trainer_gpus(self):
         cfg = self.cfg

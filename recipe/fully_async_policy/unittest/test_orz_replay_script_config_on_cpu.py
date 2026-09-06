@@ -225,6 +225,35 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         self.assertIsNone(qwen.async_training.replay_buffer.reuse_halflife)
         self.assertNotIn("nu-", qwen.trainer.experiment_name)
 
+    def test_fresh_share_gate_is_off_by_default_and_env_overridable(self):
+        """replay_buffer.min_fresh_ratio (the trainer waits for ceil(ratio x mini) groups that arrived
+        from the rollouter since the last composition) defaults to 0 here and in the twin; the knob
+        reaches hydra and tags the experiment name only when set."""
+        self.assertEqual(self.cfg.async_training.replay_buffer.min_fresh_ratio, 0)
+        self.assertEqual(compose(QWEN).async_training.replay_buffer.min_fresh_ratio, 0)
+        self.assertNotIn("fresh-", self.cfg.trainer.experiment_name)
+        text = open(os.path.join(REPLAY, ORZ)).read()
+        self.assertIn('async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}"', text)
+        self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}", text)
+        env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet")
+        env["replay_min_fresh_ratio"] = "0.5"
+        with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
+            proc = subprocess.run(
+                ["bash", os.path.join(REPLAY, ORZ), "--cfg", "job", "--resolve"],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=out,
+                stderr=subprocess.PIPE,
+                timeout=900,
+            )
+            if proc.returncode != 0:
+                raise unittest.SkipTest(f"could not compose {ORZ}: {proc.stderr.decode()[-300:]}")
+            out.flush()
+            out.seek(0)
+            cfg = OmegaConf.load(out.name)
+        self.assertAlmostEqual(cfg.async_training.replay_buffer.min_fresh_ratio, 0.5)
+        self.assertIn(" nu-1 fresh-0.5 ", cfg.trainer.experiment_name)
+
     def test_replay_depth_is_half_the_twins(self):
         """tau=8 / k=32 against the twin's 16 / 64: the ORZ-7B post-mortems tie its divergences to
         deep staleness, so this arm halves the reuse depth while keeping the terminal sampling
