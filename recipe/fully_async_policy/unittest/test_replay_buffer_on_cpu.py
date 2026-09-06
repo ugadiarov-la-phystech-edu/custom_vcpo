@@ -614,18 +614,34 @@ def test_update_param_version_logs_and_resets_group_ratio_window():
 # ---------------------------------------------------------------- trainer acquire loop
 
 
+def _pickle(sample):
+    return ray.cloudpickle.dumps(sample) if sample is not None else None
+
+
 class _QueueStub:
-    """Fake MessageQueueClient: one-shot non-blocking drain + a scripted
-    sequence for the blocking get_sample calls (empty script -> sentinel)."""
+    """Fake MessageQueueClient: a scripted non-blocking drain + a scripted
+    sequence for the blocking get_sample calls (empty script -> sentinel).
+
+    ``available`` is either a flat list of samples (one-shot: the first drain
+    returns all of them, later drains nothing) or a list of lists, one batch
+    per drain call in order (empty list = a drain that finds nothing), which
+    scripts the fresh-share gate's polling wait."""
 
     def __init__(self, available=None, blocking=None):
-        self.available = [ray.cloudpickle.dumps(s) if s is not None else None for s in (available or [])]
-        self.blocking = [ray.cloudpickle.dumps(s) if s is not None else None for s in (blocking or [])]
+        available = list(available or [])
+        if available and all(isinstance(b, list) for b in available):
+            self.available_batches = [[_pickle(s) for s in batch] for batch in available]
+        else:
+            self.available_batches = [[_pickle(s) for s in available]] if available else []
+        self.blocking = [_pickle(s) for s in (blocking or [])]
         self.blocking_calls = 0
+        self.drain_calls = 0
 
     def get_available_samples_sync(self):
-        out, self.available = self.available, []
-        return out
+        self.drain_calls += 1
+        if not self.available_batches:
+            return []
+        return self.available_batches.pop(0)
 
     def get_sample_sync(self):
         self.blocking_calls += 1
@@ -634,12 +650,23 @@ class _QueueStub:
         return (self.blocking.pop(0), 0)
 
 
-def _make_replay_trainer(mini_size, requires_mini_batches, available=None, blocking=None, reuse_halflife=None):
+def _make_replay_trainer(
+    mini_size,
+    requires_mini_batches,
+    available=None,
+    blocking=None,
+    reuse_halflife=None,
+    min_fresh_ratio=0.0,
+    wait_timeout_s=3600.0,
+):
     t = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
     t.replay_buffer = ReplayBuffer(tau=4.0, staleness_threshold=100, seed=0, reuse_halflife=reuse_halflife)
     t.replay_updates_done = 0
     t.replay_requires_mini_batches = float(requires_mini_batches)
     t.required_samples = mini_size
+    t.replay_min_fresh_ratio = float(min_fresh_ratio)
+    t.replay_min_fresh_wait_timeout_s = float(wait_timeout_s)
+    t.replay_fresh_poll_interval_s = 0.0  # never sleep in tests
     t.rollout_done = False
     t.current_param_version = 0
     t.message_queue_client = _QueueStub(available=available, blocking=blocking)
@@ -1193,3 +1220,309 @@ def test_message_queue_get_available_samples_drains_in_order():
     assert drained == ["a", "b", None]
     assert size_after == 0
     assert empty == []
+
+
+# ---------------------------------------------------------------- fresh-share gate
+
+
+def _gate_trainer(mini_size, ratio, available=None, blocking=None, requires_mini_batches=1, wait_timeout_s=3600.0):
+    return _make_replay_trainer(
+        mini_size=mini_size,
+        requires_mini_batches=requires_mini_batches,
+        available=available,
+        blocking=blocking,
+        min_fresh_ratio=ratio,
+        wait_timeout_s=wait_timeout_s,
+    )
+
+
+def _prime_pool(trainer, n, version=0):
+    """Put n already-composed (non-fresh, untrained) groups into the buffer."""
+    for _ in range(n):
+        trainer.replay_buffer.add(_sample(group_version=version), current_version=version)
+    trainer.replay_buffer.compose_minibatch(n, current_version=version)  # consumes their freshness
+    assert trainer.replay_buffer.pending_fresh_count() == 0
+
+
+def test_pending_fresh_count_tracks_add_compose_and_evict():
+    buf = _make_buffer(staleness_threshold=2)
+    assert buf.pending_fresh_count() == 0
+    e_old = buf.add(_sample(group_version=0), current_version=0)
+    buf.add(_sample(group_version=3), current_version=3)
+    assert buf.pending_fresh_count() == 2
+    buf.evict(current_version=3)  # e_old: staleness 3 > 2 -> gone from the pending list too
+    assert e_old not in buf.entries
+    assert buf.pending_fresh_count() == 1
+    buf.compose_minibatch(1, current_version=3)
+    assert buf.pending_fresh_count() == 0  # one-shot freshness
+    assert buf.untrained_count() == 1  # untrained is a different thing
+
+
+def test_compose_info_carries_the_fresh_prefix_staleness():
+    buf = _make_buffer()
+    for v in (10, 8):
+        buf.add(_sample(group_version=v), current_version=10)
+    buf.compose_minibatch(2, current_version=10)
+    buf.mark_trained(buf.entries)
+    buf.add(_sample(group_version=9), current_version=10)  # the only fresh one
+    selected, info = buf.compose_minibatch(3, current_version=10)
+    assert info["n_new"] == 1
+    assert info["fresh_staleness"] == info["staleness"][:1] == [1]
+    assert len(info["staleness"]) == 3
+    # pure replay -> empty prefix
+    _, info = buf.compose_minibatch(3, current_version=10)
+    assert info["n_new"] == 0 and info["fresh_staleness"] == []
+
+
+def test_min_fresh_groups_is_ceil_of_ratio_times_mini_size_capped_at_mini_size():
+    t = _gate_trainer(mini_size=3, ratio=0.0)
+    assert t._replay_min_fresh_groups(3) == 0
+    t.replay_min_fresh_ratio = 0.34
+    assert t._replay_min_fresh_groups(3) == 2  # ceil(1.02)
+    t.replay_min_fresh_ratio = 1 / 3
+    assert t._replay_min_fresh_groups(3) == 1  # exact thirds do not round up
+    t.replay_min_fresh_ratio = 0.5
+    assert t._replay_min_fresh_groups(33) == 17
+    t.replay_min_fresh_ratio = 1.0
+    assert t._replay_min_fresh_groups(33) == 33
+    # a trainer built before the knob existed (no attribute) -> gate off
+    bare = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
+    assert bare._replay_min_fresh_groups(33) == 0
+
+
+def test_gate_off_never_polls_and_matches_the_ungated_draws():
+    def run(ratio_attr):
+        s = [_sample(group_version=v) for v in range(6)]
+        t = _make_replay_trainer(mini_size=2, requires_mini_batches=1, available=[s[0], s[1], s[2], s[3]])
+        if ratio_attr is not None:
+            t.replay_min_fresh_ratio = ratio_attr
+        picks = []
+        for _ in range(4):
+            entries, info = t._acquire_replay_minibatch()
+            picks.append([e.sample.group_version for e in entries])
+            t.replay_buffer.mark_trained(entries)
+        return picks, t.message_queue_client.drain_calls
+
+    picks_off, drains_off = run(0.0)
+    picks_bare, drains_bare = run(None)
+    assert picks_off == picks_bare
+    # exactly one drain per acquire: the gate loop never ran
+    assert drains_off == drains_bare == 4
+
+
+def test_gate_satisfied_by_the_initial_drain_does_not_wait():
+    s = [_sample(group_version=v) for v in range(3)]
+    t = _gate_trainer(mini_size=2, ratio=0.5)
+    _prime_pool(t, 2)
+    t.message_queue_client = _QueueStub(available=[s[0]])
+    entries, info = t._acquire_replay_minibatch()
+    assert info["n_new"] == 1 and info["n_replayed"] == 1
+    assert t.message_queue_client.drain_calls == 1
+    assert t._replay_fresh_wait_s == 0.0 and t._replay_fresh_floor_waived == 0
+
+
+def test_gate_polls_until_enough_groups_arrive_from_the_rollouter():
+    # floor = ceil(0.5 x 4) = 2; the first drain brings one, two empty polls,
+    # then a batch with two more -> compose with a 3-group fresh prefix
+    s = [_sample(group_version=v) for v in range(5)]
+    t = _gate_trainer(mini_size=4, ratio=0.5)
+    _prime_pool(t, 4)
+    t.message_queue_client = _QueueStub(available=[[s[0]], [], [], [s[1], s[2]]])
+    entries, info = t._acquire_replay_minibatch()
+    assert t.message_queue_client.drain_calls == 4
+    assert info["n_new"] == 3 and info["n_replayed"] == 1
+    assert [e.sample.group_version for e in entries[:3]] == [2, 1, 0]  # newest-arrived first
+    assert t._replay_fresh_floor_waived == 0
+    assert t._replay_fresh_wait_s >= 0.0
+
+
+def test_gate_counts_only_arrivals_since_the_last_composition_not_untrained_groups():
+    # 4 untrained groups sit in the pool (they lost freshness at their one
+    # composition); with the floor at 2 the gate must still wait for arrivals
+    s = [_sample(group_version=v) for v in range(3)]
+    t = _gate_trainer(mini_size=2, ratio=1.0)
+    _prime_pool(t, 4)
+    assert t.replay_buffer.untrained_count() == 4
+    t.message_queue_client = _QueueStub(available=[[], [], [s[0]], [s[1]]])
+    entries, info = t._acquire_replay_minibatch()
+    assert t.message_queue_client.drain_calls == 4
+    assert info["n_new"] == 2 and info["n_replayed"] == 0
+    assert [e.sample.group_version for e in entries] == [1, 0]
+
+
+def test_gate_ratio_one_gives_pure_fresh_minibatches_with_overflow_to_the_pool():
+    s = [_sample(group_version=v) for v in range(5)]
+    t = _gate_trainer(mini_size=2, ratio=1.0)
+    _prime_pool(t, 2)
+    t.message_queue_client = _QueueStub(available=[[s[0], s[1], s[2]]])
+    entries, info = t._acquire_replay_minibatch()
+    assert info["n_new"] == 2 and info["n_replayed"] == 0
+    assert [e.sample.group_version for e in entries] == [2, 1]
+    assert t.replay_buffer.pending_fresh_count() == 0  # s0 fell into the pool, no carried priority
+    t.replay_buffer.mark_trained(entries)
+    assert t.replay_buffer.untrained_count() == 3  # the 2 primed + s0
+
+
+def test_gate_runs_after_the_watermark_and_watermark_pulls_count_toward_the_floor():
+    # empty buffer, watermark 2 -> two blocking pulls; both are arrivals, so
+    # the floor (2) is met without any polling drain beyond the initial one
+    s = [_sample(group_version=v) for v in range(2)]
+    t = _gate_trainer(mini_size=2, ratio=1.0, blocking=[s[0], s[1]])
+    entries, info = t._acquire_replay_minibatch()
+    assert t.message_queue_client.blocking_calls == 2
+    assert t.message_queue_client.drain_calls == 1
+    assert info["n_new"] == 2
+    assert t._replay_fresh_floor_waived == 0
+
+
+def test_gate_is_waived_when_the_rollouter_is_done_and_the_tail_still_drains_pure_replay():
+    # mirrors the 3+3 smokes: one fresh mini-batch, then the rollouter ends;
+    # the gate must not turn the pure-replay tail into a hang or an early stop
+    s = [_sample(group_version=0) for _ in range(3)]
+    t = _gate_trainer(mini_size=3, ratio=1.0, available=[s[0], s[1], s[2]])
+    t.replay_buffer.staleness_threshold = 1
+    entries, info = t._acquire_replay_minibatch()  # update 1: all fresh
+    assert info["n_new"] == 3 and t._replay_fresh_floor_waived == 0
+    t._replay_post_update_maintenance(entries, new_version=1)
+    t.current_param_version = 1
+    # the sentinel arrives with the next drain
+    t.message_queue_client = _QueueStub(available=[[None]])
+    entries, info = t._acquire_replay_minibatch()  # update 2: pure replay, floor waived
+    assert t.rollout_done is True
+    assert info["n_new"] == 0 and info["n_replayed"] == 3
+    assert t._replay_fresh_floor_waived == 1
+    t._replay_post_update_maintenance(entries, new_version=2)
+    t.current_param_version = 2
+    assert t.replay_buffer.size() == 0  # staleness 2 > 1 evicted everything
+    assert t._acquire_replay_minibatch() == (None, None)
+
+
+def test_gate_is_waived_on_the_wall_clock_cap():
+    s = [_sample(group_version=0) for _ in range(2)]
+    t = _gate_trainer(mini_size=2, ratio=1.0, wait_timeout_s=1e-6)
+    _prime_pool(t, 2)
+    t.message_queue_client = _QueueStub(available=[[]] * 1000)  # nothing ever arrives
+    entries, info = t._acquire_replay_minibatch()
+    assert info["n_new"] == 0 and info["n_replayed"] == 2
+    assert t._replay_fresh_floor_waived == 1
+    assert t._replay_fresh_wait_s >= 1e-6
+    assert t.message_queue_client.drain_calls < 1000  # it stopped polling on the cap
+    del s
+
+
+def test_gate_uncapped_when_timeout_is_non_positive():
+    s = [_sample(group_version=v) for v in range(2)]
+    t = _gate_trainer(mini_size=2, ratio=1.0, wait_timeout_s=0.0)
+    _prime_pool(t, 2)
+    # 50 empty polls then the arrivals: an uncapped gate keeps polling
+    t.message_queue_client = _QueueStub(available=[[]] * 50 + [[s[0], s[1]]])
+    entries, info = t._acquire_replay_minibatch()
+    assert info["n_new"] == 2 and t._replay_fresh_floor_waived == 0
+    assert t.message_queue_client.drain_calls == 51
+
+
+def test_gate_wait_keeps_the_virtual_step_gated_by_the_fresh_prefix():
+    t = _gate_trainer(mini_size=2, ratio=0.5)
+    for _ in range(2):
+        old = _sample(group_version=0)
+        old.enqueue_time = 1e9
+        old.validation_pause_before = 0.0
+        t.replay_buffer.add(old, current_version=0)
+    t.replay_buffer.compose_minibatch(2, current_version=0)
+    fresh = _sample(group_version=0)
+    fresh.enqueue_time = 100.0
+    fresh.validation_pause_before = 0.0
+    t.message_queue_client = _QueueStub(available=[[], [], [fresh]])
+    entries, info = t._acquire_replay_minibatch()
+    assert info["n_new"] == 1
+    assert t._step_virtual_start == pytest.approx(100.0)
+
+
+def test_gate_does_not_change_the_sentinel_stop_below_the_watermark():
+    t = _gate_trainer(mini_size=2, ratio=1.0, requires_mini_batches=2, available=[None])
+    assert t._acquire_replay_minibatch() == (None, None)
+
+
+def test_add_replay_metrics_splits_staleness_by_origin_and_reports_the_gate():
+    t = _gate_trainer(mini_size=4, ratio=0.5)
+    for v in (10, 10, 8, 6):
+        t.replay_buffer.add(_sample(group_version=v), current_version=10)
+    t._replay_fresh_wait_s = 12.5
+    t._replay_fresh_floor_waived = 0
+    metrics = {}
+    info = {"n_new": 2, "n_replayed": 2, "staleness": [3, 5, 20, 40], "fresh_staleness": [3, 5]}
+    t._add_replay_metrics(metrics, info, new_version=10)
+    assert metrics["replay/minibatch_fresh_staleness_mean"] == pytest.approx(4.0)
+    assert metrics["replay/minibatch_fresh_staleness_max"] == 5.0
+    assert metrics["replay/minibatch_replayed_staleness_mean"] == pytest.approx(30.0)
+    assert metrics["replay/minibatch_staleness_mean"] == pytest.approx(17.0)  # the mixed mean is unchanged
+    assert metrics["replay/fresh_floor"] == 2.0
+    assert metrics["replay/fresh_wait_s"] == 12.5
+    assert metrics["replay/fresh_floor_waived"] == 0.0
+    assert set(FullyAsyncTrainer.REPLAY_HIST_KEYS) == {
+        "replay/minibatch_staleness_hist",
+        "replay/buffer_staleness_hist",
+        "replay/minibatch_times_trained_hist",
+    }
+
+
+def test_add_replay_metrics_omits_the_empty_side_and_falls_back_without_fresh_staleness():
+    t = _gate_trainer(mini_size=2, ratio=0.0)
+    t.replay_buffer.add(_sample(group_version=0), current_version=0)
+    # pure fresh, legacy info without fresh_staleness -> prefix derived from staleness
+    metrics = {}
+    t._add_replay_metrics(metrics, {"n_new": 2, "n_replayed": 0, "staleness": [1, 3]}, new_version=0)
+    assert metrics["replay/minibatch_fresh_staleness_mean"] == pytest.approx(2.0)
+    assert "replay/minibatch_replayed_staleness_mean" not in metrics
+    assert metrics["replay/fresh_floor"] == 0.0
+    assert metrics["replay/fresh_wait_s"] == 0.0 and metrics["replay/fresh_floor_waived"] == 0.0
+    # pure replay
+    metrics = {}
+    t._add_replay_metrics(metrics, {"n_new": 0, "n_replayed": 2, "staleness": [4, 6]}, new_version=0)
+    assert "replay/minibatch_fresh_staleness_mean" not in metrics
+    assert "replay/minibatch_fresh_staleness_max" not in metrics
+    assert metrics["replay/minibatch_replayed_staleness_mean"] == pytest.approx(5.0)
+
+
+def test_end_to_end_gate_metrics_from_a_real_compose():
+    s = [_sample(group_version=v) for v in (7, 9)]
+    t = _gate_trainer(mini_size=3, ratio=0.5)
+    _prime_pool(t, 3, version=4)
+    t.current_param_version = 10
+    t.message_queue_client = _QueueStub(available=[[], [s[0], s[1]]])
+    entries, info = t._acquire_replay_minibatch()
+    metrics = {}
+    t._add_replay_metrics(metrics, info, new_version=11)
+    assert info["n_new"] == 2
+    assert metrics["replay/minibatch_fresh_staleness_mean"] == pytest.approx(2.0)  # (3 + 1) / 2 at version 10
+    assert metrics["replay/minibatch_replayed_staleness_mean"] == pytest.approx(6.0)
+    assert metrics["replay/fresh_floor"] == 2.0
+    assert metrics["replay/fresh_floor_waived"] == 0.0
+
+
+def test_min_fresh_gate_defaults_are_off_in_recipe_configs():
+    import os
+
+    cfg_dir = os.path.join(os.path.dirname(__file__), "..", "config")
+    for name in ("fully_async_ppo_trainer.yaml", "fully_async_ppo_megatron_trainer.yaml"):
+        cfg = OmegaConf.load(os.path.join(cfg_dir, name))
+        rb = cfg.async_training.replay_buffer
+        assert rb.min_fresh_ratio == 0.0, name
+        assert rb.min_fresh_wait_timeout_s == 3600, name
+
+
+def test_trainer_reads_and_validates_the_min_fresh_gate_from_config():
+    """Source-inspected like the reuse_halflife test (ray wraps __init__)."""
+    import os
+
+    src = open(os.path.join(os.path.dirname(__file__), "..", "fully_async_trainer.py")).read()
+    assert 'replay_cfg.get("min_fresh_ratio", 0.0)' in src
+    assert 'replay_cfg.get("min_fresh_wait_timeout_s", 3600.0)' in src
+    assert "0.0 <= self.replay_min_fresh_ratio <= 1.0" in src
+    # the gate is applied after the watermark loop and before composition
+    body = src.split("def _acquire_replay_minibatch")[1].split("def _replay_min_fresh_groups")[0]
+    assert (
+        body.index("self._wait_one_sample_into_buffer()")
+        < body.index("self._wait_for_fresh_floor(")
+        < body.index("compose_minibatch(")
+    )

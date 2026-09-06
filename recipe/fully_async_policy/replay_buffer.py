@@ -144,12 +144,16 @@ class ReplayBuffer:
             "n_new": n_fresh,
             "n_replayed": mini_size - n_fresh,
             "staleness": staleness,
+            "fresh_staleness": staleness[:n_fresh],
             "times_trained": [e.times_trained for e in selected],
         }
         return selected, info
 
     def size(self) -> int:
         return len(self.entries)
+
+    def pending_fresh_count(self) -> int:
+        return len(self.pending_fresh)
 
     def untrained_count(self) -> int:
         return sum(1 for e in self.entries if e.times_trained == 0)
