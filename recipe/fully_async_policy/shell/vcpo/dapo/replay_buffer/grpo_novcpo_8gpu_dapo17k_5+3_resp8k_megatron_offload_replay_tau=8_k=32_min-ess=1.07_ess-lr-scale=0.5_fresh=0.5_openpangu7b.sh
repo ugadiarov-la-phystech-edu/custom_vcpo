@@ -368,7 +368,7 @@ if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${repl
 replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5} # the base: 0 (see FRESH-SHARE GATE)
 replay_fresh_tag=""
 if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
-replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
+replay_save_state=${replay_save_state:-True} # replay_buffer.pt is part of the resumable state (see CHECKPOINTS)
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
 # Replay mode subsumes DAPO filtering (insertion gate always on) and replaces
@@ -379,7 +379,7 @@ opportunistic_enable=False
 opportunistic_max_extra_epochs=0
 serialize_validation=${serialize_validation:-True}
 pause_generation_during_save=${pause_generation_during_save:-True}
-save_queue_state=False # no queue snapshots in checkpoints: resume is disabled
+save_queue_state=${save_queue_state:-True} # rollout_queue.pt / message_queue.pt are part of the resumable state (see CHECKPOINTS)
 
 # ================= Training/Rollout Steps =================
 # Same 66000-prompt generation budget as the B-33x4 arms (500 steps * 132
@@ -391,20 +391,39 @@ epochs=10000000
 # checkpoint every 20 updates (=660 groups consumed, matching the 5-step
 # cadence of the B-33x4 arms in group units).
 test_freq=${test_freq:-5} # the twin: 20
-# Model checkpointing is OFF: save_freq<=0 disables _check_save_checkpoint's
-# save gate entirely (fully_async_trainer.py), so no global_step_N/ directory
-# — not even an hf_model — is ever written; zero checkpoint disk footprint.
-# resume_mode=disable is kept as a safety net: with no checkpoints of its own
-# to resume from, this only matters if a prior run left one under the same
-# exp_name/log_dir, which would otherwise be picked up by resume_mode=auto.
-# replay_buffer.save_state / save_queue_state are moot with saving off
-# (nothing ever calls the code path they gate) but left False for when
-# save_freq is overridden back on. Re-enable saving with save_freq=N>0 and
-# set ckpt_save_contents/max_actor_ckpt_to_keep as needed.
+# CHECKPOINTS — two tiers. Every save_freq updates (parameter-version units, one
+# version per replay update) the trainer writes a FULL checkpoint:
+#   global_step_N/actor/huggingface/       hf_model export (bf16 safetensors + config +
+#                                          tokenizer; loadable by vLLM as is) — KEPT AT EVERY SAVE
+#   global_step_N/actor/dist_ckpt/         Megatron dist-checkpoint: model + optimizer + extra
+#   global_step_N/replay_buffer.pt         the replay buffer (groups, scores, RNG, counters)
+#   global_step_N/rollout_queue.pt, message_queue.pt   the rollouter's in-flight / queued groups
+#   global_step_N/timing_state.json, data.pt, actor/transformer_config.json   (small)
+# and then, with async_training.resumable_ckpts_to_keep=1, deletes dist_ckpt/ + replay_buffer.pt +
+# rollout_queue.pt + message_queue.pt from every OLDER global_step_* directory, so exactly one
+# resumable checkpoint (the newest) exists at any time while the hf_model of every save stays
+# for evaluation. trainer.max_actor_ckpt_to_keep must stay null: that knob rmtree's whole actor/
+# directories, hf_model included. The base arm and the Qwen twin keep the hf-only policy.
+#
+# Disk (remote_h100, ~600 GB free): hf ~16 GB per save (the accumulating part: ~320 GB per 100
+# updates at save_freq=5 — this fills the disk first); the resumable state ~65-100 GB
+# (bf16 weights + bf16 master + Adam moments under the precision-aware CPU-offload optimizer;
+# NOT YET MEASURED — record it after the first save) + replay_buffer.pt 4-6 GB + queue snapshots,
+# present in the newest directory only, ~2x that at the instant of a save.
+#
+# resume_mode=auto: a relaunch under the SAME exp_name resumes from the newest full checkpoint
+# (actor, optimizer, replay buffer, queues, timing offsets all restored; a directory whose resume
+# state was pruned is refused with a clear error). A fresh start needs a new exp_name or removing
+# the run directory. The stop-the-world save pause (pause_generation_during_save) now brackets a
+# multi-minute dist-checkpoint write to NFS instead of the ~45 s hf export; it is excluded from
+# cumulative_training_time by design. This is the first arm on this stack that saves the
+# Megatron optimizer under optimizer_cpu_offload — run the 3+3 smoke with
+# ARM_SCRIPT=<this script> and verify_checkpoints.py --resumable-last 1 before a long run.
 save_freq=${save_freq:-5} # the twin: 20
-max_actor_ckpt_to_keep=null
-ckpt_save_contents="['hf_model']"
-resume_mode=disable
+max_actor_ckpt_to_keep=null # MUST stay null (see CHECKPOINTS)
+ckpt_save_contents=${ckpt_save_contents:-"['model','optimizer','extra','hf_model']"} # the base: ['hf_model']
+resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-1} # the base: null (nothing to prune)
+resume_mode=${resume_mode:-auto} # the base: disable
 
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos"}
@@ -564,6 +583,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.serialize_validation="${serialize_validation}" \
     async_training.pause_generation_during_save="${pause_generation_during_save}" \
     async_training.save_queue_state="${save_queue_state}" \
+    async_training.resumable_ckpts_to_keep="${resumable_ckpts_to_keep}" \
     async_training.replay_buffer.enable="${replay_enable}" \
     async_training.replay_buffer.tau="${replay_tau}" \
     async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \

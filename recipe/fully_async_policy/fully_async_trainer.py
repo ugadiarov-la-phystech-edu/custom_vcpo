@@ -15,11 +15,12 @@
 import json
 import math
 import os
+import shutil
 import time
 from collections import defaultdict
 from datetime import datetime
 from pprint import pprint
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -47,6 +48,80 @@ from verl.utils.metric import reduce_metrics
 
 # make_opportunistic_minibatch_indices moved to ray_trainer (imported above) so
 # the fractional-ppo_epochs update path can use it too.
+
+# The pieces of a global_step_N/ directory that only a RESUME needs: the Megatron
+# dist-checkpoint (model + optimizer + extra state), the replay buffer and the
+# rollouter's queue snapshots. Everything else in the directory — actor/huggingface/
+# (the hf_model export), actor/transformer_config.json, timing_state.json, data.pt —
+# is small or serves evaluation and is never pruned.
+RESUMABLE_CKPT_PIECES = ("actor/dist_ckpt", "replay_buffer.pt", "rollout_queue.pt", "message_queue.pt")
+_GLOBAL_STEP_PREFIX = "global_step_"
+
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def list_checkpoint_steps(root_dir: str) -> list[tuple[int, str]]:
+    """(step, path) of every ``global_step_<int>`` directory directly under root_dir, ascending."""
+    if not root_dir or not os.path.isdir(root_dir):
+        return []
+    out = []
+    for name in os.listdir(root_dir):
+        if not name.startswith(_GLOBAL_STEP_PREFIX):
+            continue
+        suffix = name[len(_GLOBAL_STEP_PREFIX) :]
+        path = os.path.join(root_dir, name)
+        if suffix.isdigit() and os.path.isdir(path):
+            out.append((int(suffix), path))
+    return sorted(out)
+
+
+def prune_resumable_checkpoint_state(root_dir: str, keep: Optional[int], current_step: int) -> list[tuple[str, int]]:
+    """Drop the resume-only pieces (RESUMABLE_CKPT_PIECES) from every checkpoint
+    directory older than the ``keep`` newest ones, leaving the hf_model export and
+    the small files in place.
+
+    Two-tier retention for runs that want an evaluable hf_model at every save
+    but only the LAST full (model + optimizer + replay + queue) checkpoint on
+    disk — trainer.max_actor_ckpt_to_keep cannot express that (the Megatron
+    manager rmtree's whole actor/ directories, hf_model included).
+
+    ``keep`` None or <= 0 disables pruning. Only directories with step <=
+    ``current_step`` are considered (a foreign, higher-numbered directory is
+    never touched) and the ``keep`` newest of those are left intact, so the
+    directory just written is never pruned. Directories that never had the
+    pieces (hf-only saves under the same exp_name) are simply skipped.
+    Deletion errors propagate — a silently failed prune would hide a disk
+    problem. Returns (removed path, bytes freed) per removed piece.
+    """
+    if keep is None or int(keep) <= 0:
+        return []
+    keep = int(keep)
+    steps = [(step, path) for step, path in list_checkpoint_steps(root_dir) if step <= int(current_step)]
+    victims = steps[:-keep] if len(steps) > keep else []
+    removed: list[tuple[str, int]] = []
+    for step, path in victims:
+        assert step != int(current_step), "never prune the checkpoint that was just written"
+        for piece in RESUMABLE_CKPT_PIECES:
+            target = os.path.join(path, piece)
+            if os.path.isdir(target):
+                size = _dir_size_bytes(target)
+                shutil.rmtree(target)
+            elif os.path.isfile(target):
+                size = os.path.getsize(target)
+                os.remove(target)
+            else:
+                continue
+            removed.append((target, size))
+    return removed
 
 
 @ray.remote(num_cpus=10)
@@ -229,6 +304,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         # trajectory match a no-validation-no-save run exactly.
         self.serialize_validation = bool(config.async_training.get("serialize_validation", False))
         self.pause_generation_during_save = bool(config.async_training.get("pause_generation_during_save", False))
+        # Two-tier checkpoint retention (see prune_resumable_checkpoint_state):
+        # after every save keep the resume-only pieces in the N newest
+        # global_step_* dirs only; null/0 = never prune (every checkpoint keeps
+        # whatever save_contents wrote).
+        _keep = config.async_training.get("resumable_ckpts_to_keep", None)
+        self.resumable_ckpts_to_keep = int(_keep) if _keep is not None and int(_keep) > 0 else None
         self.compute_prox_log_prob = self.config.async_training.compute_prox_log_prob
         total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
@@ -976,6 +1057,30 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.current_param_version))
+        # Only after everything of THIS checkpoint (actor, rollouter queues,
+        # timing, replay buffer, tracker) is on disk: retire the resume-only
+        # pieces of the older checkpoints. The directory just written is never
+        # touched, so this is safe with checkpoint.async_save too.
+        self._prune_older_resumable_checkpoints()
+
+    def _prune_older_resumable_checkpoints(self):
+        keep = getattr(self, "resumable_ckpts_to_keep", None)
+        if keep is None:
+            return
+        removed = prune_resumable_checkpoint_state(
+            self.config.trainer.default_local_dir, keep, self.current_param_version
+        )
+        by_dir: dict[str, int] = defaultdict(int)
+        for path, size in removed:
+            step_dir = path
+            while os.path.basename(step_dir) and not os.path.basename(step_dir).startswith(_GLOBAL_STEP_PREFIX):
+                step_dir = os.path.dirname(step_dir)
+            by_dir[step_dir] += size
+        for step_dir, size in sorted(by_dir.items()):
+            print(
+                f"[FullyAsyncTrainer] Pruned resume-only state from {step_dir} "
+                f"({size / 1e9:.1f} GB freed; hf_model kept; keeping the {keep} newest full checkpoint(s))"
+            )
 
     def _save_replay_state(self, local_global_step_folder):
         """Persist the replay buffer next to the checkpoint unless
@@ -1095,6 +1200,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             f"current_param_version to {self.current_param_version}"
         )
         print(f"[FullyAsyncTrainer] Resuming from  {global_step_folder}")
+        self._check_resumable_checkpoint(global_step_folder)
         self._restore_timing_state(global_step_folder)
         if self.replay_enable:
             replay_path = os.path.join(global_step_folder, "replay_buffer.pt")
@@ -1121,6 +1227,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
         return self.current_param_version
+
+    @staticmethod
+    def _check_resumable_checkpoint(global_step_folder: str) -> None:
+        """Fail early, with the reason, when the selected checkpoint holds no
+        Megatron dist-checkpoint: an hf_model-only save, or a directory whose
+        resume-only pieces were pruned by async_training.resumable_ckpts_to_keep.
+        Without this the failure surfaces deep inside the dist-checkpoint load."""
+        present = [p for p in RESUMABLE_CKPT_PIECES if os.path.exists(os.path.join(global_step_folder, p))]
+        print(f"[FullyAsyncTrainer] Resumable pieces in {global_step_folder}: {present or 'none'}")
+        if not os.path.isdir(os.path.join(global_step_folder, "actor", "dist_ckpt")):
+            raise RuntimeError(
+                f"Cannot resume from {global_step_folder}: no actor/dist_ckpt/ there. Either the run saved "
+                "hf_model only (actor.checkpoint.save_contents without model/optimizer/extra) or the "
+                "resume-only state of this checkpoint was pruned (async_training.resumable_ckpts_to_keep). "
+                "Point trainer.resume_from_path at a full checkpoint, or start a new exp_name."
+            )
 
     def _replay_checkpoint_state(self) -> dict:
         return {

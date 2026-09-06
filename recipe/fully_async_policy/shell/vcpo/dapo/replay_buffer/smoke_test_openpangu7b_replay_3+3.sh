@@ -133,7 +133,9 @@ set +x
 echo "==================== checkpoint verification ===================="
 # --dtype BF16: megatron's hf_model save writes bf16; --base-model diffs parameter names against the
 # re-aliased checkpoint, which is what catches a missing o_proj.bias export.
-python "${HERE}/verify_checkpoints.py" "${CKPTS_DIR}" --expect 2 --dtype BF16 --base-model "${MODEL_PATH}"
+# VERIFY_RESUMABLE_LAST=1 when smoking the two-tier arm (ARM_SCRIPT=..._fresh=0.5_openpangu7b.sh):
+# global_step_1 must be pruned to hf + small files, global_step_2 must hold the full resumable state.
+python "${HERE}/verify_checkpoints.py" "${CKPTS_DIR}" --expect 2 --dtype BF16 --base-model "${MODEL_PATH}" --resumable-last "${VERIFY_RESUMABLE_LAST:-0}"
 
 echo "==================== validation accuracy ===================="
 python - "${CKPTS_DIR}" <<'PY'

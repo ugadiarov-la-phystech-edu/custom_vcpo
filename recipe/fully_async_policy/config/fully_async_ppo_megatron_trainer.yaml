@@ -45,6 +45,17 @@ async_training:
   # save partial rollouts and completed rollouts in the replay buffer queue
   save_queue_state: True
 
+  # Two-tier checkpoint retention. After every save, keep the resume-only pieces
+  # (actor/dist_ckpt = model+optimizer+extra, replay_buffer.pt, rollout_queue.pt,
+  # message_queue.pt) only in the N newest global_step_* directories; the
+  # hf_model export (actor/huggingface), transformer_config.json,
+  # timing_state.json and data.pt stay in every checkpoint. null = never prune.
+  # Meant for actor.checkpoint.save_contents that includes model/optimizer/extra
+  # with trainer.max_actor_ckpt_to_keep=null (that knob deletes whole
+  # directories, hf_model included). Resume (resume_mode=auto) always finds the
+  # newest directory, which is never pruned
+  resumable_ckpts_to_keep: null
+
   # Opportunistic PPO epochs (rollout-bound elasticity): after the scheduled
   # update, keep running extra shuffled group-complete mini-batch updates on the
   # current batch while the queue holds fewer than

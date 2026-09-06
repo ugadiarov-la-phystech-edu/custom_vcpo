@@ -28,7 +28,12 @@ checkpoint may legitimately carry null) and ``checkpoint_saved_datetime``, both 
 "%Y-%m-%d %H:%M:%S" without a timezone, instead of the ISO/tz-aware ``run_start_datetime`` /
 ``checkpoint_datetime`` pair the baselines branch writes.
 
-Usage: python verify_checkpoints.py <ckpt_dir> [--expect N] [--base-model Qwen/Qwen3-8B]
+Two-tier retention (async_training.resumable_ckpts_to_keep=N with save_contents that include
+model/optimizer/extra): pass ``--resumable-last N`` and the N newest checkpoints must additionally
+hold actor/dist_ckpt/ + replay_buffer.pt + rollout_queue.pt while every older one must have them
+pruned; without the flag the legacy hf-only rule applies (no dist_ckpt/ anywhere).
+
+Usage: python verify_checkpoints.py <ckpt_dir> [--expect N] [--base-model Qwen/Qwen3-8B] [--resumable-last N]
 Exits non-zero and prints every failure it found.
 """
 
@@ -116,7 +121,46 @@ def _first_tensor(hf_dir, key):
     return None
 
 
-def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
+RESUMABLE_PIECES = ("actor/dist_ckpt", "replay_buffer.pt", "rollout_queue.pt")
+
+
+def resumable_expectation(index: int, n_steps: int, resumable_last: int):
+    """What the step at ``index`` (ascending order) must hold under --resumable-last N:
+    None (N == 0) = the legacy hf-only rule (no dist_ckpt anywhere); True = the resume-only
+    pieces must be present (one of the N newest); False = they must have been pruned."""
+    if not resumable_last or resumable_last <= 0:
+        return None
+    return index >= n_steps - resumable_last
+
+
+def _tree_size(path: str) -> int:
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            total += os.path.getsize(os.path.join(root, f))
+    return total
+
+
+def check_resumable_pieces(step_dir: str, report, expect_resumable) -> None:
+    """Resume-only state check for one checkpoint directory (see resumable_expectation)."""
+    name = os.path.basename(step_dir)
+    present = {piece: os.path.exists(os.path.join(step_dir, piece)) for piece in RESUMABLE_PIECES}
+    if expect_resumable is None:
+        # save_contents=['hf_model'] must not leave a sharded checkpoint behind, on either backend
+        report.check(not present["actor/dist_ckpt"], f"{name}: no megatron dist_ckpt/ (hf_model-only save)")
+        return
+    if expect_resumable:
+        for piece, ok in present.items():
+            size = _tree_size(os.path.join(step_dir, piece)) / 1e9 if ok else 0.0
+            report.check(ok, f"{name}: resumable piece {piece} present ({size:.1f} GB)")
+    else:
+        leftovers = [piece for piece, ok in present.items() if ok]
+        report.check(not leftovers, f"{name}: resume-only state pruned (left: {leftovers})")
+
+
+def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None, expect_resumable=None):
     """Everything one global_step_N directory must contain. Returns its parsed timing state.
 
     expect_dtype pins the weight dtype ("BF16"/"F32"); the megatron arms save bf16, while an FSDP2
@@ -137,11 +181,7 @@ def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
         any(f.endswith(".safetensors") for f in files),
         f"{name}: weights written (files: {sorted(files)})",
     )
-    # save_contents=['hf_model'] must not leave a sharded checkpoint behind, on either backend
-    report.check(
-        not os.path.exists(os.path.join(step_dir, "actor", "dist_ckpt")),
-        f"{name}: no megatron dist_ckpt/ (hf_model-only save)",
-    )
+    check_resumable_pieces(step_dir, report, expect_resumable)
     # the FSDP manager writes per-rank shards under the same actor/ directory; fsdp_config.json
     # is written unconditionally by rank 0 and is expected
     shard_prefixes = ("model_world_size_", "optim_world_size_", "extra_state_world_size_")
@@ -226,6 +266,14 @@ def main():
         help="expected weight dtype: BF16 (megatron / bf16 FSDP arms), F32 (FSDP at model_dtype=fp32), "
         'or "any" to only require that one dtype is used throughout',
     )
+    parser.add_argument(
+        "--resumable-last",
+        type=int,
+        default=0,
+        help="two-tier retention (async_training.resumable_ckpts_to_keep=N): the N newest checkpoints must hold "
+        "actor/dist_ckpt + replay_buffer.pt + rollout_queue.pt and every older one must have them pruned; "
+        "0 = legacy hf-only rule (no dist_ckpt anywhere)",
+    )
     args = parser.parse_args()
 
     report = Report()
@@ -250,12 +298,13 @@ def main():
             report.check(False, f"could not read the base model {args.base_model}: {exc}")
 
     timings = []
-    for step in steps:
+    for index, step in enumerate(steps):
         timing = verify_checkpoint(
             os.path.join(args.ckpt_dir, step),
             report,
             base_state=base_state,
             expect_dtype=None if args.dtype.lower() == "any" else args.dtype.upper(),
+            expect_resumable=resumable_expectation(index, len(steps), args.resumable_last),
         )
         timings.append((step, timing))
 
