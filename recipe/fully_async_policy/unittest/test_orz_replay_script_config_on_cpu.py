@@ -122,9 +122,7 @@ class TestOrzReplayArmConfig(unittest.TestCase):
             "actor_rollout_ref.rollout.gpu_memory_utilization",
             "data.max_prompt_length",
             "data.max_response_length",
-            "trainer.save_freq",
             "trainer.resume_mode",
-            "rollout.test_freq",
             "rollout.total_rollout_steps",
             "async_training.replay_buffer.enable",
             "async_training.replay_buffer.requires_mini_batches",
@@ -215,6 +213,15 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         self.assertAlmostEqual(ess.min_ess, 1.07)
         self.assertAlmostEqual(compose(QWEN).actor_rollout_ref.actor.ess_scaling.min_ess, 1.1)
         self.assertIn("min-ess-1.07", self.cfg.trainer.experiment_name)
+
+    def test_validates_and_saves_every_10_updates_unlike_the_twin(self):
+        """test_freq/save_freq 10 (the twin: 20), in parameter-version units — one version per
+        replay update — so the ORZ curves are read at twice the twin's granularity."""
+        self.assertEqual(self.cfg.rollout.test_freq, 10)
+        self.assertEqual(self.cfg.trainer.save_freq, 10)
+        qwen = compose(QWEN)
+        self.assertEqual(qwen.rollout.test_freq, 20)
+        self.assertEqual(qwen.trainer.save_freq, 20)
 
     def test_reuse_halflife_is_one_and_the_twin_has_none(self):
         """The reuse decay (REPLAY_REUSE_PENALTY_DISCUSSION.md) is on for this arm at nu=1 and off
