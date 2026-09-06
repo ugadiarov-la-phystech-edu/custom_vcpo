@@ -20,14 +20,14 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 export PYTHONUNBUFFERED=1
 
 MODEL_PATH=${MODEL_PATH:-"Open-Reasoner-Zero/Open-Reasoner-Zero-7B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/orz-math-72k.parquet"}
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/orz/aime-2024-orz.parquet','/home/jovyan/datasets/math_datasets/orz/aime-2025-orz.parquet']"}
 
 project_name='vcpo'
 
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-n_gpus_rollout=${n_gpus_rollout:-5}
+n_gpus_rollout=${n_gpus_rollout:-3}
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 rollout_mode="async"
@@ -52,7 +52,7 @@ precision_dtype="bfloat16"
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-33}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-35}
 micro_bsz_per_gpu=1
 use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
@@ -69,18 +69,18 @@ use_kl_loss=False
 kl_loss_coef=0.0
 use_kl_in_reward=False
 kl_coef=0.0
-entropy_coeff=0
+entropy_coeff=${entropy_coeff:-0}
 calculate_entropy=True
 grad_clip=1.0
 
-lr=1e-6
+lr=${lr:-1e-6}
 lr_warmup_steps=0
 weight_decay=0.1
 
 update_policy_per_traj=True
 grad_baselining=False
 ess_enable=${ess_enable:-True}
-min_ess=${min_ess:-1.1}
+min_ess=${min_ess:-1.07}
 ess_lr_scale=${ess_lr_scale:-0.5}
 ess_use_clipped=False
 ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
@@ -96,15 +96,15 @@ log_probs_pearson_corr=${log_probs_pearson_corr:-True}
 skip_recompute_old_log_prob=True
 compute_prox_log_prob=False
 
-staleness_threshold=${staleness_threshold:-64.0}
+staleness_threshold=${staleness_threshold:-32.0}
 updates_per_param_sync=1
 num_minibatches_per_update=1
 partial_rollout=True
 use_rollout_log_probs=True
 
 replay_enable=${replay_enable:-True}
-replay_tau=${replay_tau:-16}
-replay_staleness_threshold=${replay_staleness_threshold:-64}
+replay_tau=${replay_tau:-8}
+replay_staleness_threshold=${replay_staleness_threshold:-32}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
 replay_save_state=False
@@ -132,7 +132,7 @@ reward_fn_name=${reward_fn_name:-"compute_score"}
 val_temperature=${val_temperature:-1.0}
 val_top_p=${val_top_p:-1.0}
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
