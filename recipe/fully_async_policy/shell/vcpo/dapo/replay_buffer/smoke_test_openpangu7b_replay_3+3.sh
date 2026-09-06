@@ -54,7 +54,7 @@ echo "[smoke] training finished in $(( $(date +%s) - start_time ))s" >&2
 
 set +x
 echo "==================== checkpoint verification ===================="
-python "${HERE}/verify_checkpoints.py" "${CKPTS_DIR}" --expect 2 --dtype BF16 --base-model "${MODEL_PATH}"
+python "${HERE}/verify_checkpoints.py" "${CKPTS_DIR}" --expect 2 --dtype BF16 --base-model "${MODEL_PATH}" --resumable-last "${VERIFY_RESUMABLE_LAST:-0}"
 
 echo "==================== validation accuracy ===================="
 python - "${CKPTS_DIR}" <<'PY'

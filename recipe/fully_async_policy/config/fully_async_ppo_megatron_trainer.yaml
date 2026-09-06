@@ -37,6 +37,8 @@ async_training:
   # save partial rollouts and completed rollouts in the replay buffer queue
   save_queue_state: True
 
+  resumable_ckpts_to_keep: null
+
   opportunistic_epochs:
 
     enable: False

@@ -268,6 +268,14 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         b = OmegaConf.to_container(self.base, resolve=True)
         a["async_training"]["replay_buffer"].pop("min_fresh_ratio")
         b["async_training"]["replay_buffer"].pop("min_fresh_ratio")
+        # the second deliberate divergence: the two-tier checkpoint policy (tested separately)
+        for cfg in (a, b):
+            cfg["actor_rollout_ref"]["actor"]["checkpoint"].pop("save_contents")
+            cfg["actor_rollout_ref"]["actor"]["checkpoint"].pop("load_contents", None)
+            cfg["trainer"].pop("resume_mode")
+            cfg["async_training"]["replay_buffer"].pop("save_state")
+            cfg["async_training"].pop("save_queue_state")
+            cfg["async_training"].pop("resumable_ckpts_to_keep", None)
         a_text = json.dumps(a, sort_keys=True)
         self.assertIn(" fresh-0.5", a_text)
         self.assertEqual(json.loads(a_text.replace(" fresh-0.5", "")), b)
@@ -276,6 +284,27 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         text = script_text(PANGU_FRESH)
         self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}", text)
         self.assertIn("FRESH-SHARE GATE", text)
+
+    def test_checkpoint_policy_is_hf_every_save_plus_last_resumable(self):
+        """hf_model at every save (kept), full resumable state (model+optimizer+extra, replay buffer,
+        rollouter queues) written every save and pruned from all but the newest checkpoint by
+        async_training.resumable_ckpts_to_keep=1; resume_mode=auto. The base arm stays hf-only."""
+        ckpt = self.cfg.actor_rollout_ref.actor.checkpoint
+        self.assertEqual(list(ckpt.save_contents), ["model", "optimizer", "extra", "hf_model"])
+        self.assertEqual(self.cfg.trainer.resume_mode, "auto")
+        self.assertEqual(self.cfg.trainer.save_freq, 5)
+        self.assertIsNone(self.cfg.trainer.max_actor_ckpt_to_keep)  # would rmtree hf_model too
+        self.assertIs(self.cfg.async_training.replay_buffer.save_state, True)
+        self.assertIs(self.cfg.async_training.save_queue_state, True)
+        self.assertEqual(self.cfg.async_training.resumable_ckpts_to_keep, 1)
+        self.assertEqual(list(self.base.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
+        self.assertEqual(self.base.trainer.resume_mode, "disable")
+        self.assertIsNone(self.base.async_training.get("resumable_ckpts_to_keep", None))
+        text = script_text(PANGU_FRESH)
+        self.assertIn('async_training.resumable_ckpts_to_keep="${resumable_ckpts_to_keep}"', text)
+        self.assertIn("resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-1}", text)
+        self.assertIn("# CHECKPOINTS", text)
+        self.assertNotIn("Model checkpointing is OFF", text)
 
 
 class TestOpenPanguReplayArmScriptText(unittest.TestCase):

@@ -121,7 +121,7 @@ if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${repl
 replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}
 replay_fresh_tag=""
 if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
-replay_save_state=False
+replay_save_state=${replay_save_state:-True}
 
 dynamic_filtering_enable=False
 min_buffered_batches=1.0
@@ -129,15 +129,16 @@ opportunistic_enable=False
 opportunistic_max_extra_epochs=0
 serialize_validation=${serialize_validation:-True}
 pause_generation_during_save=${pause_generation_during_save:-True}
-save_queue_state=False
+save_queue_state=${save_queue_state:-True}
 
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
 test_freq=${test_freq:-5}
 save_freq=${save_freq:-5}
 max_actor_ckpt_to_keep=null
-ckpt_save_contents="['hf_model']"
-resume_mode=disable
+ckpt_save_contents=${ckpt_save_contents:-"['model','optimizer','extra','hf_model']"}
+resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-1}
+resume_mode=${resume_mode:-auto}
 
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos"}
 exp_name_safe=${exp_name//\//_}
@@ -294,6 +295,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.serialize_validation="${serialize_validation}" \
     async_training.pause_generation_during_save="${pause_generation_during_save}" \
     async_training.save_queue_state="${save_queue_state}" \
+    async_training.resumable_ckpts_to_keep="${resumable_ckpts_to_keep}" \
     async_training.replay_buffer.enable="${replay_enable}" \
     async_training.replay_buffer.tau="${replay_tau}" \
     async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \

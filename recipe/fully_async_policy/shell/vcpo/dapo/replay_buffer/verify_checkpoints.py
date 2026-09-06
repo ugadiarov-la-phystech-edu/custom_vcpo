@@ -86,7 +86,41 @@ def _first_tensor(hf_dir, key):
     return None
 
 
-def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
+RESUMABLE_PIECES = ("actor/dist_ckpt", "replay_buffer.pt", "rollout_queue.pt")
+
+
+def resumable_expectation(index: int, n_steps: int, resumable_last: int):
+    if not resumable_last or resumable_last <= 0:
+        return None
+    return index >= n_steps - resumable_last
+
+
+def _tree_size(path: str) -> int:
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            total += os.path.getsize(os.path.join(root, f))
+    return total
+
+
+def check_resumable_pieces(step_dir: str, report, expect_resumable) -> None:
+    name = os.path.basename(step_dir)
+    present = {piece: os.path.exists(os.path.join(step_dir, piece)) for piece in RESUMABLE_PIECES}
+    if expect_resumable is None:
+        report.check(not present["actor/dist_ckpt"], f"{name}: no megatron dist_ckpt/ (hf_model-only save)")
+        return
+    if expect_resumable:
+        for piece, ok in present.items():
+            size = _tree_size(os.path.join(step_dir, piece)) / 1e9 if ok else 0.0
+            report.check(ok, f"{name}: resumable piece {piece} present ({size:.1f} GB)")
+    else:
+        leftovers = [piece for piece, ok in present.items() if ok]
+        report.check(not leftovers, f"{name}: resume-only state pruned (left: {leftovers})")
+
+
+def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None, expect_resumable=None):
     name = os.path.basename(step_dir)
     hf_dir = os.path.join(step_dir, "actor", "huggingface")
 
@@ -101,10 +135,7 @@ def verify_checkpoint(step_dir, report, base_state=None, expect_dtype=None):
         any(f.endswith(".safetensors") for f in files),
         f"{name}: weights written (files: {sorted(files)})",
     )
-    report.check(
-        not os.path.exists(os.path.join(step_dir, "actor", "dist_ckpt")),
-        f"{name}: no megatron dist_ckpt/ (hf_model-only save)",
-    )
+    check_resumable_pieces(step_dir, report, expect_resumable)
     shard_prefixes = ("model_world_size_", "optim_world_size_", "extra_state_world_size_")
     actor_files = os.listdir(os.path.join(step_dir, "actor"))
     fsdp_shards = [f for f in actor_files if f.startswith(shard_prefixes)]
@@ -180,6 +211,14 @@ def main():
         help="expected weight dtype: BF16 (megatron / bf16 FSDP arms), F32 (FSDP at model_dtype=fp32), "
         'or "any" to only require that one dtype is used throughout',
     )
+    parser.add_argument(
+        "--resumable-last",
+        type=int,
+        default=0,
+        help="two-tier retention (async_training.resumable_ckpts_to_keep=N): the N newest checkpoints must hold "
+        "actor/dist_ckpt + replay_buffer.pt + rollout_queue.pt and every older one must have them pruned; "
+        "0 = legacy hf-only rule (no dist_ckpt anywhere)",
+    )
     args = parser.parse_args()
 
     report = Report()
@@ -203,12 +242,13 @@ def main():
             report.check(False, f"could not read the base model {args.base_model}: {exc}")
 
     timings = []
-    for step in steps:
+    for index, step in enumerate(steps):
         timing = verify_checkpoint(
             os.path.join(args.ckpt_dir, step),
             report,
             base_state=base_state,
             expect_dtype=None if args.dtype.lower() == "any" else args.dtype.upper(),
+            expect_resumable=resumable_expectation(index, len(steps), args.resumable_last),
         )
         timings.append((step, timing))
 
