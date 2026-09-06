@@ -138,9 +138,9 @@ val_top_p=${val_top_p:-1.0}
 
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife}${replay_fresh_tag} ess-${ess_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
-log_dir="logs/${exp_name_safe}"
-CKPTS_DIR="${log_dir}"
-mkdir -p -- "${log_dir}"
+log_dir=${log_dir:-"logs/${exp_name_safe}"}
+CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
+mkdir -p -- "${log_dir}" "${CKPTS_DIR}"
 export TENSORBOARD_DIR="${log_dir}/tensorboard"
 
 trainer_logger="['console','tensorboard']"

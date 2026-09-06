@@ -285,6 +285,48 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}", text)
         self.assertIn("FRESH-SHARE GATE", text)
 
+    def test_locations_default_to_logs_under_exp_name(self):
+        """log_dir (TensorBoard + rollout dumps) and CKPTS_DIR (checkpoints) both default to
+        logs/<exp_name>, like the base arm."""
+        exp = self.cfg.trainer.experiment_name
+        self.assertEqual(self.cfg.trainer.default_local_dir, f"logs/{exp}")
+        self.assertEqual(self.cfg.trainer.rollout_data_dir, f"logs/{exp}")
+        self.assertEqual(self.base.trainer.default_local_dir, f"logs/{self.base.trainer.experiment_name}")
+
+    def test_locations_are_env_overridable_separately(self):
+        """log_dir and CKPTS_DIR can be pointed elsewhere independently (absolute paths); the
+        checkpoint policy keys are unaffected by the move."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = os.path.join(tmp, "runs", "x")
+            ckpts = os.path.join(tmp, "ckpts", "x")
+            env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet")
+            env["log_dir"] = log_dir
+            env["CKPTS_DIR"] = ckpts
+            with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
+                proc = subprocess.run(
+                    ["bash", os.path.join(REPLAY, PANGU_FRESH), "--cfg", "job", "--resolve"],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    stdout=out,
+                    stderr=subprocess.PIPE,
+                    timeout=900,
+                )
+                if proc.returncode != 0:
+                    raise unittest.SkipTest(f"could not compose {PANGU_FRESH}: {proc.stderr.decode()[-300:]}")
+                out.flush()
+                out.seek(0)
+                cfg = OmegaConf.load(out.name)
+            self.assertEqual(cfg.trainer.default_local_dir, ckpts)
+            self.assertEqual(cfg.trainer.rollout_data_dir, log_dir)
+            self.assertEqual(cfg.trainer.experiment_name, self.cfg.trainer.experiment_name)
+            self.assertEqual(cfg.async_training.resumable_ckpts_to_keep, 1)
+            # the script creates both directories up front (mkdir -p), even for a --cfg dry run
+            self.assertTrue(os.path.isdir(log_dir) and os.path.isdir(ckpts))
+        text = script_text(PANGU_FRESH)
+        self.assertIn('log_dir=${log_dir:-"logs/${exp_name_safe}"}', text)
+        self.assertIn('CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}', text)
+        self.assertIn('export TENSORBOARD_DIR="${log_dir}/tensorboard"', text)
+
     def test_checkpoint_policy_is_hf_every_save_plus_last_resumable(self):
         """hf_model at every save (kept), full resumable state (model+optimizer+extra, replay buffer,
         rollouter queues) written every save and pruned from all but the newest checkpoint by

@@ -141,9 +141,9 @@ resume_mode=disable
 
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos"}
 exp_name_safe=${exp_name//\//_}
-log_dir="logs/${exp_name_safe}"
-CKPTS_DIR="${log_dir}"
-mkdir -p -- "${log_dir}"
+log_dir=${log_dir:-"logs/${exp_name_safe}"}
+CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
+mkdir -p -- "${log_dir}" "${CKPTS_DIR}"
 export TENSORBOARD_DIR="${log_dir}/tensorboard"
 
 trainer_logger="['console','tensorboard']"
