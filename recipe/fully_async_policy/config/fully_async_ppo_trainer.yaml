@@ -63,6 +63,10 @@ async_training:
 
     requires_mini_batches: 2
 
+    min_fresh_ratio: 0.0
+
+    min_fresh_wait_timeout_s: 3600
+
     sampling_seed: 1234
 
     save_state: True

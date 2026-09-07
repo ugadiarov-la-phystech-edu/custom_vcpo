@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 import time
 from collections import defaultdict
@@ -143,6 +144,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self.replay_reuse_halflife = float(_reuse_halflife) if _reuse_halflife is not None else None
             self.replay_requires_mini_batches = float(replay_cfg.get("requires_mini_batches", 2))
             assert self.replay_requires_mini_batches >= 1, "replay_buffer.requires_mini_batches must be >= 1"
+            self.replay_min_fresh_ratio = float(replay_cfg.get("min_fresh_ratio", 0.0))
+            assert 0.0 <= self.replay_min_fresh_ratio <= 1.0, (
+                f"replay_buffer.min_fresh_ratio must be in [0, 1], got {self.replay_min_fresh_ratio}"
+            )
+            self.replay_min_fresh_wait_timeout_s = float(replay_cfg.get("min_fresh_wait_timeout_s", 3600.0))
+            self.replay_fresh_poll_interval_s = 0.5
             self.replay_sampling_seed = int(replay_cfg.get("sampling_seed", 1234))
             self.replay_save_state = bool(replay_cfg.get("save_state", True))
             assert self.trigger_parameter_sync_step == 1, (
@@ -482,10 +489,51 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 )
                 return None, None
             self._wait_one_sample_into_buffer()
+        self._replay_fresh_wait_s, self._replay_fresh_floor_waived = self._wait_for_fresh_floor(mini_size)
         entries, info = self.replay_buffer.compose_minibatch(mini_size, self.current_param_version)
         consumer_end = time.time()
         self._open_virtual_step(consumer_end, [e.sample for e in entries[: info["n_new"]]])
         return entries, info
+
+    def _replay_min_fresh_groups(self, mini_size: int) -> int:
+        ratio = float(getattr(self, "replay_min_fresh_ratio", 0.0))
+        if ratio <= 0.0:
+            return 0
+        return min(mini_size, int(math.ceil(ratio * mini_size - 1e-9)))
+
+    def _wait_for_fresh_floor(self, mini_size: int) -> tuple[float, int]:
+        floor = self._replay_min_fresh_groups(mini_size)
+        if floor <= 0 or self.replay_buffer.pending_fresh_count() >= floor:
+            return 0.0, 0
+        timeout = float(getattr(self, "replay_min_fresh_wait_timeout_s", 3600.0))
+        poll = float(getattr(self, "replay_fresh_poll_interval_s", 0.5))
+        start = time.time()
+        waited = 0.0
+        announced = False
+        while self.replay_buffer.pending_fresh_count() < floor:
+            waited = time.time() - start
+            if self.rollout_done:
+                print(
+                    f"[FullyAsyncTrainer][Replay] rollout finished: fresh floor {floor} waived with "
+                    f"{self.replay_buffer.pending_fresh_count()} pending fresh groups"
+                )
+                return waited, 1
+            if timeout > 0.0 and waited >= timeout:
+                print(
+                    f"[FullyAsyncTrainer][Replay] WARNING: fresh floor {floor} not met after {waited:.0f}s "
+                    f"({self.replay_buffer.pending_fresh_count()} pending fresh groups); composing anyway"
+                )
+                return waited, 1
+            if self._drain_queue_into_buffer() == 0:
+                if poll > 0.0:
+                    time.sleep(poll)
+                if not announced and waited >= 60.0:
+                    announced = True
+                    print(
+                        f"[FullyAsyncTrainer][Replay] waiting for fresh groups: "
+                        f"{self.replay_buffer.pending_fresh_count()}/{floor} after {waited:.0f}s"
+                    )
+        return time.time() - start, 0
 
     def _replay_post_update_maintenance(self, entries, new_version: int) -> None:
         self.replay_buffer.mark_trained(entries)
@@ -562,6 +610,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         )
         if buffer_staleness:
             metrics["replay/buffer_staleness_mean"] = float(np.mean(buffer_staleness))
+        n_new = int(info["n_new"])
+        fresh_staleness = list(info.get("fresh_staleness", minibatch_staleness[:n_new]))
+        replayed_staleness = list(minibatch_staleness[n_new:])
+        if fresh_staleness:
+            metrics["replay/minibatch_fresh_staleness_mean"] = float(np.mean(fresh_staleness))
+            metrics["replay/minibatch_fresh_staleness_max"] = float(np.max(fresh_staleness))
+        if replayed_staleness:
+            metrics["replay/minibatch_replayed_staleness_mean"] = float(np.mean(replayed_staleness))
+        metrics["replay/fresh_floor"] = float(self._replay_min_fresh_groups(int(self.required_samples)))
+        metrics["replay/fresh_wait_s"] = float(getattr(self, "_replay_fresh_wait_s", 0.0))
+        metrics["replay/fresh_floor_waived"] = float(getattr(self, "_replay_fresh_floor_waived", 0))
         if minibatch_times_trained:
             metrics["replay/minibatch_times_trained_mean"] = float(np.mean(minibatch_times_trained))
             metrics["replay/minibatch_times_trained_max"] = float(np.max(minibatch_times_trained))

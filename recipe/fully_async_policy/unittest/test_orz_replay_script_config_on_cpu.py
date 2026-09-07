@@ -41,6 +41,8 @@ from omegaconf import OmegaConf
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 REPLAY = os.path.join(REPO_ROOT, "recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer")
 
+# the Qwen twin carries nu=1 and fresh=0.5 in its name; the ORZ arm derives its own
+# name from the stem WITHOUT those tags (it runs nu=1 but no gate)
 STEM = "grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5"
 ORZ = (
     STEM.replace("dapo17k_5+3", "orz72k_3+5")
@@ -48,7 +50,7 @@ ORZ = (
     .replace("min-ess=1.1", "min-ess=1.07")
     + "_orz7b.sh"
 )
-QWEN = f"{STEM}.sh"
+QWEN = f"{STEM}_nu=1_fresh=0.5.sh"
 SMOKE_3P3 = "smoke_test_orz7b_replay_3+3.sh"
 
 _COMPOSED = {}
@@ -223,14 +225,45 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         self.assertEqual(qwen.rollout.test_freq, 20)
         self.assertEqual(qwen.trainer.save_freq, 20)
 
-    def test_reuse_halflife_is_one_and_the_twin_has_none(self):
-        """The reuse decay (REPLAY_REUSE_PENALTY_DISCUSSION.md) is on for this arm at nu=1 and off
-        (null) for the Qwen twin, whose draws must stay bit-for-bit what they were."""
+    def test_reuse_halflife_is_one_on_this_arm_and_the_twin(self):
+        """The reuse decay (REPLAY_REUSE_PENALTY_DISCUSSION.md) runs at nu=1 on this arm and, since
+        2026-09-07, on the Qwen twin as well; both tag it into the experiment name."""
         self.assertEqual(self.cfg.async_training.replay_buffer.reuse_halflife, 1)
         self.assertIn(" nu-1 ", self.cfg.trainer.experiment_name)
         qwen = compose(QWEN)
-        self.assertIsNone(qwen.async_training.replay_buffer.reuse_halflife)
-        self.assertNotIn("nu-", qwen.trainer.experiment_name)
+        self.assertEqual(qwen.async_training.replay_buffer.reuse_halflife, 1)
+        self.assertIn(" nu-1 ", qwen.trainer.experiment_name)
+
+    def test_fresh_share_gate_is_off_by_default_and_env_overridable(self):
+        """replay_buffer.min_fresh_ratio (the trainer waits for ceil(ratio x mini) groups that arrived
+        from the rollouter since the last composition) defaults to 0 here, while the Qwen twin runs
+        0.5 and tags it; the knob reaches hydra and tags the experiment name only when set."""
+        self.assertEqual(self.cfg.async_training.replay_buffer.min_fresh_ratio, 0)
+        self.assertNotIn("fresh-", self.cfg.trainer.experiment_name)
+        qwen = compose(QWEN)
+        self.assertAlmostEqual(qwen.async_training.replay_buffer.min_fresh_ratio, 0.5)
+        self.assertIn(" nu-1 fresh-0.5 ", qwen.trainer.experiment_name)
+        text = open(os.path.join(REPLAY, ORZ)).read()
+        self.assertIn('async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}"', text)
+        self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}", text)
+        env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet")
+        env["replay_min_fresh_ratio"] = "0.5"
+        with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
+            proc = subprocess.run(
+                ["bash", os.path.join(REPLAY, ORZ), "--cfg", "job", "--resolve"],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=out,
+                stderr=subprocess.PIPE,
+                timeout=900,
+            )
+            if proc.returncode != 0:
+                raise unittest.SkipTest(f"could not compose {ORZ}: {proc.stderr.decode()[-300:]}")
+            out.flush()
+            out.seek(0)
+            cfg = OmegaConf.load(out.name)
+        self.assertAlmostEqual(cfg.async_training.replay_buffer.min_fresh_ratio, 0.5)
+        self.assertIn(" nu-1 fresh-0.5 ", cfg.trainer.experiment_name)
 
     def test_replay_depth_is_half_the_twins(self):
         """tau=8 / k=32 against the twin's 16 / 64: the ORZ-7B post-mortems tie its divergences to
