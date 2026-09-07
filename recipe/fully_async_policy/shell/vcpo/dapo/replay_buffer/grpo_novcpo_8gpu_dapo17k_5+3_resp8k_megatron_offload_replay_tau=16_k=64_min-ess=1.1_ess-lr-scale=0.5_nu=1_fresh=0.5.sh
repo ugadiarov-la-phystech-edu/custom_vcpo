@@ -269,9 +269,9 @@ save_queue_state=False # no queue snapshots in checkpoints: resume is disabled
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
 # Model versions now tick once per UPDATE (not per 132-group step): validate /
-# checkpoint every 20 updates (=660 groups consumed, matching the 5-step
-# cadence of the B-33x4 arms in group units).
-test_freq=${test_freq:-20}
+# checkpoint every 25 updates (=825 groups consumed; 20 updates = 660 groups
+# matched the 5-step cadence of the B-33x4 arms in group units until 2026-09-07).
+test_freq=${test_freq:-25} # was 20 until 2026-09-07
 # Model checkpointing is OFF: save_freq<=0 disables _check_save_checkpoint's
 # save gate entirely (fully_async_trainer.py), so no global_step_N/ directory
 # — not even an hf_model — is ever written; zero checkpoint disk footprint.
@@ -282,7 +282,7 @@ test_freq=${test_freq:-20}
 # (nothing ever calls the code path they gate) but left False for when
 # save_freq is overridden back on. Re-enable saving with save_freq=N>0 and
 # set ckpt_save_contents/max_actor_ckpt_to_keep as needed.
-save_freq=${save_freq:-20}
+save_freq=${save_freq:-25} # was 20 until 2026-09-07
 max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable
