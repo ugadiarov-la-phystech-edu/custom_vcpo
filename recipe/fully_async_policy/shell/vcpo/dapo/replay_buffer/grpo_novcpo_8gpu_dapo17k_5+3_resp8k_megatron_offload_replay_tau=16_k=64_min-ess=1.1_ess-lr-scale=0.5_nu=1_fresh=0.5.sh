@@ -6,8 +6,25 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=grpo-novcpo-replay-ess
+#SBATCH --job-name=grpo-novcpo-replay-ess-nu1-fresh0.5
 
+# REUSE DECAY + FRESH-SHARE GATE (2026-09-07; renamed from
+# ..._replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5.sh). Two defaults changed
+# from that script, both env-overridable and both tagged into exp_name:
+#   * replay_buffer.reuse_halflife=1 (was null): each training halves a group's
+#     replay-draw weight, 2^(-times_trained/1). Mean reuse stays M/A; the 4+-pass
+#     tail and the trained-once-then-evicted tail go away and replayed picks get
+#     younger (REPLAY_REUSE_PENALTY_DISCUSSION.md). The ORZ 3+5 arm has run nu=1
+#     since 2026-09-06.
+#   * replay_buffer.min_fresh_ratio=0.5 (was 0): the trainer waits until
+#     ceil(0.5 x 33) = 17 groups have arrived from the rollouter since the last
+#     composition (see the knob's comment below). On this 5+3 geometry the Qwen
+#     twins saw 12-17 arrivals per update, so expect a short wait on some updates
+#     (~0.1 update-times on average) and a mean reuse of ~2 instead of 2-2.7; the
+#     openPangu 5+3 arm at the same floor never waited (20-28 arrivals/update).
+# The null/0 combination of the previous script is reproduced with
+#   replay_reuse_halflife=null replay_min_fresh_ratio=0 bash <this script>.
+#
 # MIN-ESS-braked replay arm (mbs=1 per-traj path): the ESS brake is a floor
 # detector — brake (lr * ess_lr_scale) only when the mini-batch's global ESS
 # is <= min_ess (1.1) effective samples, i.e. within 10% of the structural
@@ -211,12 +228,27 @@ replay_staleness_threshold=${replay_staleness_threshold:-64}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
 # Reuse-decay half-life in trainings (2^(-times_trained/nu) on the replay draw
-# weight; REPLAY_REUSE_PENALTY_DISCUSSION.md). null = the staleness-only draw
-# this arm has always used, bit-for-bit; set e.g. 1 to enable. Tagged into
-# exp_name only when set.
-replay_reuse_halflife=${replay_reuse_halflife:-null}
+# weight; REPLAY_REUSE_PENALTY_DISCUSSION.md). 1 by default since 2026-09-07
+# (see REUSE DECAY + FRESH-SHARE GATE); null = the staleness-only draw the
+# previous script used, bit-for-bit. Tagged into exp_name only when set.
+replay_reuse_halflife=${replay_reuse_halflife:-1}
 replay_reuse_tag=""
 if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${replay_reuse_halflife}"; fi
+# Fresh-share gate (replay_buffer.min_fresh_ratio): with a value f > 0 the trainer
+# does not run an update until ceil(f x mini_bsz) groups have ARRIVED FROM THE
+# ROLLOUTER since the previous mini-batch was composed (the fresh prefix of the
+# next mini-batch; untrained groups already in the buffer do not count). Mean
+# trainings per group become ~1/f instead of M/A (mini-batch groups / arrivals per
+# update) at the cost of trainer idle time (~f x M/A - 1 update-times per update);
+# waiting does not age the fresh groups (no version is produced meanwhile). 0 keeps
+# the arm bit-for-bit. The wait is capped by replay_buffer.min_fresh_wait_timeout_s
+# (yaml default 3600 s; on the cap the update runs anyway and
+# replay/fresh_floor_waived logs 1). Fresh groups are NOT on-policy — a long
+# rollout spans several updates — so watch replay/minibatch_fresh_staleness_mean.
+# 0.5 by default since 2026-09-07 (see REUSE DECAY + FRESH-SHARE GATE); 0 = never wait.
+replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}
+replay_fresh_tag=""
+if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
@@ -256,7 +288,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -416,5 +448,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"

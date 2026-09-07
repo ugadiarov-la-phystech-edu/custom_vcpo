@@ -121,6 +121,27 @@ async_training:
     # while the buffer holds < requires_mini_batches * ppo_mini_batch_size groups
     requires_mini_batches: 2
 
+    # Fresh-share gate: an update waits until at least ceil(min_fresh_ratio x
+    # ppo_mini_batch_size) groups have arrived FROM THE ROLLOUTER since the
+    # previous composition (the fresh prefix of the next mini-batch; untrained
+    # groups already in the pool do not count — they lost their one-shot
+    # freshness). 0 = never wait (historical behaviour, draws bit-for-bit);
+    # 1 = every update is pure fresh. Mean trainings per group become ~1/ratio
+    # instead of mini-batch groups / arrivals per update, at the cost of trainer
+    # idle time (~ratio x mini_size / arrivals-per-update update-times).
+    # Waiting does not age the fresh groups (no version is produced meanwhile).
+    # Waived once the rollouter is finished (the tail drains pure replay as
+    # without the gate)
+    min_fresh_ratio: 0.0
+
+    # Wall-clock cap on that wait, seconds (<= 0 = uncapped). On the cap the
+    # trainer composes anyway and logs replay/fresh_floor_waived=1. Guards the
+    # post-collapse hang: the rollouter pauses after mini_size x
+    # (async_training.staleness_threshold + 1) samples since the last version
+    # change, degenerate groups count there but never reach the buffer, so with
+    # nearly-all-degenerate rollouts both sides could wait on each other forever
+    min_fresh_wait_timeout_s: 3600
+
     # Seed for the weighted without-replacement sampling of replayed groups
     sampling_seed: 1234
 
