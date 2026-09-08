@@ -108,6 +108,28 @@ TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.par
 
 project_name='vcpo'
 
+# ================= Seeds =================
+# One SEED (default 1) feeds every seed knob this pipeline exposes, as in the
+# main_ppo sync arms:
+#   * data.seed                             -> rollouter prompt order (the
+#     RandomSampler torch.Generator of create_rl_sampler) + RLHFDataset subset rng;
+#   * actor_rollout_ref.actor.megatron.seed -> set_random_seed on every trainer
+#     worker (torch / numpy / random + Megatron's model-parallel CUDA rng);
+#     ref.megatron.seed resolves from it via oc.select, critic.megatron.seed
+#     does not (literal 42) and is set explicitly -- inert under GRPO;
+#   * actor_rollout_ref.actor.data_loader_seed -> the Megatron actor's
+#     mini-batch shuffle seed (only used with actor.shuffle=True);
+#   * async_training.replay_buffer.sampling_seed -> the weighted
+#     without-replacement draw of replayed groups (replay_sampling_seed below
+#     follows SEED unless overridden separately);
+#   * async_training.ppo_epochs_shuffle_seed / opportunistic_epochs.shuffle_seed
+#     -> group shuffles of the fractional / opportunistic epoch paths (both off).
+#   NOT covered: vLLM's sampling seed -- vllm_async_server.py passes
+#   config.get("seed", 0) but RolloutConfig has no `seed` field, so the engine
+#   seed is always 0. SEED is part of exp_name ("seed-N") so repeats get their
+#   own log dir.
+SEED=${SEED:-1}
+
 # ================= GPU Layout =================
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -225,7 +247,7 @@ replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-16}
 replay_staleness_threshold=${replay_staleness_threshold:-64}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
-replay_sampling_seed=${replay_sampling_seed:-1234}
+replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
@@ -265,7 +287,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo dynbsz B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo dynbsz B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -290,6 +312,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
+    data.seed=${SEED} \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.return_raw_chat=${return_raw_chat} \
     data.filter_overlong_prompts=True \
@@ -326,6 +349,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ess_scaling.min_ess=${min_ess} \
     actor_rollout_ref.actor.ess_scaling.lr_scale=${ess_lr_scale} \
     actor_rollout_ref.actor.ess_scaling.use_clipped=${ess_use_clipped} \
+    actor_rollout_ref.actor.data_loader_seed=${SEED} \
+    actor_rollout_ref.actor.megatron.seed=${SEED} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \
@@ -384,6 +409,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
+    critic.megatron.seed=${SEED} \
     critic.megatron.tensor_model_parallel_size=${train_tp} \
     critic.megatron.pipeline_model_parallel_size=${train_pp} \
     critic.megatron.context_parallel_size=${train_cp} \
@@ -427,5 +453,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
+    async_training.ppo_epochs_shuffle_seed=${SEED} \
+    async_training.opportunistic_epochs.shuffle_seed=${SEED} \
     async_training.replay_buffer.save_state="${replay_save_state}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
