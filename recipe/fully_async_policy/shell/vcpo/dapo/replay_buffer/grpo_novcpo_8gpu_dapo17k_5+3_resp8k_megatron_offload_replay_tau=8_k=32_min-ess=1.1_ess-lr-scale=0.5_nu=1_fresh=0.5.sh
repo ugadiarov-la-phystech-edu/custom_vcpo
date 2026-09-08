@@ -37,9 +37,11 @@
 # backend-independent. NOTE: the removed ess_scaling keys (scaling_rule,
 # base_ess_ratio, trigger_ratio) no longer exist in the dataclass — sibling
 # historical scripts that still set them fail fast at Hydra instantiation.
-# Inherited replay-arm mechanics (trainer-side replay buffer, tau=16,
-# eviction k=64, rmb=1, sync after every update, DAPO insertion gate, frozen
-# advantages / behavior log-probs):
+# Inherited replay-arm mechanics (trainer-side replay buffer, tau=8,
+# eviction k=32 — halved from the tau=16 / k=64 of the arm this was derived
+# from, keeping the 2^-4 terminal sampling weight at the eviction horizon;
+# rmb=1, sync after every update, DAPO insertion gate, frozen advantages /
+# behavior log-probs):
 #   * update_policy_per_traj=True: every mini-batch's sequence-level IS
 #     ratios against the cached behavior log-probs are DP-all-reduced into
 #     ess_ratio = (sum w)^2 / (B * sum w^2), logged as staleness/ess_ratio
@@ -67,17 +69,18 @@
 #     actor/ess_scaled_lr + staleness/ess_ratio via structured metrics)
 #     every update.
 # Replay-arm notes that still apply:
-#   * Groups staler than replay_buffer.staleness_threshold=64 updates are
+#   * Groups staler than replay_buffer.staleness_threshold=32 updates are
 #     evicted after each update; scores are recomputed each update. With
-#     tau=16 a staleness-64 group still carries sampling weight 2^-4 = 1/16 —
-#     deep replay is intended. The buffer retains every kept group of the
-#     last 64 updates (~1000-1600 groups, roughly 7-12 GB driver RAM and the
-#     same for replay_buffer.pt in checkpoints).
+#     tau=8 a staleness-32 group still carries sampling weight 2^-4 = 1/16 —
+#     the tau=16 / k=64 arm's terminal weight at half the depth. The buffer
+#     retains every kept group of the last 32 updates (~500-800 groups,
+#     roughly 4-6 GB driver RAM and the same for replay_buffer.pt in
+#     checkpoints).
 #   * Warm-up/watermark: requires_mini_batches=1 — the first update consumes
 #     a fresh mini-batch of unseen groups; afterwards training pauses only
 #     while the buffer holds < 1*33 = 33 groups.
-#   * async_training.staleness_threshold=64 aligns the rollouter's generation
-#     quota with the eviction horizon (33*(64+1)=2145 groups licensed; in
+#   * async_training.staleness_threshold=32 aligns the rollouter's generation
+#     quota with the eviction horizon (33*(32+1)=1089 groups licensed; in
 #     practice a stall backstop — concurrency caps at 165 in-flight).
 #   * Model versions tick once per UPDATE: test/save freq are in update units.
 #   * serialize_validation=True / pause_generation_during_save=True kept:
@@ -215,7 +218,7 @@ compute_prox_log_prob=False
 # Generation quota aligned with the replay eviction horizon: groups older
 # than replay_staleness_threshold updates are deleted anyway, so licensing
 # generation beyond it would only produce evicted-unseen waste.
-staleness_threshold=${staleness_threshold:-64.0}
+staleness_threshold=${staleness_threshold:-32.0}
 updates_per_param_sync=1     # REQUIRED by replay mode: sync after every update
 num_minibatches_per_update=1 # REQUIRED by replay mode: one mini-batch per update
 partial_rollout=True
@@ -223,8 +226,8 @@ use_rollout_log_probs=True
 
 # ================= Replay buffer =================
 replay_enable=${replay_enable:-True}
-replay_tau=${replay_tau:-16}
-replay_staleness_threshold=${replay_staleness_threshold:-64}
+replay_tau=${replay_tau:-8}
+replay_staleness_threshold=${replay_staleness_threshold:-32}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
 # Reuse-decay half-life in trainings (2^(-times_trained/nu) on the replay draw

@@ -9,7 +9,7 @@
 #SBATCH --job-name=grpo-novcpo-replay-ess
 
 # Open-Reasoner-Zero-7B variant of
-#   ..._megatron_offload_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5.sh
+#   ..._megatron_offload_replay_tau=8_k=32_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5.sh
 # trained on ORZ's OWN RL data (orz-math-72k) with ORZ-prompt validation sets.
 # Every min-ESS, optimizer and schedule setting below is byte-identical to
 # that arm; the differences are the model, the experiment name, the validation
