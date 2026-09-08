@@ -43,13 +43,8 @@ REPLAY = os.path.join(REPO_ROOT, "recipe/fully_async_policy/shell/vcpo/dapo/repl
 
 # the Qwen twin carries nu=1 and fresh=0.5 in its name; the ORZ arm derives its own
 # name from the stem WITHOUT those tags (it runs nu=1 but no gate)
-STEM = "grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=16_k=64_min-ess=1.1_ess-lr-scale=0.5"
-ORZ = (
-    STEM.replace("dapo17k_5+3", "orz72k_3+5")
-    .replace("tau=16_k=64", "tau=8_k=32")
-    .replace("min-ess=1.1", "min-ess=1.07")
-    + "_orz7b.sh"
-)
+STEM = "grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=8_k=32_min-ess=1.1_ess-lr-scale=0.5"
+ORZ = STEM.replace("dapo17k_5+3", "orz72k_3+5").replace("min-ess=1.1", "min-ess=1.07") + "_orz7b.sh"
 QWEN = f"{STEM}_nu=1_fresh=0.5.sh"
 SMOKE_3P3 = "smoke_test_orz7b_replay_3+3.sh"
 
@@ -265,20 +260,18 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         self.assertAlmostEqual(cfg.async_training.replay_buffer.min_fresh_ratio, 0.5)
         self.assertIn(" nu-1 fresh-0.5 ", cfg.trainer.experiment_name)
 
-    def test_replay_depth_is_half_the_twins(self):
-        """tau=8 / k=32 against the twin's 16 / 64: the ORZ-7B post-mortems tie its divergences to
-        deep staleness, so this arm halves the reuse depth while keeping the terminal sampling
-        weight (2^-4 at the eviction horizon). The rollouter's generation quota follows k so no
-        group is generated only to be evicted unseen."""
-        rb = self.cfg.async_training.replay_buffer
-        self.assertEqual((rb.tau, rb.staleness_threshold), (8, 32))
-        self.assertEqual(self.cfg.async_training.staleness_threshold, 32)
+    def test_replay_depth_is_tau8_k32_on_both_arms(self):
+        """tau=8 / k=32 on this arm and, since 2026-09-08, on the Qwen twin too (renamed from the
+        tau=16_k=64 arm it was derived from): the ORZ-7B post-mortems tie divergences to
+        deep staleness, so both halve the reuse depth of the original arm while keeping the
+        terminal sampling weight (2^-4 at the eviction horizon). The rollouter's generation quota
+        follows k so no group is generated only to be evicted unseen."""
         qwen = compose(QWEN)
-        self.assertEqual(
-            (qwen.async_training.replay_buffer.tau, qwen.async_training.replay_buffer.staleness_threshold),
-            (16, 64),
-        )
-        self.assertEqual(qwen.async_training.staleness_threshold, qwen.async_training.replay_buffer.staleness_threshold)
+        for cfg in (self.cfg, qwen):
+            rb = cfg.async_training.replay_buffer
+            self.assertEqual((rb.tau, rb.staleness_threshold), (8, 32))
+            self.assertEqual(cfg.async_training.staleness_threshold, 32)
+        self.assertIn("tau-8 k-32", qwen.trainer.experiment_name)
 
     def test_layout_is_three_rollout_plus_five_trainer_gpus(self):
         """ORZ-7B's short responses make the per-traj update the bottleneck, so this arm hands the

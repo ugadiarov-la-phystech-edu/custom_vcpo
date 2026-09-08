@@ -96,15 +96,15 @@ log_probs_pearson_corr=${log_probs_pearson_corr:-True}
 skip_recompute_old_log_prob=True
 compute_prox_log_prob=False
 
-staleness_threshold=${staleness_threshold:-64.0}
+staleness_threshold=${staleness_threshold:-32.0}
 updates_per_param_sync=1
 num_minibatches_per_update=1
 partial_rollout=True
 use_rollout_log_probs=True
 
 replay_enable=${replay_enable:-True}
-replay_tau=${replay_tau:-16}
-replay_staleness_threshold=${replay_staleness_threshold:-64}
+replay_tau=${replay_tau:-8}
+replay_staleness_threshold=${replay_staleness_threshold:-32}
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-1234}
 replay_reuse_halflife=${replay_reuse_halflife:-1}
