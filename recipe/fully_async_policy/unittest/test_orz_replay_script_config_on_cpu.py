@@ -217,13 +217,13 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         self.assertIn("min-ess-1.07", self.cfg.trainer.experiment_name)
 
     def test_validates_and_saves_every_10_updates_unlike_the_twin(self):
-        """test_freq/save_freq 10 (the twin: 20), in parameter-version units — one version per
+        """test_freq/save_freq 10 (the twin: 25), in parameter-version units — one version per
         replay update — so the ORZ curves are read at twice the twin's granularity."""
         self.assertEqual(self.cfg.rollout.test_freq, 10)
         self.assertEqual(self.cfg.trainer.save_freq, 10)
         qwen = compose(QWEN)
-        self.assertEqual(qwen.rollout.test_freq, 20)
-        self.assertEqual(qwen.trainer.save_freq, 20)
+        self.assertEqual(qwen.rollout.test_freq, 25)
+        self.assertEqual(qwen.trainer.save_freq, 25)
 
     def test_reuse_halflife_is_one_on_this_arm_and_the_twin(self):
         """The reuse decay (REPLAY_REUSE_PENALTY_DISCUSSION.md) runs at nu=1 on this arm and, since
