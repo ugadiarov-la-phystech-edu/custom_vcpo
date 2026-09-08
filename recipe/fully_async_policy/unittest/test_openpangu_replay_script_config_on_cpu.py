@@ -79,6 +79,26 @@ def compose(script_name, stub_test_file=True):
     return cfg
 
 
+def compose_env(script_name, extra_env):
+    """Uncached variant of compose() with extra environment overrides."""
+    env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet")
+    env.update(extra_env)
+    with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
+        proc = subprocess.run(
+            ["bash", os.path.join(REPLAY, script_name), "--cfg", "job", "--resolve"],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=out,
+            stderr=subprocess.PIPE,
+            timeout=900,
+        )
+        if proc.returncode != 0:
+            raise unittest.SkipTest(f"could not compose {script_name}: {proc.stderr.decode()[-300:]}")
+        out.flush()
+        out.seek(0)
+        return OmegaConf.load(out.name)
+
+
 def script_text(script_name):
     with open(os.path.join(REPLAY, script_name)) as f:
         return f.read()
@@ -260,22 +280,18 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         self.assertNotIn("fresh-", self.base.trainer.experiment_name)
 
     def test_everything_else_equals_the_base(self):
-        """Identical to the base once the one knob and the name tag (which the experiment name
-        propagates into the checkpoint / rollout-dump / validation-dump paths) are removed."""
+        """Identical to the base once the gate knob, the name tag (which the experiment name
+        propagates into the checkpoint / rollout-dump / validation-dump paths) and the
+        validation / save cadence (15 vs 5, tested separately) are removed. In particular the
+        checkpoint policy is the base's hf-only one."""
         import json
 
         a = OmegaConf.to_container(self.cfg, resolve=True)
         b = OmegaConf.to_container(self.base, resolve=True)
-        a["async_training"]["replay_buffer"].pop("min_fresh_ratio")
-        b["async_training"]["replay_buffer"].pop("min_fresh_ratio")
-        # the second deliberate divergence: the two-tier checkpoint policy (tested separately)
         for cfg in (a, b):
-            cfg["actor_rollout_ref"]["actor"]["checkpoint"].pop("save_contents")
-            cfg["actor_rollout_ref"]["actor"]["checkpoint"].pop("load_contents", None)
-            cfg["trainer"].pop("resume_mode")
-            cfg["async_training"]["replay_buffer"].pop("save_state")
-            cfg["async_training"].pop("save_queue_state")
-            cfg["async_training"].pop("resumable_ckpts_to_keep", None)
+            cfg["async_training"]["replay_buffer"].pop("min_fresh_ratio")
+            cfg["rollout"].pop("test_freq")
+            cfg["trainer"].pop("save_freq")
         a_text = json.dumps(a, sort_keys=True)
         self.assertIn(" fresh-0.5", a_text)
         self.assertEqual(json.loads(a_text.replace(" fresh-0.5", "")), b)
@@ -319,7 +335,7 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
             self.assertEqual(cfg.trainer.default_local_dir, ckpts)
             self.assertEqual(cfg.trainer.rollout_data_dir, log_dir)
             self.assertEqual(cfg.trainer.experiment_name, self.cfg.trainer.experiment_name)
-            self.assertEqual(cfg.async_training.resumable_ckpts_to_keep, 1)
+            self.assertIsNone(cfg.async_training.get("resumable_ckpts_to_keep", None))
             # the script creates both directories up front (mkdir -p), even for a --cfg dry run
             self.assertTrue(os.path.isdir(log_dir) and os.path.isdir(ckpts))
         text = script_text(PANGU_FRESH)
@@ -327,26 +343,54 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         self.assertIn('CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}', text)
         self.assertIn('export TENSORBOARD_DIR="${log_dir}/tensorboard"', text)
 
-    def test_checkpoint_policy_is_hf_every_save_plus_last_resumable(self):
-        """hf_model at every save (kept), full resumable state (model+optimizer+extra, replay buffer,
-        rollouter queues) written every save and pruned from all but the newest checkpoint by
-        async_training.resumable_ckpts_to_keep=1; resume_mode=auto. The base arm stays hf-only."""
-        ckpt = self.cfg.actor_rollout_ref.actor.checkpoint
-        self.assertEqual(list(ckpt.save_contents), ["model", "optimizer", "extra", "hf_model"])
-        self.assertEqual(self.cfg.trainer.resume_mode, "auto")
-        self.assertEqual(self.cfg.trainer.save_freq, 5)
-        self.assertIsNone(self.cfg.trainer.max_actor_ckpt_to_keep)  # would rmtree hf_model too
-        self.assertIs(self.cfg.async_training.replay_buffer.save_state, True)
-        self.assertIs(self.cfg.async_training.save_queue_state, True)
-        self.assertEqual(self.cfg.async_training.resumable_ckpts_to_keep, 1)
-        self.assertEqual(list(self.base.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
-        self.assertEqual(self.base.trainer.resume_mode, "disable")
-        self.assertIsNone(self.base.async_training.get("resumable_ckpts_to_keep", None))
+    def test_validates_and_saves_every_15_updates(self):
+        """test_freq/save_freq 15 on this variant (the base openPangu arm: 5, the twin: 20) in
+        parameter-version units; both stay env-overridable."""
+        self.assertEqual(self.cfg.rollout.test_freq, 15)
+        self.assertEqual(self.cfg.trainer.save_freq, 15)
+        self.assertEqual(self.base.rollout.test_freq, 5)
+        self.assertEqual(self.base.trainer.save_freq, 5)
+        cfg = compose_env(PANGU_FRESH, {"test_freq": "3", "save_freq": "6"})
+        self.assertEqual(cfg.rollout.test_freq, 3)
+        self.assertEqual(cfg.trainer.save_freq, 6)
+
+    def test_checkpoints_are_hf_model_only_like_the_base(self):
+        """hf_model at every save and nothing resumable: no dist-ckpt, replay buffer or queue
+        snapshots, resume_mode=disable, nothing to prune. Same as the base arm."""
+        for cfg in (self.cfg, self.base):
+            self.assertEqual(list(cfg.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
+            self.assertEqual(cfg.trainer.resume_mode, "disable")
+            self.assertIsNone(cfg.trainer.max_actor_ckpt_to_keep)  # would rmtree hf_model too
+            self.assertIs(cfg.async_training.replay_buffer.save_state, False)
+            self.assertIs(cfg.async_training.save_queue_state, False)
+            self.assertIsNone(cfg.async_training.get("resumable_ckpts_to_keep", None))
         text = script_text(PANGU_FRESH)
-        self.assertIn('async_training.resumable_ckpts_to_keep="${resumable_ckpts_to_keep}"', text)
-        self.assertIn("resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-1}", text)
-        self.assertIn("# CHECKPOINTS", text)
-        self.assertNotIn("Model checkpointing is OFF", text)
+        self.assertIn("ckpt_save_contents=${ckpt_save_contents:-\"['hf_model']\"}", text)
+        self.assertIn("resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-null}", text)
+        self.assertIn("resume_mode=${resume_mode:-disable}", text)
+
+    def test_two_tier_resumable_policy_stays_reachable_through_env(self):
+        """The knobs documented in CHECKPOINTS switch the full resumable policy back on without
+        editing the script: full save contents, one resumable checkpoint kept, resume_mode=auto,
+        replay buffer + queue snapshots."""
+        cfg = compose_env(
+            PANGU_FRESH,
+            {
+                "ckpt_save_contents": "['model','optimizer','extra','hf_model']",
+                "resumable_ckpts_to_keep": "1",
+                "resume_mode": "auto",
+                "replay_save_state": "True",
+                "save_queue_state": "True",
+            },
+        )
+        ckpt = cfg.actor_rollout_ref.actor.checkpoint
+        self.assertEqual(list(ckpt.save_contents), ["model", "optimizer", "extra", "hf_model"])
+        self.assertEqual(cfg.async_training.resumable_ckpts_to_keep, 1)
+        self.assertEqual(cfg.trainer.resume_mode, "auto")
+        self.assertIs(cfg.async_training.replay_buffer.save_state, True)
+        self.assertIs(cfg.async_training.save_queue_state, True)
+        self.assertIsNone(cfg.trainer.max_actor_ckpt_to_keep)
+        self.assertEqual(cfg.trainer.save_freq, 15)
 
 
 class TestOpenPanguReplayArmScriptText(unittest.TestCase):
