@@ -176,8 +176,8 @@
 #     tau=8 a staleness-32 group still carries sampling weight 2^-4 = 1/16 —
 #     the twin's terminal weight at half the depth (see REPLAY DEPTH). The
 #     buffer retains every kept group of the last 32 updates (~500-800
-#     groups, roughly 4-6 GB driver RAM and the same for replay_buffer.pt in
-#     checkpoints).
+#     groups, roughly 4-6 GB driver RAM; the same for replay_buffer.pt when
+#     the two-tier checkpoint knobs are on).
 #   * Warm-up/watermark: requires_mini_batches=1 — the first update consumes
 #     a fresh mini-batch of unseen groups; afterwards training pauses only
 #     while the buffer holds < 1*33 = 33 groups.
@@ -390,7 +390,7 @@ if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${repl
 replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5} # the base: 0 (see FRESH-SHARE GATE)
 replay_fresh_tag=""
 if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
-replay_save_state=${replay_save_state:-True} # replay_buffer.pt is part of the resumable state (see CHECKPOINTS)
+replay_save_state=${replay_save_state:-False} # no replay_buffer.pt: hf-only checkpoints, resume disabled (see CHECKPOINTS)
 
 # ================= Elastic mechanisms OFF / stop-the-world accounting =================
 # Replay mode subsumes DAPO filtering (insertion gate always on) and replaces
@@ -401,7 +401,7 @@ opportunistic_enable=False
 opportunistic_max_extra_epochs=0
 serialize_validation=${serialize_validation:-True}
 pause_generation_during_save=${pause_generation_during_save:-True}
-save_queue_state=${save_queue_state:-True} # rollout_queue.pt / message_queue.pt are part of the resumable state (see CHECKPOINTS)
+save_queue_state=${save_queue_state:-False} # no queue snapshots: hf-only checkpoints, resume disabled (see CHECKPOINTS)
 
 # ================= Training/Rollout Steps =================
 # Same 66000-prompt generation budget as the B-33x4 arms (500 steps * 132
@@ -409,54 +409,39 @@ save_queue_state=${save_queue_state:-True} # rollout_queue.pt / message_queue.pt
 # trained horizon proportionally.
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
-# Model versions now tick once per UPDATE (not per 132-group step): validate /
-# checkpoint every 20 updates (=660 groups consumed, matching the 5-step
-# cadence of the B-33x4 arms in group units).
-test_freq=${test_freq:-5} # the twin: 20
-# CHECKPOINTS — two tiers. Every save_freq updates (parameter-version units, one
-# version per replay update) the trainer writes a FULL checkpoint:
-#   global_step_N/actor/huggingface/       hf_model export (bf16 safetensors + config +
-#                                          tokenizer; loadable by vLLM as is) — KEPT AT EVERY SAVE
-#   global_step_N/actor/dist_ckpt/         Megatron dist-checkpoint: model + optimizer + extra
-#   global_step_N/replay_buffer.pt         the replay buffer (groups, scores, RNG, counters)
-#   global_step_N/rollout_queue.pt, message_queue.pt   the rollouter's in-flight / queued groups
+# Model versions tick once per UPDATE (not per 132-group step): validate /
+# checkpoint every 15 updates (=495 groups consumed; the base openPangu arm
+# every 5, the Qwen twin every 20).
+test_freq=${test_freq:-15} # the twin: 20, the base openPangu arm: 5
+# CHECKPOINTS — hf_model only, like the base arm. Every save_freq updates (parameter-version
+# units, one version per replay update) the trainer exports
+#   global_step_N/actor/huggingface/   bf16 safetensors + config + tokenizer (loadable by vLLM as is)
 #   global_step_N/timing_state.json, data.pt, actor/transformer_config.json   (small)
-# and then, with async_training.resumable_ckpts_to_keep=1, deletes dist_ckpt/ + replay_buffer.pt +
-# rollout_queue.pt + message_queue.pt from every OLDER global_step_* directory, so exactly one
-# resumable checkpoint (the newest) exists at any time while the hf_model of every save stays
-# for evaluation. trainer.max_actor_ckpt_to_keep must stay null: that knob rmtree's whole actor/
-# directories, hf_model included. The base arm and the Qwen twin keep the hf-only policy.
-#
-# Disk (remote_h100, ~600 GB free): hf ~16 GB per save (the accumulating part: ~320 GB per 100
-# updates at save_freq=5 — this fills the disk first); the resumable state ~65-100 GB
-# (bf16 weights + bf16 master + Adam moments under the precision-aware CPU-offload optimizer;
-# NOT YET MEASURED — record it after the first save) + replay_buffer.pt 4-6 GB + queue snapshots,
-# present in the newest directory only, ~2x that at the instant of a save.
-#
-# resume_mode=auto: a relaunch under the SAME exp_name resumes from the newest full checkpoint
-# (actor, optimizer, replay buffer, queues, timing offsets all restored; a directory whose resume
-# state was pruned is refused with a clear error). A fresh start needs a new exp_name or removing
-# the run directory. The stop-the-world save pause (pause_generation_during_save) now brackets a
-# multi-minute dist-checkpoint write to NFS instead of the ~45 s hf export; it is excluded from
-# cumulative_training_time by design. This is the first arm on this stack that saves the
-# Megatron optimizer under optimizer_cpu_offload — run the 3+3 smoke with
-# ARM_SCRIPT=<this script> and verify_checkpoints.py --resumable-last 1 before a long run.
-save_freq=${save_freq:-5} # the twin: 20
+# No Megatron dist-checkpoint, replay buffer or queue snapshot is written, so a run cannot be
+# resumed; resume_mode=disable also keeps a stale global_step_* under a reused exp_name from being
+# picked up. Disk: hf ~16 GB per save, ~107 GB per 100 updates at save_freq=15.
+# trainer.max_actor_ckpt_to_keep stays null: that knob rmtree's whole actor/ directories.
+# The two-tier resumable policy remains reachable through the env knobs below:
+#   ckpt_save_contents="['model','optimizer','extra','hf_model']" resumable_ckpts_to_keep=1
+#   resume_mode=auto replay_save_state=True save_queue_state=True
+# (full checkpoint measured at 121 GB on this stack, global_step_220 of the 2026-09-07 run; the
+# save pause then brackets a multi-minute dist-checkpoint write instead of the ~45 s hf export).
+save_freq=${save_freq:-15} # the twin: 20, the base openPangu arm: 5
 max_actor_ckpt_to_keep=null # MUST stay null (see CHECKPOINTS)
-ckpt_save_contents=${ckpt_save_contents:-"['model','optimizer','extra','hf_model']"} # the base: ['hf_model']
-resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-1} # the base: null (nothing to prune)
-resume_mode=${resume_mode:-auto} # the base: disable
+ckpt_save_contents=${ckpt_save_contents:-"['hf_model']"}
+resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-null} # nothing to prune with hf-only saves
+resume_mode=${resume_mode:-disable}
 
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # LOCATIONS, env-overridable. log_dir: TensorBoard (log_dir/tensorboard) and the rollout /
 # validation dumps (trainer.rollout_data_dir). CKPTS_DIR (trainer.default_local_dir): the
-# global_step_N/ checkpoints — hf exports at every save plus the newest full resumable one
-# (see CHECKPOINTS). Both default to logs/<exp_name> under the launch directory (the repo
-# root); absolute paths are fine, e.g. CKPTS_DIR on a volume with more room than the shared
-# filesystem. resume_mode=auto looks for a previous run in CKPTS_DIR, so keep it stable
-# across relaunches of the same exp_name.
+# global_step_N/ checkpoints — hf exports at every save (see CHECKPOINTS). Both default to
+# logs/<exp_name> under the launch directory (the repo root); absolute paths are fine, e.g.
+# CKPTS_DIR on a volume with more room than the shared filesystem. With the two-tier knobs,
+# resume_mode=auto looks for a previous run in CKPTS_DIR, so keep it stable across relaunches
+# of the same exp_name.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
 CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
 mkdir -p -- "${log_dir}" "${CKPTS_DIR}"
