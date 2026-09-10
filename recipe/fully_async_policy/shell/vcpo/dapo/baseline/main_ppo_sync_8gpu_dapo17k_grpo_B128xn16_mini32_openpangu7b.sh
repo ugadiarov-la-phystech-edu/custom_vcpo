@@ -78,6 +78,15 @@ calculate_log_probs=True
 test_freq=${test_freq:-2}
 save_freq=${save_freq:-2}
 total_epochs=${total_epochs:-3}
+max_updates=${max_updates:-null}
+updates_per_step=$(( train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs ))
+(( updates_per_step >= 1 )) || { echo "updates_per_step must be >= 1 (train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs)" >&2; exit 2; }
+if [[ "${max_updates}" == "null" ]]; then
+    total_training_steps=null
+else
+    [[ "${max_updates}" =~ ^[1-9][0-9]*$ ]] || { echo "max_updates must be a positive integer or null, got '${max_updates}'" >&2; exit 2; }
+    total_training_steps=$(( (max_updates + updates_per_step - 1) / updates_per_step ))
+fi
 val_before_train=${val_before_train:-True}
 save_contents=${save_contents:-"['hf_model']"}
 max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null}
@@ -188,4 +197,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
+    trainer.total_training_steps=${total_training_steps} \
     trainer.total_epochs=${total_epochs} "$@"
