@@ -18,6 +18,12 @@ async_training:
   # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
   require_batches: 1
 
+  # Not a key here: trainer.total_training_steps (verl's standard key, null in
+  # the base config) caps the number of trainer UPDATES in the async trainer
+  # (FullyAsyncTrainer._train_step_cap_reached). The run ends at the cap or at
+  # rollout.total_rollout_steps, whichever comes first; at the cap a final
+  # checkpoint is forced and the rollouter is cancelled by fully_async_main.
+
   # Non-integer scheduled PPO epochs over each pulled batch (driver-side).
   # null keeps the single whole-batch update_actor call (worker-internal
   # mini-batch loop over require_batches mini-batches). A float f instead runs

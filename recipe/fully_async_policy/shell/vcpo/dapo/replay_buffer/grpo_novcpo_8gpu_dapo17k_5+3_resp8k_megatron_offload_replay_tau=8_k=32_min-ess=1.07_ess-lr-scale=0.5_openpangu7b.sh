@@ -375,6 +375,14 @@ save_queue_state=False # no queue snapshots in checkpoints: resume is disabled
 # groups). Fed prompts, not kept groups: filtering shortens the effective
 # trained horizon proportionally.
 total_rollout_steps=${total_rollout_steps:-66000}
+# Cap on OPTIMIZER UPDATES (= parameter versions here: one sync per update), passed
+# as verl's trainer.total_training_steps; the same env knob as the sync main_ppo arms
+# (there it is converted to rollout steps). null = no cap, the prompt budget above
+# decides; whichever of the two comes first ends the run. At the cap the trainer runs
+# the usual final validation and writes a final checkpoint (hf_model) even when the
+# version is not a multiple of save_freq, and the rollouter is cancelled.
+#   export max_updates=500; bash <this script>
+max_updates=${max_updates:-null}
 epochs=10000000
 # Model versions now tick once per UPDATE (not per 132-group step): validate /
 # checkpoint every 20 updates (=660 groups consumed, matching the 5-step
@@ -546,6 +554,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     rollout.nnodes="${NNODES}" \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
+    trainer.total_training_steps="${max_updates}" \
     rollout.total_epochs="${epochs}" \
     rollout.test_freq="${test_freq}" \
     async_training.staleness_threshold="${staleness_threshold}" \
