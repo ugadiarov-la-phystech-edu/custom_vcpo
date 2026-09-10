@@ -223,6 +223,23 @@ calculate_log_probs=True
 test_freq=${test_freq:-5}    # rollout steps (= 20 optimizer updates)
 save_freq=${save_freq:-5}    # rollout steps
 total_epochs=${total_epochs:-3}
+# Cap on OPTIMIZER UPDATES (null = none: total_epochs decides). One rollout step runs
+# updates_per_step = train_prompt_bsz / ppo_mini_batch_size * ppo_epochs updates, so the
+# cap is rounded UP to whole rollout steps and passed as verl's trainer.total_training_steps:
+# that step runs validation + a checkpoint save regardless of test_freq / save_freq and ends
+# the run (RayPPOTrainer.is_last_step). total_epochs still bounds it from above (a cap beyond
+# the epoch budget is never reached). LR is constant with no warmup: unaffected. A trailing
+# trainer.total_training_steps=N on the command line (the OOM smoke) still overrides this.
+#   export max_updates=200; bash <this script>
+max_updates=${max_updates:-null}
+updates_per_step=$(( train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs ))
+(( updates_per_step >= 1 )) || { echo "updates_per_step must be >= 1 (train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs)" >&2; exit 2; }
+if [[ "${max_updates}" == "null" ]]; then
+    total_training_steps=null
+else
+    [[ "${max_updates}" =~ ^[1-9][0-9]*$ ]] || { echo "max_updates must be a positive integer or null, got '${max_updates}'" >&2; exit 2; }
+    total_training_steps=$(( (max_updates + updates_per_step - 1) / updates_per_step ))
+fi
 val_before_train=${val_before_train:-True}
 # Weights only, in huggingface format: no optimizer state (fp32 master + 2 adam
 # moments is ~6x the bf16 weights on the megatron distributed optimizer) and no
@@ -339,4 +356,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
+    trainer.total_training_steps=${total_training_steps} \
     trainer.total_epochs=${total_epochs} "$@"
