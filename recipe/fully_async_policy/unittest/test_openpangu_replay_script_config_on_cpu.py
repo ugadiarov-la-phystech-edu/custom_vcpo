@@ -343,6 +343,24 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         self.assertIn('CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}', text)
         self.assertIn('export TENSORBOARD_DIR="${log_dir}/tensorboard"', text)
 
+    def test_max_updates_caps_updates_and_is_unset_by_default(self):
+        """trainer.total_training_steps (verl's key, read by FullyAsyncTrainer as a cap on
+        optimizer updates = parameter versions here) is null on both openPangu arms: the prompt
+        budget alone ends the run. The env knob max_updates (same name as in the sync main_ppo
+        arms) sets it and leaves rollout.total_rollout_steps as the second bound."""
+        for cfg in (self.cfg, self.base):
+            self.assertIsNone(cfg.trainer.total_training_steps)
+            self.assertEqual(cfg.rollout.total_rollout_steps, 66000)
+        for arm in (PANGU, PANGU_FRESH):
+            text = script_text(arm)
+            self.assertIn("max_updates=${max_updates:-null}", text, arm)
+            self.assertIn('trainer.total_training_steps="${max_updates}"', text, arm)
+            self.assertNotIn("${total_training_steps", text, arm)  # the old knob name is gone
+        cfg = compose_env(PANGU_FRESH, {"max_updates": "150"})
+        self.assertEqual(cfg.trainer.total_training_steps, 150)
+        self.assertEqual(cfg.rollout.total_rollout_steps, 66000)
+        self.assertEqual(cfg.trainer.save_freq, 15)  # a cap off the grid still gets the forced final save
+
     def test_validates_and_saves_every_15_updates(self):
         """test_freq/save_freq 15 on this variant (the base openPangu arm: 5, the twin: 20) in
         parameter-version units; both stay env-overridable."""

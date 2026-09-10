@@ -98,6 +98,15 @@ def prune_resumable_checkpoint_state(root_dir: str, keep: Optional[int], current
     return removed
 
 
+def parse_max_train_steps(value) -> int | None:
+    if value is None:
+        return None
+    steps = int(value)
+    if steps < 1:
+        raise ValueError(f"trainer.total_training_steps must be >= 1 or null, got {value!r}")
+    return steps
+
+
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
     """
@@ -163,6 +172,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.total_train_steps = None
         self.progress_bar = None
         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
+        self.max_train_steps = parse_max_train_steps(config.trainer.get("total_training_steps", None))
+        self.stopped_by_step_cap = False
         self.last_ckpt_version = 0
         self.cumulative_save_time = 0.0
         self.rollouter_first_sample_time = None
@@ -253,8 +264,21 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.param_synchronizer = param_synchronizer
 
     def set_total_train_steps(self, total_train_steps):
+        if self.max_train_steps is not None:
+            total_train_steps = min(total_train_steps, self.max_train_steps)
         self.total_train_steps = total_train_steps
         self.progress_bar = tqdm(total=self.total_train_steps, initial=0, desc="Training Progress")
+
+    def _train_step_cap_reached(self) -> bool:
+        if self.max_train_steps is None or self.global_steps <= self.max_train_steps:
+            return False
+        if not self.stopped_by_step_cap:
+            print(
+                f"[FullyAsyncTrainer] reached trainer.total_training_steps={self.max_train_steps} "
+                f"after {self.global_steps - 1} updates; stopping"
+            )
+            self.stopped_by_step_cap = True
+        return True
 
     def get_actor_wg(self):
         """Get actor worker group"""
@@ -445,6 +469,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
         while True:
+            if self._train_step_cap_reached():
+                break
             metrics = {}
             timing_raw = {}
             self._step_wait_valid_time = 0.0
@@ -505,7 +531,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._log_validation_data()
         self.progress_bar.close()
 
-        self._check_save_checkpoint(timing_raw)
+        self._check_save_checkpoint(timing_raw, force=self.stopped_by_step_cap)
 
     def _drain_queue_into_buffer(self) -> int:
         drained = self.message_queue_client.get_available_samples_sync()
@@ -719,6 +745,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         timing_raw = {}
         while True:
+            if self._train_step_cap_reached():
+                break
             metrics = {}
             timing_raw = {}
             self._step_wait_valid_time = 0.0
@@ -770,9 +798,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._log_validation_data()
         self.progress_bar.close()
 
-        self._check_save_checkpoint(timing_raw)
+        self._check_save_checkpoint(timing_raw, force=self.stopped_by_step_cap)
 
-    def _check_save_checkpoint(self, timing_raw):
+    def _check_save_checkpoint(self, timing_raw, force: bool = False):
         if self.current_param_version == self.last_ckpt_version:
             return
         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
@@ -787,10 +815,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         # 2. The current step number is a multiple of the save frequency.
         # 3. The ESI(Elastic Server Instance)/training plan is close to expiration.
         if self.config.trainer.save_freq > 0 and (
-            self.current_param_version % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+            self.current_param_version % self.config.trainer.save_freq == 0 or esi_close_to_expiration or force
         ):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
+            elif force and self.current_param_version % self.config.trainer.save_freq != 0:
+                print(f"Force saving checkpoint at version {self.current_param_version}: step cap reached.")
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 self._save_checkpoint()
                 self.last_ckpt_version = self.current_param_version
