@@ -124,6 +124,7 @@ pause_generation_during_save=${pause_generation_during_save:-True}
 save_queue_state=False
 
 total_rollout_steps=${total_rollout_steps:-66000}
+max_updates=${max_updates:-null}
 epochs=10000000
 test_freq=${test_freq:-10}
 save_freq=${save_freq:-10}
@@ -279,6 +280,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     rollout.nnodes="${NNODES}" \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
+    trainer.total_training_steps="${max_updates}" \
     rollout.total_epochs="${epochs}" \
     rollout.test_freq="${test_freq}" \
     async_training.staleness_threshold="${staleness_threshold}" \

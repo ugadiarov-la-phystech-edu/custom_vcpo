@@ -22,10 +22,10 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
+from recipe.fully_async_policy.detach_utils import resolve_resume_path
 from recipe.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from recipe.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from recipe.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
-from recipe.fully_async_policy.detach_utils import resolve_resume_path
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role
 from verl.utils.fs import copy_to_local
@@ -122,6 +122,13 @@ def create_role_worker_mapping(config):
         role_worker_mapping[Role.RefPolicy] = ray.remote(DetachActorWorker)
 
     return role_worker_mapping, ray_worker_group_cls
+
+
+def remaining_after_completion(done_future, trainer_future, remaining):
+    remaining = list(remaining)
+    if done_future == trainer_future:
+        return remaining, []
+    return [], remaining
 
 
 @ray.remote(num_cpus=1)
@@ -277,6 +284,11 @@ class FullyAsyncTaskRunner:
                         for remaining_future in remaining_futures:
                             ray.cancel(remaining_future)
                         raise e
+                    to_cancel, remaining_futures = remaining_after_completion(future, trainer_future, remaining_futures)
+                    if to_cancel:
+                        print("[ASYNC MAIN] Trainer finished first; cancelling the rollouter")
+                        for remaining_future in to_cancel:
+                            ray.cancel(remaining_future)
 
                 futures = remaining_futures
 
