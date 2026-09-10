@@ -51,6 +51,26 @@ SMOKE_3P3 = "smoke_test_orz7b_replay_3+3.sh"
 _COMPOSED = {}
 
 
+def compose_with_env(script_name, extra_env):
+    """Uncached compose with extra environment overrides (TRAIN_FILE / TEST_FILE stubbed)."""
+    env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet")
+    env.update(extra_env)
+    with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
+        proc = subprocess.run(
+            ["bash", os.path.join(REPLAY, script_name), "--cfg", "job", "--resolve"],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=out,
+            stderr=subprocess.PIPE,
+            timeout=900,
+        )
+        if proc.returncode != 0:
+            raise unittest.SkipTest(f"could not compose {script_name}: {proc.stderr.decode()[-300:]}")
+        out.flush()
+        out.seek(0)
+        return OmegaConf.load(out.name)
+
+
 def compose(script_name, stub_test_file=True):
     """Run the script with hydra's --cfg job --resolve and parse the config it would launch with.
 
@@ -259,6 +279,24 @@ class TestOrzReplayArmConfig(unittest.TestCase):
             cfg = OmegaConf.load(out.name)
         self.assertAlmostEqual(cfg.async_training.replay_buffer.min_fresh_ratio, 0.5)
         self.assertIn(" nu-1 fresh-0.5 ", cfg.trainer.experiment_name)
+
+    def test_max_updates_caps_updates_and_is_unset_by_default(self):
+        """trainer.total_training_steps (verl's key, read by FullyAsyncTrainer as a cap on
+        optimizer updates) is null on both arms: the prompt budget alone ends the run. The env
+        knob max_updates (same name as in the sync main_ppo arms) sets it;
+        rollout.total_rollout_steps stays as the second bound."""
+        qwen = compose(QWEN)
+        for cfg in (self.cfg, qwen):
+            self.assertIsNone(cfg.trainer.total_training_steps)
+            self.assertEqual(cfg.rollout.total_rollout_steps, 66000)
+        for arm in (ORZ, QWEN):
+            text = open(os.path.join(REPLAY, arm)).read()
+            self.assertIn("max_updates=${max_updates:-null}", text, arm)
+            self.assertIn('trainer.total_training_steps="${max_updates}"', text, arm)
+            self.assertNotIn("${total_training_steps", text, arm)  # the old knob name is gone
+        cfg = compose_with_env(ORZ, {"max_updates": "500"})
+        self.assertEqual(cfg.trainer.total_training_steps, 500)
+        self.assertEqual(cfg.rollout.total_rollout_steps, 66000)
 
     def test_replay_depth_is_tau8_k32_on_both_arms(self):
         """tau=8 / k=32 on this arm and, since 2026-09-08, on the Qwen twin too (renamed from the

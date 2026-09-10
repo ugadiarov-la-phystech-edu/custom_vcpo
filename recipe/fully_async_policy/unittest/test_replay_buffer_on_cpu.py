@@ -1526,3 +1526,128 @@ def test_trainer_reads_and_validates_the_min_fresh_gate_from_config():
         < body.index("self._wait_for_fresh_floor(")
         < body.index("compose_minibatch(")
     )
+
+
+# ==================== trainer.total_training_steps: stop at a max number of updates ====================
+
+
+def _make_capped_trainer(cap, global_steps=1):
+    from recipe.fully_async_policy.fully_async_trainer import parse_max_train_steps
+
+    t = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
+    t.max_train_steps = parse_max_train_steps(cap)
+    t.global_steps = global_steps
+    t.stopped_by_step_cap = False
+    return t
+
+
+def test_parse_max_train_steps_accepts_null_and_positive_ints():
+    from recipe.fully_async_policy.fully_async_trainer import parse_max_train_steps
+
+    assert parse_max_train_steps(None) is None
+    assert parse_max_train_steps(500) == 500
+    assert parse_max_train_steps("500") == 500
+    for bad in (0, -1, "0"):
+        with pytest.raises(ValueError):
+            parse_max_train_steps(bad)
+
+
+def test_no_cap_never_stops():
+    t = _make_capped_trainer(None)
+    for step in (1, 10, 10_000):
+        t.global_steps = step
+        assert t._train_step_cap_reached() is False
+    assert t.stopped_by_step_cap is False
+
+
+def test_cap_stops_after_exactly_n_updates(capsys):
+    # global_steps starts at 1 and is incremented after every update: it reads
+    # N+1 once N updates are done, which is when the loop must stop pulling.
+    t = _make_capped_trainer(3)
+    for step in (1, 2, 3):
+        t.global_steps = step
+        assert t._train_step_cap_reached() is False
+    t.global_steps = 4
+    assert t._train_step_cap_reached() is True
+    assert t.stopped_by_step_cap is True
+    assert t._train_step_cap_reached() is True  # idempotent
+    out = capsys.readouterr().out
+    assert out.count("reached trainer.total_training_steps=3 after 3 updates") == 1
+
+
+def test_cap_counts_updates_done_before_a_resume():
+    # load_checkpoint restores global_steps = version * trigger_parameter_sync_step + 1,
+    # so a run resumed at version 5 with a cap of 5 stops before pulling anything.
+    t = _make_capped_trainer(5, global_steps=5 * 1 + 1)
+    assert t._train_step_cap_reached() is True
+    t = _make_capped_trainer(6, global_steps=5 * 1 + 1)
+    assert t._train_step_cap_reached() is False
+
+
+def test_progress_bar_total_honours_the_cap():
+    for cap, budget_steps, expected in ((500, 2000, 500), (None, 2000, 2000), (5000, 2000, 2000)):
+        t = _make_capped_trainer(cap)
+        t.set_total_train_steps(budget_steps)
+        assert t.total_train_steps == expected, (cap, budget_steps)
+        assert t.progress_bar.total == expected
+        t.progress_bar.close()
+
+
+def _make_save_trainer(save_freq, version, last_saved):
+    t = _make_replay_trainer(mini_size=2, requires_mini_batches=1)
+    t.config = SimpleNamespace(trainer=SimpleNamespace(save_freq=save_freq, esi_redundant_time=0))
+    t.max_steps_duration = 0
+    t.current_param_version = version
+    t.last_ckpt_version = last_saved
+    t.cumulative_save_time = 0.0
+    t._step_save_time = 0.0
+    t.saved = []
+    t._save_checkpoint = lambda: t.saved.append(t.current_param_version)
+    return t
+
+
+def test_force_saves_a_final_checkpoint_off_the_save_freq_grid(capsys):
+    t = _make_save_trainer(save_freq=25, version=137, last_saved=125)
+    t._check_save_checkpoint({}, force=False)
+    assert t.saved == []
+    t._check_save_checkpoint({}, force=True)
+    assert t.saved == [137]
+    assert t.last_ckpt_version == 137
+    assert "Force saving checkpoint at version 137: step cap reached." in capsys.readouterr().out
+    # never twice for the same version, forced or not
+    t._check_save_checkpoint({}, force=True)
+    t._check_save_checkpoint({}, force=False)
+    assert t.saved == [137]
+
+
+def test_force_respects_save_freq_zero_and_the_grid():
+    t = _make_save_trainer(save_freq=0, version=137, last_saved=125)
+    t._check_save_checkpoint({}, force=True)
+    assert t.saved == []  # saving is off: the cap does not turn it on
+    t = _make_save_trainer(save_freq=25, version=150, last_saved=125)
+    t._check_save_checkpoint({}, force=False)
+    assert t.saved == [150]  # the grid still saves without force
+
+
+def test_fit_loops_check_the_cap_before_pulling_and_force_the_final_save():
+    import inspect
+
+    for fn, pull in (
+        (FullyAsyncTrainer._fit_replay, "self._acquire_replay_minibatch()"),
+        (FullyAsyncTrainer.fit, "self._get_samples_from_queue()"),
+    ):
+        body = inspect.getsource(fn)
+        assert body.index("if self._train_step_cap_reached():") < body.index(pull), fn.__name__
+        assert "self._check_save_checkpoint(timing_raw, force=self.stopped_by_step_cap)" in body, fn.__name__
+
+
+def test_total_training_steps_is_null_in_the_base_configs_and_read_by_init():
+    import inspect
+    import os
+
+    src = inspect.getsource(FullyAsyncTrainer.__init__)
+    assert 'config.trainer.get("total_training_steps", None)' in src
+    cfg_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "trainer", "config")
+    for name in ("_generated_ppo_trainer.yaml", "_generated_ppo_megatron_trainer.yaml"):
+        cfg = OmegaConf.load(os.path.join(cfg_dir, name))
+        assert cfg.trainer.total_training_steps is None, name
