@@ -150,6 +150,14 @@ rollout_mode=async
 # 0.5 is the ceiling with the resident (non-offloaded) trainer on the Qwen3-8B twin;
 # assumed to carry over (see MEMORY). Raise only together with param_offload=True.
 gpu_memory_utilization=${gpu_memory_utilization:-0.5}
+# H100 emulation on bigger cards (verl/utils/gpu_memory_cap.py): exporting VERL_GPU_MEM_CAP_GB=80
+# in the launching shell caps the TRAINER worker allocator at 80 GiB (actor role only; the vLLM
+# servers are separate processes bounded by gpu_memory_utilization). Pair it with the fraction
+# that gives vLLM the same absolute budget as on an 80 GiB H100: gpu_memory_utilization =
+# 0.5*80/<device GiB> (0.28 on a 143.8 GiB H200). The knob is only READ here, never set. Tagged
+# in exp_name so emulated runs never share a log dir with real ones.
+emu_tag=""
+if [[ -n "${VERL_GPU_MEM_CAP_GB:-}" ]]; then emu_tag=" h100-emu-${VERL_GPU_MEM_CAP_GB}gb-gmu${gpu_memory_utilization}"; fi
 rollout_tp=1
 enable_chunked_prefill=True
 max_num_batched_tokens=$((1024 * 10))
@@ -194,7 +202,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 openPangu-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 openPangu-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"

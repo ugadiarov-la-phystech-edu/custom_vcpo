@@ -51,6 +51,7 @@ from verl.utils.device import (
 from verl.utils.distributed import set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
+from verl.utils.gpu_memory_cap import apply_gpu_memory_cap
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
@@ -284,6 +285,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self._register_dispatch_collect_info(
                 mesh_name="actor", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
             )
+        # Optional smaller-card emulation (VERL_GPU_MEM_CAP_GB), actor-role processes only:
+        # the rollout side is bounded by rollout.gpu_memory_utilization instead (vLLM budgets
+        # against the device total; in async rollout mode its engines are separate processes).
+        if self._is_actor:
+            apply_gpu_memory_cap()
+
         only_rollout = self._is_rollout and not self._is_actor
         set_random_seed(seed=self.config.actor.megatron.seed, only_rollout=only_rollout)
 
