@@ -1,30 +1,39 @@
 #!/usr/bin/env bash
-#SBATCH --gpus-per-node=6
+#SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=128
 #SBATCH --exclusive
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=grpo-novcpo-replay-ess-fresh0.5-3+3-gmu0.95-openpangu7b
+#SBATCH --job-name=grpo-novcpo-replay-ess-fresh0.5-4+4-gmu0.95-openpangu7b
 
-# 3+3 / gmu=0.95 LAYOUT VARIANT of the fresh-share-gated openPangu-Embedded-7B arm
+# 4+4 / gmu=0.95 LAYOUT VARIANT of the fresh-share-gated openPangu-Embedded-7B arm
 #   ..._8gpu_dapo17k_5+3_..._fresh=0.5_openpangu7b.sh
-# for a machine where only SIX GPUs are available (e.g. the shared 8xH200 remote_h200):
-#   * 3 vLLM rollout engines + 3 Megatron trainer GPUs (NGPUS_PER_NODE=6, n_gpus_rollout=3;
-#     the trainer side is unchanged: tp=1/dp=3, mini-batch 33*16=528 seqs divides by 3);
+# for an 8-GPU machine with big cards (the 8xH200 remote_h200):
+#   * 4 vLLM rollout engines + 4 Megatron trainer GPUs (NGPUS_PER_NODE=8, n_gpus_rollout=4):
+#     one rollout GPU of the 5+3 arm is moved to the trainer. The 5+3 arm is TRAINER-BOUND
+#     after its pipeline fill (2026-09-12 emulated run: update_actor ~200 s of a 235 s step on
+#     3 trainer GPUs, <1 s waiting for batches, staleness backlog growing), so the fourth
+#     trainer GPU is where the time goes: tp=1/dp=4, the 33*16=528-seq mini-batch splits
+#     into 132 seqs per rank instead of 176, i.e. ~25% less update time per step. Per-GPU
+#     trainer memory is unchanged (set by the 1-seq micro-batch and the resident params +
+#     grad buffers).
 #   * gpu_memory_utilization=0.95: the engines hold nothing but vLLM, so give them almost the
-#     whole card (on a 143.8 GiB H200 that is ~137 GiB, ~120 GiB of KV after the weights);
-#     0.95 is the practical ceiling -- the remainder is CUDA context, NCCL buffers for the
-#     weight sync and CUDA graphs. NOT for H100 emulation (that pairs VERL_GPU_MEM_CAP_GB
-#     with a LOWER fraction).
-#   * CUDA_VISIBLE_DEVICES defaults to 0-5: on a shared machine pass the six FREE GPUs,
-#     e.g. CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 -- vLLM refuses to start on a GPU that cannot
-#     give it the requested fraction.
-# Expect 3/5 of the 5+3 arm's generation throughput: with fresh=0.5 the gate waits longer
-# (more trainer idle, charged to cumulative_training_time as always), so compare with the 5+3
-# runs at equal cumulative_training_time. The experiment name carries the layout (" 3-3 ")
-# and the fraction (" gmu-0.95 ") so the runs never share a log dir with the 5+3 arm.
+#     whole card (on a 143.8 GiB H200 that is ~137 GiB, ~120 GiB of KV after the weights,
+#     vs ~50 GiB at the 5+3 arm's emulated 0.51). That is what lets FOUR engines out-produce
+#     the five at 0.51: the rollouter keeps ~200 sequences in flight per engine, far beyond
+#     the smaller cache, so those engines ran in KV waves. 0.95 is the practical ceiling --
+#     the remainder is CUDA context, NCCL buffers for the weight sync and CUDA graphs. NOT
+#     for H100 emulation (that pairs VERL_GPU_MEM_CAP_GB with a LOWER fraction; no H100 can
+#     offer 137 GiB to an engine).
+#   * CUDA_VISIBLE_DEVICES defaults to 0-7 (all eight GPUs). On a shared machine pass the
+#     free ones -- vLLM refuses to start on a GPU that cannot give it the requested fraction.
+# Diagnostics: if the four engines do NOT keep up, timing_s/gen (the trainer's wait for a
+# batch) turns non-zero after the fill and replay/fresh_wait_s grows; then compare with the
+# 5+3 runs at equal cumulative_training_time rather than per update. The experiment name
+# carries the layout (" 4-4 ", "tp1dp4") and the fraction (" gmu-0.95 ") so the runs never
+# share a log dir with the 5+3 arm.
 #
 # ---- everything below this line is inherited from the 5+3 fresh=0.5 arm ----
 #
@@ -208,8 +217,8 @@
 #   * serialize_validation=True / pause_generation_during_save=True kept:
 #     stop-the-world validation and checkpoint saves — pure time translations
 #     excluded from cumulative_training_time.
-# Base-script notes that still apply: trainer tp=1/dp=3 (sequence_parallel
-# needs TP>1), 33*16=528 seqs divide by DP=3, HDO full CPU offload with bf16
+# Base-script notes that still apply: trainer tp=1/dp=4 here (sequence_parallel
+# needs TP>1), 33*16=528 seqs divide by DP=4 (132 per rank), HDO full CPU offload with bf16
 # master weights (do NOT swap for use_precision_aware_optimizer without
 # optimizer_cpu_offload: silent stall, probe 2026-07-30). OPOB stays off.
 
@@ -219,7 +228,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export RAY_DISABLE_IMPORT_WARNING=1
 export VLLM_USE_V1=1
 export RAY_ADDRESS="local"
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5} # the SIX gpus to use; pick the free ones on a shared box
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7} # the EIGHT gpus to use; pick the free ones on a shared box
 export WANDB_MODE=disabled
 export VLLM_USE_FLASHINFER_SAMPLER=0
 # Unbuffered worker stdout: Ray block-buffers prints otherwise, lagging the
@@ -280,8 +289,8 @@ SEED=${SEED:-1}
 
 # ================= GPU Layout =================
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-6} # 3+3 layout (the 5+3 arm: 8)
-n_gpus_rollout=${n_gpus_rollout:-3} # -> n_gpus_training = 3, same trainer geometry as the 5+3 arm
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-8} # 4+4 layout
+n_gpus_rollout=${n_gpus_rollout:-4} # -> n_gpus_training = 4 (the 5+3 arm: 5 -> 3); trainer dp=4, see the header
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 # ================= Rollout =================
@@ -300,7 +309,7 @@ max_response_length=${max_response_length:-8192}
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 # ================= Megatron Parallelism =================
-train_tp=1 # only valid TP for 3 trainer GPUs (pure DP, no TP comm)
+train_tp=1 # pure DP over the 4 trainer GPUs (no TP comm); TP=2 would halve dp and is not needed for memory
 train_pp=1
 train_cp=1
 sequence_parallel=False # requires TP>1
@@ -310,7 +319,7 @@ precision_dtype="bfloat16"
 # ================= Batch Sizes =================
 train_prompt_bsz=0
 gen_prompt_bsz=1
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3 (528/3=176)
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=4 (528/4=132)
 micro_bsz_per_gpu=1 # per-traj path REQUIRES micro batch size 1 and use_dynamic_bsz=False
 use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
@@ -461,10 +470,9 @@ resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-null} # nothing to prune with
 resume_mode=${resume_mode:-disable}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} gmu-${gpu_memory_utilization} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} gmu-${gpu_memory_utilization} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp4 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
-# LOCATIONS, env-overridable. log_dir: TensorBoard (log_dir/tensorboard) and the rollout /
-# validation dumps (trainer.rollout_data_dir). CKPTS_DIR (trainer.default_local_dir): the
+# LOCATIONS, env-overridable. log_dir: TensorBoard (log_dir/tensorboard). CKPTS_DIR (trainer.default_local_dir): the
 # global_step_N/ checkpoints — hf exports at every save (see CHECKPOINTS). Both default to
 # logs/<exp_name> under the launch directory (the repo root); absolute paths are fine, e.g.
 # CKPTS_DIR on a volume with more room than the shared filesystem. With the two-tier knobs,
@@ -473,6 +481,12 @@ exp_name_safe=${exp_name//\//_}
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
 CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
 mkdir -p -- "${log_dir}" "${CKPTS_DIR}"
+# NO per-update rollout dump (the 5+3 arms write every training batch as <update>.jsonl into
+# log_dir via trainer.rollout_data_dir="${log_dir}"): it sat on the trainer's critical path at
+# 30-36 s per update, ~15% of a 235 s step in the 2026-09-12 emulated 5+3 run, and this arm
+# exists to shorten exactly that path. Re-enable with rollout_data_dir=<dir> (e.g.
+# rollout_data_dir="${log_dir}"); validation dumps stay off (log_val_generations=0 below).
+rollout_data_dir=${rollout_data_dir:-null}
 export TENSORBOARD_DIR="${log_dir}/tensorboard"
 
 trainer_logger="['console','tensorboard']"
@@ -604,7 +618,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
     "actor_rollout_ref.actor.checkpoint.save_contents=${ckpt_save_contents}" \
     trainer.resume_mode=${resume_mode} \
-    trainer.rollout_data_dir="${log_dir}" \
+    trainer.rollout_data_dir="${rollout_data_dir}" \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.nnodes="${NNODES}" \

@@ -46,7 +46,7 @@ QWEN = "grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=16_k=64_
 PANGU = QWEN.replace("tau=16_k=64_min-ess=1.1", "tau=8_k=32_min-ess=1.07").replace(".sh", "_openpangu7b.sh")
 SMOKE_3P3 = "smoke_test_openpangu7b_replay_3+3.sh"
 PANGU_FRESH = PANGU.replace("_openpangu7b.sh", "_fresh=0.5_openpangu7b.sh")
-PANGU_FRESH_3P3 = PANGU_FRESH.replace("8gpu_dapo17k_5+3", "6gpu_dapo17k_3+3").replace(
+PANGU_FRESH_4P4 = PANGU_FRESH.replace("8gpu_dapo17k_5+3", "8gpu_dapo17k_4+4").replace(
     "_fresh=0.5_openpangu7b.sh", "_fresh=0.5_gmu=0.95_openpangu7b.sh"
 )
 REALIASED_MODEL = "/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"
@@ -414,38 +414,53 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         self.assertEqual(cfg.trainer.save_freq, 15)
 
 
-class TestOpenPanguReplay3plus3Variant(unittest.TestCase):
-    """The 6-GPU variant of the fresh=0.5 arm: 3 vLLM engines + 3 trainer GPUs and
-    gpu_memory_utilization=0.95, tagged " 3-3 " and " gmu-0.95 "; everything else is the
-    5+3 fresh arm's, so the two differ in exactly the layout and the memory fraction."""
+class TestOpenPanguReplay4plus4Variant(unittest.TestCase):
+    """The 4+4 variant of the fresh=0.5 arm: 4 vLLM engines + 4 trainer GPUs (dp=4) and
+    gpu_memory_utilization=0.95, tagged " 4-4 ", "tp1dp4" and " gmu-0.95 "; everything else is
+    the 5+3 fresh arm's, so the two differ in exactly the layout and the memory fraction."""
 
     @classmethod
     def setUpClass(cls):
-        cls.cfg = compose(PANGU_FRESH_3P3)
+        cls.cfg = compose(PANGU_FRESH_4P4)
         cls.fresh = compose(PANGU_FRESH)
 
-    def test_layout_is_three_plus_three_with_the_same_trainer_geometry(self):
-        self.assertEqual(self.cfg.rollout.n_gpus_per_node, 3)
-        self.assertEqual(self.cfg.trainer.n_gpus_per_node, 3)
+    def test_layout_is_four_plus_four_with_dp4(self):
+        self.assertEqual(self.cfg.rollout.n_gpus_per_node, 4)
+        self.assertEqual(self.cfg.trainer.n_gpus_per_node, 4)
         self.assertEqual(self.fresh.rollout.n_gpus_per_node, 5)
         self.assertEqual(self.fresh.trainer.n_gpus_per_node, 3)
         self.assertEqual(self.cfg.actor_rollout_ref.actor.megatron.tensor_model_parallel_size, 1)
         self.assertEqual(self.cfg.actor_rollout_ref.actor.ppo_mini_batch_size, 33)
-        self.assertEqual(33 * self.cfg.actor_rollout_ref.rollout.n % 3, 0)  # 528 seqs over DP=3
+        # 528 seqs over DP=4 (132 per rank); still divisible by the 5+3 arm's DP=3 too
+        self.assertEqual(33 * self.cfg.actor_rollout_ref.rollout.n % 4, 0)
+        self.assertEqual(33 * self.cfg.actor_rollout_ref.rollout.n % 3, 0)
+
+    def test_no_rollout_dump_by_default_but_re_enablable(self):
+        """The per-update <update>.jsonl dump (30-36 s per update on the 5+3 arm) is off here;
+        the 5+3 fresh arm still writes it into log_dir."""
+        self.assertIsNone(self.cfg.trainer.rollout_data_dir)
+        self.assertEqual(self.fresh.trainer.rollout_data_dir, self.fresh.trainer.default_local_dir)
+        cfg = compose_env(PANGU_FRESH_4P4, {"rollout_data_dir": "/tmp/dumps"})
+        self.assertEqual(cfg.trainer.rollout_data_dir, "/tmp/dumps")
+        text = script_text(PANGU_FRESH_4P4)
+        self.assertIn("rollout_data_dir=${rollout_data_dir:-null}", text)
+        self.assertIn('trainer.rollout_data_dir="${rollout_data_dir}"', text)
 
     def test_rollout_engines_get_almost_the_whole_card(self):
         self.assertAlmostEqual(self.cfg.actor_rollout_ref.rollout.gpu_memory_utilization, 0.95)
         self.assertAlmostEqual(self.fresh.actor_rollout_ref.rollout.gpu_memory_utilization, 0.9)
-        cfg = compose_env(PANGU_FRESH_3P3, {"gpu_memory_utilization": "0.5"})
+        cfg = compose_env(PANGU_FRESH_4P4, {"gpu_memory_utilization": "0.5"})
         self.assertAlmostEqual(cfg.actor_rollout_ref.rollout.gpu_memory_utilization, 0.5)
         self.assertIn(" gmu-0.5 ", cfg.trainer.experiment_name)
 
     def test_experiment_name_carries_layout_and_fraction(self):
         name = self.cfg.trainer.experiment_name
-        self.assertIn(" 3-3 ", name)
+        self.assertIn(" 4-4 ", name)
+        self.assertIn(" tp1dp4 ", name)
         self.assertIn(" gmu-0.95 ", name)
         self.assertIn(" nu-1 fresh-0.5 ", name)
         self.assertIn(" 5-3 ", self.fresh.trainer.experiment_name)
+        self.assertIn(" tp1dp3 ", self.fresh.trainer.experiment_name)
         self.assertNotIn("gmu-", self.fresh.trainer.experiment_name)
         self.assertNotEqual(self.cfg.trainer.default_local_dir, self.fresh.trainer.default_local_dir)
 
@@ -457,18 +472,26 @@ class TestOpenPanguReplay3plus3Variant(unittest.TestCase):
         for cfg in (a, b):
             cfg["rollout"].pop("n_gpus_per_node")
             cfg["trainer"].pop("n_gpus_per_node")
+            cfg["trainer"].pop("rollout_data_dir")  # null here, log_dir on the 5+3 arm (tested above)
             cfg["actor_rollout_ref"]["rollout"].pop("gpu_memory_utilization")
-        a_text = json.dumps(a, sort_keys=True).replace(" 3-3 ", " 5-3 ").replace(" gmu-0.95", "")
+        a_text = (
+            json.dumps(a, sort_keys=True)
+            .replace(" 4-4 ", " 5-3 ")
+            .replace(" tp1dp4 ", " tp1dp3 ")
+            .replace(" gmu-0.95", "")
+        )
         self.assertEqual(json.loads(a_text), b)
 
     def test_script_text(self):
-        text = script_text(PANGU_FRESH_3P3)
-        self.assertIn("NGPUS_PER_NODE=${NGPUS_PER_NODE:-6}", text)
-        self.assertIn("n_gpus_rollout=${n_gpus_rollout:-3}", text)
+        text = script_text(PANGU_FRESH_4P4)
+        self.assertIn("NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}", text)
+        self.assertIn("n_gpus_rollout=${n_gpus_rollout:-4}", text)
         self.assertIn("gpu_memory_utilization=${gpu_memory_utilization:-0.95}", text)
-        self.assertIn("export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}", text)
-        self.assertIn("#SBATCH --gpus-per-node=6", text)
+        self.assertIn("export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}", text)
+        self.assertIn("#SBATCH --gpus-per-node=8", text)
         self.assertIn(" gmu-${gpu_memory_utilization}", text)
+        self.assertIn(" tp1dp4 ", text)
+        self.assertNotIn("3+3", text.split("smoke_test_openpangu7b_replay_3+3.sh")[0].split("4+4 / gmu=0.95")[1])
 
 
 class TestOpenPanguReplayArmScriptText(unittest.TestCase):
