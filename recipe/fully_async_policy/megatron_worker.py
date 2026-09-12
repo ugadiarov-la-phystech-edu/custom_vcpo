@@ -21,6 +21,7 @@ import torch
 import torch.distributed
 from omegaconf import DictConfig
 
+from recipe.fully_async_policy.gpu_memory_cap import apply_gpu_memory_cap
 from recipe.fully_async_policy.megatron_utils import copy_megatron_model_to_cpu, restore_megatron_model_from_cpu
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
@@ -115,6 +116,7 @@ class DetachActorWorker(DetachNcclSync):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         set_expandable_segments(True)
+        apply_gpu_memory_cap()
 
     def _get_actor_params_generator(self):
         assert self._is_actor

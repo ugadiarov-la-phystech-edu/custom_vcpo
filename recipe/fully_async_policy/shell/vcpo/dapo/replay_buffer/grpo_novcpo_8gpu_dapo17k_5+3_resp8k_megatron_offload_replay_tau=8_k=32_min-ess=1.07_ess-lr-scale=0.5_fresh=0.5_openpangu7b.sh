@@ -46,6 +46,8 @@ return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
 gpu_memory_utilization=${gpu_memory_utilization:-0.9}
+emu_tag=""
+if [[ -n "${VERL_GPU_MEM_CAP_GB:-}" ]]; then emu_tag=" h100-emu-${VERL_GPU_MEM_CAP_GB}gb-gmu${gpu_memory_utilization}"; fi
 enable_chunked_prefill=True
 calculate_log_probs=True
 
@@ -143,7 +145,7 @@ ckpt_save_contents=${ckpt_save_contents:-"['hf_model']"}
 resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-null}
 resume_mode=${resume_mode:-disable}
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
 CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
