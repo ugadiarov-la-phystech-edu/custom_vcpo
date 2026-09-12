@@ -437,7 +437,9 @@ class TestOpenPanguReplayArmScriptText(unittest.TestCase):
         """The AsyncRL port forced Transformer Engine fused attention and capped GPU memory through an env
         hook; this arm keeps verl's defaults (flash attention under Megatron auto) like every other arm."""
         self.assertNotIn("attention_backend=fused", self.text)
-        self.assertNotIn("VERL_GPU_MEM_CAP_GB", self.text)
+        # the cap is opt-in from the launching shell: the arm only reads it for the exp_name tag
+        self.assertNotIn("export VERL_GPU_MEM_CAP_GB", self.text)
+        self.assertIn('if [[ -n "${VERL_GPU_MEM_CAP_GB:-}" ]]; then emu_tag=', self.text)
         self.assertIn("export VLLM_USE_FLASHINFER_SAMPLER=0", self.text)
 
     def test_header_documents_the_openpangu_specifics(self):

@@ -238,6 +238,13 @@ return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
 gpu_memory_utilization=${gpu_memory_utilization:-0.9} # the twin's value; env-overridable for the first launch on this model
+# H100 emulation on bigger cards (recipe/fully_async_policy/gpu_memory_cap.py): exporting
+# VERL_GPU_MEM_CAP_GB=80 in the launching shell caps the TRAINER allocator at 80 GiB; pair it
+# with gpu_memory_utilization=0.5 on an H200 (0.9*80/143.8 = 0.50 gives vLLM the same absolute
+# budget as 0.9 on an 80 GiB H100). The knob is only READ here, never set. Tagged in exp_name
+# so emulated runs never share a log dir with real ones.
+emu_tag=""
+if [[ -n "${VERL_GPU_MEM_CAP_GB:-}" ]]; then emu_tag=" h100-emu-${VERL_GPU_MEM_CAP_GB}gb-gmu${gpu_memory_utilization}"; fi
 enable_chunked_prefill=True
 calculate_log_probs=True
 
@@ -404,7 +411,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # LOCATIONS, env-overridable. log_dir: TensorBoard (log_dir/tensorboard) and the rollout /
 # validation dumps (trainer.rollout_data_dir). CKPTS_DIR (trainer.default_local_dir): the
