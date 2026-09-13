@@ -135,7 +135,14 @@ async_training:
     # Both the warm-up length and the pause watermark; may be fractional
     # (e.g. 1.5). Warm-up: the first ceil(requires_mini_batches) updates each
     # consume a fresh mini-batch of unseen groups. Watermark: training pauses
-    # while the buffer holds < requires_mini_batches * ppo_mini_batch_size groups
+    # while the buffer holds < requires_mini_batches * ppo_mini_batch_size groups.
+    # Values in (0, 1): a SMALLER, all-fresh FIRST mini-batch only — its size in
+    # groups is requires_mini_batches * ppo_mini_batch_size rounded UP to a group
+    # count whose sequences (groups * rollout.n) split evenly over the trainer
+    # DP ranks (0.5 * 33 = 16.5 -> 17 -> 18 at n=16, dp=3); every later
+    # composition uses the full ppo_mini_batch_size (watermark = one full
+    # mini-batch) and the fresh-share floor is taken on the full size. Never
+    # applied after a resume. Cuts the pipeline fill before update 1.
     requires_mini_batches: 2
 
     # Fresh-share gate: an update waits until at least ceil(min_fresh_ratio x
