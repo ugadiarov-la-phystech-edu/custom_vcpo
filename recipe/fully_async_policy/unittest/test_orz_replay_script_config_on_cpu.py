@@ -526,3 +526,38 @@ class TestOrzReplaySmoke3plus3(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFractionalRequiresMiniBatches(unittest.TestCase):
+    """replay_buffer.requires_mini_batches < 1 passes through the arms untouched (the trainer turns it
+    into the size of the FIRST mini-batch: rmb x mini rounded up to a group count whose sequences split
+    evenly over the trainer DP ranks) and is tagged in the experiment name."""
+
+    @staticmethod
+    def _expected_first(cfg, rmb=0.5):
+        from recipe.fully_async_policy.fully_async_trainer import first_minibatch_groups, trainer_dp_size
+
+        return first_minibatch_groups(
+            rmb, cfg.actor_rollout_ref.actor.ppo_mini_batch_size, cfg.actor_rollout_ref.rollout.n, trainer_dp_size(cfg)
+        )
+
+    def test_half_composes_and_is_tagged_on_the_orz_arm(self):
+        cfg = compose_with_env(ORZ, {"replay_requires_mini_batches": "0.5"})
+        self.assertAlmostEqual(cfg.async_training.replay_buffer.requires_mini_batches, 0.5)
+        self.assertIn(" rmb-0.5 ", cfg.trainer.experiment_name)
+        # 3+5 layout: dp=5, n=16, mini=35 -> 17.5 -> 18..19 x 16 not divisible by 5 -> 20 (320 seqs)
+        self.assertEqual((cfg.trainer.n_gpus_per_node, cfg.actor_rollout_ref.rollout.n), (5, 16))
+        self.assertEqual(self._expected_first(cfg), 20)
+
+    def test_half_on_the_qwen_fresh_arm(self):
+        cfg = compose_with_env(STEM + "_nu=1_fresh=0.5.sh", {"replay_requires_mini_batches": "0.5"})
+        self.assertAlmostEqual(cfg.async_training.replay_buffer.requires_mini_batches, 0.5)
+        self.assertIn(" rmb-0.5 ", cfg.trainer.experiment_name)
+        # 5+3 layout: dp=3, n=16, mini=33 -> 16.5 -> 17 (272 % 3 != 0) -> 18
+        self.assertEqual((cfg.trainer.n_gpus_per_node, cfg.actor_rollout_ref.rollout.n), (3, 16))
+        self.assertEqual(self._expected_first(cfg), 18)
+
+    def test_default_stays_one(self):
+        cfg = compose(ORZ)
+        self.assertEqual(cfg.async_training.replay_buffer.requires_mini_batches, 1)
+        self.assertIn(" rmb-1 ", cfg.trainer.experiment_name)

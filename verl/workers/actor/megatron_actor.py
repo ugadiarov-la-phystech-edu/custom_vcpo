@@ -388,9 +388,16 @@ class MegatronPPOActor(BasePPOActor):
             data = data.select(batch_keys=select_keys)
         # ppo_mini_batch_size is already scaled by rollout.n at worker init, so it is in the
         # same (sequence) units as the batch size. make_iterator asserts exact divisibility.
-        n_minibatches_per_epoch = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
+        # A batch SMALLER than one mini-batch is the replay trainer's warm-up mini-batch
+        # (replay_buffer.requires_mini_batches < 1: e.g. 18 groups instead of 33): iterate it
+        # as one mini-batch of its own size. The per-trajectory paths normalise by the actual
+        # mini-batch length (microbatch_loss_scale = 1 / len(minibatch)), so the step is scaled right.
+        mini_batch_size = self.config.ppo_mini_batch_size
+        if data.batch.batch_size[0] < mini_batch_size:
+            mini_batch_size = int(data.batch.batch_size[0])
+        n_minibatches_per_epoch = data.batch.batch_size[0] // mini_batch_size
         base_iterator = data.make_iterator(
-            mini_batch_size=self.config.ppo_mini_batch_size,
+            mini_batch_size=mini_batch_size,
             epochs=self.config.ppo_epochs,
             seed=self.config.data_loader_seed,
             dataloader_kwargs={"shuffle": self.config.shuffle},
@@ -1048,9 +1055,7 @@ class MegatronPPOActor(BasePPOActor):
             )
             values = tensor.tolist()
         ess, ess_ratio, ess_clipped, ess_ratio_clipped, count = values
-        return self._apply_ess_scale_and_step(
-            ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, int(count)
-        )
+        return self._apply_ess_scale_and_step(ess, ess_clipped, ess_ratio, ess_ratio_clipped, minibatch_idx, int(count))
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
     def _update_policy_per_traj_packed(self, dataloader: Iterable[DataProto]) -> dict:
@@ -1249,7 +1254,10 @@ class MegatronPPOActor(BasePPOActor):
             # minibatch_idx counts across epochs; epoch_idx is stamped by make_minibatch_iterator.
             epoch_idx = int(minibatch.meta_info.get("epoch_idx", 0))
             local_traj_records, _ = compute_staleness_statistics(
-                minibatch, minibatch_idx, rollout_is_threshold, not skip_recompute_old_log_prob,
+                minibatch,
+                minibatch_idx,
+                rollout_is_threshold,
+                not skip_recompute_old_log_prob,
                 epoch_idx=epoch_idx,
             )
 

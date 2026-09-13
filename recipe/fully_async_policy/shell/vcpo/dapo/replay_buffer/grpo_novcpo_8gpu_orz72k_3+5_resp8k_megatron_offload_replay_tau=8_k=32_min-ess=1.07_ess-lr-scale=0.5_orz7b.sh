@@ -387,6 +387,11 @@ use_rollout_log_probs=True
 replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-8} # the twin: 16 (see REPLAY DEPTH)
 replay_staleness_threshold=${replay_staleness_threshold:-32} # the twin: 64
+# Pause watermark in mini-batches (>= 1, may be fractional). Values in (0, 1) mean a SMALLER
+# all-fresh FIRST mini-batch only: e.g. 0.5 -> 17.5 groups rounded UP to 20 (20*16=320 seqs split
+# evenly over the 5 trainer ranks) -> update 1 fires after 20 complete groups instead of 35, cutting
+# the pipeline fill; every later update uses the full 35 and the fresh-share floor stays
+# ceil(f*35) NEW arrivals. Tagged rmb-<value> in exp_name.
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 # Reuse-decay half-life in trainings (see REUSE DECAY in the header); null = staleness-only draw

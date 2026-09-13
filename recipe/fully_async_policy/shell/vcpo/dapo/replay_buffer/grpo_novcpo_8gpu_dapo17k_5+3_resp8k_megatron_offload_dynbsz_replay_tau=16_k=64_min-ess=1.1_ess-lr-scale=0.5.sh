@@ -255,6 +255,11 @@ use_rollout_log_probs=True
 replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-16}
 replay_staleness_threshold=${replay_staleness_threshold:-64}
+# Pause watermark in mini-batches (>= 1, may be fractional). Values in (0, 1) mean a SMALLER
+# all-fresh FIRST mini-batch only: e.g. 0.5 -> 16.5 groups rounded UP to 18 (18*16=288 seqs split
+# evenly over the 3 trainer ranks) -> update 1 fires after 18 complete groups instead of 33, cutting
+# the pipeline fill; every later update uses the full 33 and the fresh-share floor stays
+# ceil(f*33) NEW arrivals. Tagged rmb-<value> in exp_name.
 replay_requires_mini_batches=${replay_requires_mini_batches:-1}
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
