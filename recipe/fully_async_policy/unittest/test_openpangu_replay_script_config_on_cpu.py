@@ -526,3 +526,22 @@ class TestOpenPanguReplaySmoke3plus3(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOpenPanguFreshArmFractionalRmb(unittest.TestCase):
+    """replay_requires_mini_batches < 1 passes through the fresh arm untouched (the trainer
+    interprets it as the first-mini-batch size) and is tagged in the experiment name."""
+
+    def test_half_composes_and_is_tagged(self):
+        cfg = compose_env(PANGU_FRESH, {"replay_requires_mini_batches": "0.5"})
+        self.assertAlmostEqual(cfg.async_training.replay_buffer.requires_mini_batches, 0.5)
+        self.assertIn(" rmb-0.5 ", cfg.trainer.experiment_name)
+        # the value the trainer will round: 0.5 x 33 groups at n=16 over dp=3 -> 18
+        self.assertEqual(cfg.actor_rollout_ref.actor.ppo_mini_batch_size, 33)
+        self.assertEqual(cfg.actor_rollout_ref.rollout.n, 16)
+        self.assertEqual(cfg.trainer.n_gpus_per_node, 3)
+
+    def test_default_stays_one(self):
+        cfg = compose(PANGU_FRESH)
+        self.assertEqual(cfg.async_training.replay_buffer.requires_mini_batches, 1)
+        self.assertIn(" rmb-1 ", cfg.trainer.experiment_name)
