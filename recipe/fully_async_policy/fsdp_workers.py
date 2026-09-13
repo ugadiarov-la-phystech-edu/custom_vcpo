@@ -22,6 +22,7 @@ from omegaconf import DictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from recipe.fully_async_policy.fsdp2_utils import fsdp2_sharded_load_from_cpu, fsdp2_sharded_save_to_cpu
+from recipe.fully_async_policy.gpu_memory_cap import apply_gpu_memory_cap
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
@@ -106,6 +107,7 @@ class DetachActorWorker(DetachNcclSync):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         set_expandable_segments(True)
+        apply_gpu_memory_cap()
 
     def _get_actor_params(self):
         assert self._is_actor
