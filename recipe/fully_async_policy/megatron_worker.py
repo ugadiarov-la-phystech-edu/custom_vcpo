@@ -21,6 +21,7 @@ import torch
 import torch.distributed
 from omegaconf import DictConfig
 
+from recipe.fully_async_policy.gpu_memory_cap import apply_gpu_memory_cap
 from recipe.fully_async_policy.megatron_utils import copy_megatron_model_to_cpu, restore_megatron_model_from_cpu
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
@@ -123,6 +124,9 @@ class DetachActorWorker(DetachNcclSync):
         # (vllm/device_allocator/cumem.py), and env vars reach the rollout engine
         # processes too. This worker class is trainer-only in this pipeline.
         set_expandable_segments(True)
+        # Optional smaller-card emulation (VERL_GPU_MEM_CAP_GB); trainer-process-only
+        # for the same reason as the line above (see gpu_memory_cap.apply_gpu_memory_cap).
+        apply_gpu_memory_cap()
 
     def _get_actor_params_generator(self):
         assert self._is_actor
