@@ -189,6 +189,19 @@ rollout_mode=async
 # for 128 concurrent seqs at our lengths) with ~7 GiB headroom. To go higher,
 # flip megatron param_offload/grad_offload=True first.
 gpu_memory_utilization=${gpu_memory_utilization:-0.5}
+# H100 emulation on bigger cards (verl/utils/gpu_memory_cap.py): exporting VERL_GPU_MEM_CAP_GB=<N>
+# in the launching shell caps the ACTOR worker processes' PyTorch allocator at N GiB. Pair it with
+# the fraction that gives vLLM the same absolute budget as on an 80 GiB H100: gpu_memory_utilization
+# = 0.5*80/<device GiB> (0.283 on a 143.8 GiB H200). CAVEATS measured on the H200 (2026-09-12/13):
+# in this verl's hybrid async mode the vLLM ENGINE RUNS INSIDE the actor worker process, so the cap
+# also bounds vLLM's torch-side activations, and vLLM's slept weights + KV cache stay on torch's
+# books (~28 GiB at 0.283 for a 7-8B model). An 80 GiB cap therefore trips at the entropy step of an
+# arm that fits a real H100; the like-for-like cap for the UPDATE phase is ~80 + that offset (108 GiB
+# was used). The rollout / first-wake phases are emulated by the fraction alone and must be judged
+# with an nvidia-smi sampler (~78 GB per GPU is the H100 risk line). The knob is only READ here,
+# never set. Tagged in exp_name so emulated runs never share a log dir with real ones.
+emu_tag=""
+if [[ -n "${VERL_GPU_MEM_CAP_GB:-}" ]]; then emu_tag=" h100-emu-${VERL_GPU_MEM_CAP_GB}gb-gmu${gpu_memory_utilization}"; fi
 rollout_tp=1
 enable_chunked_prefill=True
 max_num_batched_tokens=$((1024 * 10))
@@ -241,7 +254,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} ORZ72K-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} ORZ72K-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
