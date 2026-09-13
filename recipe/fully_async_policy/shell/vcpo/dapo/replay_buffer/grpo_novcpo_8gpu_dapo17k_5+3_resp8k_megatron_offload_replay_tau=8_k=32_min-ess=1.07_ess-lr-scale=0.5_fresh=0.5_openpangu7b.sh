@@ -303,6 +303,22 @@ use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
 
 bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}} # Rollout Bsz
+# Concurrency ramp (DEFAULT "[4, 10, 20]"; null = off). Without it the rollouter dispatches its whole cap at once
+# (5 engines x 33 = 165 groups = 2640 seqs, ~528 per engine) and at that concurrency each
+# sequence decodes at ~20 tok/s, so the first mini-batch's 8k-token tails take ~7 min
+# (timing_s/gen ~430 s at update 1 in every run so far; KV memory is not the limiter: the
+# 4+4 arm at gmu 0.95 filled just as slowly). A list of PER-ENGINE caps for the warm-up
+# stages: "[4, 10, 20]" = 20 groups in flight (64 seqs/engine, single-wave decode) until the
+# first mini-batch (18) is delivered (~2 min), 50 until one more mini-batch (51 delivered), 100
+# until the next (84), then the full 165. Stage widths trade supply for latency: a wider stage
+# delivers more groups but each takes longer, and a composition takes EVERY fresh group present
+# (up to 33), so a stage must still have ~17 groups landing after the previous composition and
+# before the current update ends (~3 min) — 10/20 rather than 8/16 gives that slack. Tagged
+# " ramp-4-10-20" in exp_name; pass concurrency_ramp=null to switch it off. Watch
+# replay/fresh_wait_s at updates 2-4: non-zero means widen the stages further.
+concurrency_ramp=${concurrency_ramp:-"[4, 10, 20]"}
+ramp_tag=""
+if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 
 # ================= Algorithm =================
 adv_estimator=grpo
@@ -376,11 +392,13 @@ replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-8} # the twin: 16 (see REPLAY DEPTH)
 replay_staleness_threshold=${replay_staleness_threshold:-32} # the twin: 64
 # Pause watermark in mini-batches (>= 1, may be fractional). Values in (0, 1) mean a SMALLER
-# all-fresh FIRST mini-batch only: e.g. 0.5 -> 16.5 groups rounded UP to 18 (18*16=288 seqs split
-# evenly over the 3 trainer ranks; 17*16=272 does not) -> update 1 fires after 18 complete groups
-# instead of 33, cutting the ~7 min pipeline fill; every later update uses the full 33 and the
-# fresh-share floor stays ceil(0.5*33)=17 NEW arrivals. Tagged rmb-<value> in exp_name.
-replay_requires_mini_batches=${replay_requires_mini_batches:-1}
+# all-fresh FIRST mini-batch only — the DEFAULT here is 0.5: 16.5 groups rounded UP to 18
+# (18*16=288 seqs split evenly over the 3 trainer ranks; 17*16=272 does not) -> update 1 fires
+# after 18 complete groups instead of 33; every later update uses the full 33 and the fresh-share
+# floor stays ceil(0.5*33)=17 NEW arrivals. Pass replay_requires_mini_batches=1 for the old
+# behaviour. Tagged rmb-<value> in exp_name. Pairs with concurrency_ramp below: together they cut
+# the ~7 min pipeline fill before update 1 to ~2 min.
+replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 # Reuse-decay half-life in trainings (2^(-times_trained/nu) on the replay draw
 # weight; REPLAY_REUSE_PENALTY_DISCUSSION.md, REPLAY DEPTH above). The twin runs
@@ -453,7 +471,7 @@ resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-null} # nothing to prune with
 resume_mode=${resume_mode:-disable}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # LOCATIONS, env-overridable. log_dir: TensorBoard (log_dir/tensorboard) and the rollout /
 # validation dumps (trainer.rollout_data_dir). CKPTS_DIR (trainer.default_local_dir): the
@@ -633,4 +651,5 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
     async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
-    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
+    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" \
+    async_training.concurrency_ramp="${concurrency_ramp}" "$@"
