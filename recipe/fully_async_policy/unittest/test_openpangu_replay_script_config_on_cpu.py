@@ -280,21 +280,27 @@ class TestOpenPanguReplayFreshGateVariant(unittest.TestCase):
         self.assertNotIn("fresh-", self.base.trainer.experiment_name)
 
     def test_everything_else_equals_the_base(self):
-        """Identical to the base once the gate knob, the name tag (which the experiment name
-        propagates into the checkpoint / rollout-dump / validation-dump paths) and the
-        validation / save cadence (15 vs 5, tested separately) are removed. In particular the
-        checkpoint policy is the base's hf-only one."""
+        """Identical to the base once the gate knob, the first-mini-batch / concurrency-ramp
+        knobs (this arm defaults to requires_mini_batches=0.5 and ramp [4, 8, 16]; the base to 1
+        and off), their name tags (which the experiment name propagates into the checkpoint /
+        rollout-dump / validation-dump paths) and the validation / save cadence (15 vs 5, tested
+        separately) are removed. In particular the checkpoint policy is the base's hf-only one."""
         import json
 
         a = OmegaConf.to_container(self.cfg, resolve=True)
         b = OmegaConf.to_container(self.base, resolve=True)
         for cfg in (a, b):
             cfg["async_training"]["replay_buffer"].pop("min_fresh_ratio")
+            cfg["async_training"]["replay_buffer"].pop("requires_mini_batches")
+            cfg["async_training"].pop("concurrency_ramp", None)
             cfg["rollout"].pop("test_freq")
             cfg["trainer"].pop("save_freq")
         a_text = json.dumps(a, sort_keys=True)
         self.assertIn(" fresh-0.5", a_text)
-        self.assertEqual(json.loads(a_text.replace(" fresh-0.5", "")), b)
+        self.assertIn(" rmb-0.5 ", a_text)
+        self.assertIn(" ramp-4-10-20", a_text)
+        a_text = a_text.replace(" fresh-0.5", "").replace(" rmb-0.5 ", " rmb-1 ").replace(" ramp-4-10-20", "")
+        self.assertEqual(json.loads(a_text), b)
 
     def test_knob_stays_env_overridable(self):
         text = script_text(PANGU_FRESH)
@@ -541,7 +547,41 @@ class TestOpenPanguFreshArmFractionalRmb(unittest.TestCase):
         self.assertEqual(cfg.actor_rollout_ref.rollout.n, 16)
         self.assertEqual(cfg.trainer.n_gpus_per_node, 3)
 
-    def test_default_stays_one(self):
+    def test_default_is_half_and_one_restores_the_old_behaviour(self):
         cfg = compose(PANGU_FRESH)
+        self.assertAlmostEqual(cfg.async_training.replay_buffer.requires_mini_batches, 0.5)
+        self.assertIn(" rmb-0.5 ", cfg.trainer.experiment_name)
+        cfg = compose_env(PANGU_FRESH, {"replay_requires_mini_batches": "1"})
         self.assertEqual(cfg.async_training.replay_buffer.requires_mini_batches, 1)
         self.assertIn(" rmb-1 ", cfg.trainer.experiment_name)
+
+
+class TestOpenPanguFreshArmConcurrencyRamp(unittest.TestCase):
+    """async_training.concurrency_ramp passes through the fresh arm as a list, is tagged in the
+    experiment name only when set, and composes together with the fractional first mini-batch."""
+
+    def test_default_is_4_10_20_and_null_switches_it_off(self):
+        cfg = compose(PANGU_FRESH)
+        self.assertEqual(list(cfg.async_training.concurrency_ramp), [4, 10, 20])
+        self.assertIn(" ramp-4-10-20 ", cfg.trainer.experiment_name)
+        # stage 0 covers the 18-group first mini-batch in one wave; every stage fits bsz_per_dp_rank
+        self.assertGreaterEqual(4 * cfg.rollout.n_gpus_per_node, 18)
+        self.assertLessEqual(20, cfg.async_training.bsz_per_dp_rank)
+        cfg = compose_env(PANGU_FRESH, {"concurrency_ramp": "null"})
+        self.assertIsNone(cfg.async_training.concurrency_ramp)
+        self.assertNotIn("ramp-", cfg.trainer.experiment_name)
+
+    def test_ramp_composes_as_a_list_and_is_tagged(self):
+        cfg = compose_env(PANGU_FRESH, {"concurrency_ramp": "[4,8,16]"})
+        self.assertEqual(list(cfg.async_training.concurrency_ramp), [4, 8, 16])
+        self.assertIn(" ramp-4-8-16 ", cfg.trainer.experiment_name)
+
+    def test_ramp_with_fractional_first_minibatch(self):
+        cfg = compose_env(PANGU_FRESH, {"concurrency_ramp": "[4,8,16]", "replay_requires_mini_batches": "0.5"})
+        self.assertEqual(list(cfg.async_training.concurrency_ramp), [4, 8, 16])
+        self.assertAlmostEqual(cfg.async_training.replay_buffer.requires_mini_batches, 0.5)
+        name = cfg.trainer.experiment_name
+        self.assertIn(" rmb-0.5 ", name)
+        self.assertIn(" ramp-4-8-16 ", name)
+        # 5 engines x 4 >= the 18-group first mini-batch: the first stage covers it in one wave
+        self.assertGreaterEqual(4 * cfg.rollout.n_gpus_per_node, 18)

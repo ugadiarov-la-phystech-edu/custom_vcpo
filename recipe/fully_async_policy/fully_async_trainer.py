@@ -37,6 +37,10 @@ from recipe.fully_async_policy.detach_utils import (
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer, make_opportunistic_minibatch_indices
 from recipe.fully_async_policy.replay_buffer import ReplayBuffer
+from recipe.fully_async_policy.replay_sizing import (  # noqa: F401  (re-exported for tests/launchers)
+    first_minibatch_groups,
+    trainer_dp_size,
+)
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -105,35 +109,6 @@ def parse_max_train_steps(value) -> int | None:
     if steps < 1:
         raise ValueError(f"trainer.total_training_steps must be >= 1 or null, got {value!r}")
     return steps
-
-
-def trainer_dp_size(config) -> int:
-    gpus = int(config.trainer.nnodes) * int(config.trainer.n_gpus_per_node)
-    actor_cfg = config.actor_rollout_ref.actor
-    strategy = str(actor_cfg.get("strategy", "megatron"))
-    if strategy == "megatron":
-        mp = int(actor_cfg.megatron.get("tensor_model_parallel_size", 1))
-        mp *= int(actor_cfg.megatron.get("pipeline_model_parallel_size", 1))
-        mp *= int(actor_cfg.megatron.get("context_parallel_size", 1))
-    else:
-        mp = int(actor_cfg.get("ulysses_sequence_parallel_size", 1))
-    if mp < 1 or gpus % mp != 0:
-        raise ValueError(f"trainer GPUs ({gpus}) are not divisible by the model-parallel degree ({mp})")
-    return gpus // mp
-
-
-def first_minibatch_groups(requires_mini_batches: float, mini_size: int, n: int, dp: int) -> int | None:
-    rmb = float(requires_mini_batches)
-    if rmb <= 0:
-        raise ValueError(f"replay_buffer.requires_mini_batches must be > 0, got {requires_mini_batches!r}")
-    if rmb >= 1:
-        return None
-    if mini_size < 1 or n < 1 or dp < 1:
-        raise ValueError(f"invalid mini_size={mini_size}, n={n}, dp={dp}")
-    g = max(1, math.ceil(rmb * mini_size - 1e-9))
-    while g < mini_size and (g * n) % dp != 0:
-        g += 1
-    return min(g, mini_size)
 
 
 @ray.remote(num_cpus=10)

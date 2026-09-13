@@ -70,6 +70,9 @@ use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
 
 bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}}
+concurrency_ramp=${concurrency_ramp:-"[4, 10, 20]"}
+ramp_tag=""
+if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 
 adv_estimator=grpo
 loss_agg_mode="seq-mean-token-mean"
@@ -117,7 +120,7 @@ use_rollout_log_probs=True
 replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-8}
 replay_staleness_threshold=${replay_staleness_threshold:-32}
-replay_requires_mini_batches=${replay_requires_mini_batches:-1}
+replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 replay_reuse_halflife=${replay_reuse_halflife:-1}
 replay_reuse_tag=""
@@ -145,7 +148,7 @@ ckpt_save_contents=${ckpt_save_contents:-"['hf_model']"}
 resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-null}
 resume_mode=${resume_mode:-disable}
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
 CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
@@ -316,4 +319,5 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
     async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
-    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
+    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" \
+    async_training.concurrency_ramp="${concurrency_ramp}" "$@"

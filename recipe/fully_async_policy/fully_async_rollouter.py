@@ -28,6 +28,12 @@ from recipe.fully_async_policy.detach_utils import (
 )
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
+from recipe.fully_async_policy.replay_sizing import (
+    concurrency_cap,
+    first_minibatch_groups,
+    parse_concurrency_ramp,
+    trainer_dp_size,
+)
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.reward import compute_reward, load_reward_manager
@@ -128,6 +134,21 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.bsz_per_dp_rank = int(config.async_training.get("bsz_per_dp_rank", 16))
         assert self.bsz_per_dp_rank > 0, "async_training.bsz_per_dp_rank must be positive"
+        self.concurrency_ramp = parse_concurrency_ramp(config.async_training.get("concurrency_ramp", None))
+        for stage in self.concurrency_ramp:
+            assert stage <= self.bsz_per_dp_rank, (
+                f"async_training.concurrency_ramp stage {stage} exceeds bsz_per_dp_rank={self.bsz_per_dp_rank}"
+            )
+        replay_cfg = config.async_training.get("replay_buffer", None)
+        _rmb = float(replay_cfg.get("requires_mini_batches", 2)) if replay_cfg else 2.0
+        self.ramp_first_size = (
+            first_minibatch_groups(
+                _rmb, self.required_samples, int(config.actor_rollout_ref.rollout.n), trainer_dp_size(config)
+            )
+            or self.required_samples
+        )
+        self.full_concurrent_samples = None
+        self._ramp_stage_logged = None
         filtering_cfg = config.async_training.get("dynamic_filtering", None)
         self.dynamic_filtering_enable = bool(filtering_cfg.get("enable", False)) if filtering_cfg else False
         self.dynamic_filtering_min_buffered = (
@@ -216,7 +237,19 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * self.bsz_per_dp_rank
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
+            self.full_concurrent_samples = self.max_concurrent_samples
             self.max_queue_size = self.max_required_samples
+            if self.concurrency_ramp:
+                n_eng = len(self.async_rollout_manager.server_handles)
+                stages = ", ".join(
+                    f"{min(per * n_eng, self.max_required_samples)} groups until "
+                    f"{self.ramp_first_size + i * self.required_samples} delivered"
+                    for i, per in enumerate(self.concurrency_ramp)
+                )
+                print(
+                    f"[FullyAsyncRollouter] concurrency ramp {self.concurrency_ramp} per engine x {n_eng} engines: "
+                    f"{stages}, then {self.max_concurrent_samples} (first mini-batch {self.ramp_first_size} groups)"
+                )
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -329,6 +362,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # samples when resuming training.
         # TODO: Implement dataloader recovery without losing in-flight samples.
         from verl.utils.fs import local_mkdir_safe
+
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
@@ -442,12 +476,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self._restore_internal_queues_sync(queue_state)
                 self.global_steps = int(queue_state.get("global_steps", self.global_steps))
                 self.staleness_samples = int(queue_state.get("staleness_samples", self.staleness_samples))
-                self.total_generated_samples = int(queue_state.get("total_generated_samples", self.total_generated_samples))
+                self.total_generated_samples = int(
+                    queue_state.get("total_generated_samples", self.total_generated_samples)
+                )
                 self.dropped_stale_samples = int(queue_state.get("dropped_stale_samples", self.dropped_stale_samples))
                 self.filtered_degenerate_groups = int(
                     queue_state.get("filtered_degenerate_groups", self.filtered_degenerate_groups)
                 )
-                self.processed_sample_count = int(queue_state.get("processed_sample_count", self.processed_sample_count))
+                self.processed_sample_count = int(
+                    queue_state.get("processed_sample_count", self.processed_sample_count)
+                )
                 self.current_param_version = int(queue_state.get("current_param_version", self.current_param_version))
                 self.groups_completed_total = int(
                     queue_state.get("groups_completed_total", self.groups_completed_total)
@@ -460,7 +498,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 )
                 print(f"[FullyAsyncRollouter] Loaded rollout queue state from {queue_local_path}")
             else:
-                print(f"[FullyAsyncRollouter] WARNING: No rollout queue state found at {queue_local_path}, skipping load")
+                print(
+                    f"[FullyAsyncRollouter] WARNING: No rollout queue state found at {queue_local_path}, skipping load"
+                )
 
     async def _snapshot_internal_queues(self):
         async with self.queue_lock:
@@ -639,7 +679,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
-            while len(self.active_tasks) >= self.max_concurrent_samples:
+            while len(self.active_tasks) >= self._concurrency_cap():
                 async with self.lock:
                     if self.active_tasks:
                         done_tasks, self.active_tasks = await asyncio.wait(
@@ -665,6 +705,29 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.pending_queue.task_done()
 
+    def _concurrency_cap(self) -> int:
+        ramp = getattr(self, "concurrency_ramp", None)
+        full = getattr(self, "full_concurrent_samples", None) or self.max_concurrent_samples
+        if not ramp:
+            return int(full)
+        n_eng = len(self.async_rollout_manager.server_handles) if self.async_rollout_manager is not None else 1
+        cap = concurrency_cap(
+            int(getattr(self, "total_generated_samples", 0)),
+            ramp,
+            n_eng,
+            int(self.ramp_first_size),
+            int(self.required_samples),
+            int(full),
+            int(getattr(self, "max_required_samples", full) or full),
+        )
+        if cap != self._ramp_stage_logged:
+            print(
+                f"[FullyAsyncRollouter] concurrency cap -> {cap} groups "
+                f"({int(getattr(self, 'total_generated_samples', 0))} delivered)"
+            )
+            self._ramp_stage_logged = cap
+        return cap
+
     def _score_group(self, rollout_sample: RolloutSample) -> torch.Tensor | None:
         batch = rollout_sample.full_batch
         if self.reward_fn is None or batch is None or len(batch) <= 1:
@@ -687,10 +750,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.groups_completed_total += 1
         self.groups_completed_window += 1
         if scores is None:
-            print(
-                f"[FullyAsyncRollouter][Replay] group {rollout_sample.sample_id} "
-                "unscorable, dropping"
-            )
+            print(f"[FullyAsyncRollouter][Replay] group {rollout_sample.sample_id} unscorable, dropping")
             return False
         if bool((scores == scores[0]).all().item()):
             if float(scores[0].item()) > 0:
@@ -959,6 +1019,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "static/staleness_threshold": self.staleness_threshold,
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
+            "concurrency_cap": self._concurrency_cap(),
         }
 
         return stats
