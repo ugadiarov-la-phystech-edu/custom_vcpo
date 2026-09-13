@@ -46,6 +46,7 @@ REPLAY = os.path.join(REPO_ROOT, "recipe/fully_async_policy/shell/vcpo/dapo/repl
 STEM = "grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=8_k=32_min-ess=1.1_ess-lr-scale=0.5"
 ORZ = STEM.replace("dapo17k_5+3", "orz72k_3+5").replace("min-ess=1.1", "min-ess=1.07") + "_orz7b.sh"
 QWEN = f"{STEM}_nu=1_fresh=0.5.sh"
+DYNBSZ = STEM.replace("offload_replay_tau=8_k=32", "offload_dynbsz_replay_tau=16_k=64") + ".sh"
 SMOKE_3P3 = "smoke_test_orz7b_replay_3+3.sh"
 
 _COMPOSED = {}
@@ -557,7 +558,77 @@ class TestFractionalRequiresMiniBatches(unittest.TestCase):
         self.assertEqual((cfg.trainer.n_gpus_per_node, cfg.actor_rollout_ref.rollout.n), (3, 16))
         self.assertEqual(self._expected_first(cfg), 18)
 
-    def test_default_stays_one(self):
-        cfg = compose(ORZ)
+    def test_default_is_half_on_every_arm_and_one_restores_the_old_behaviour(self):
+        for arm, first in ((ORZ, 20), (QWEN, 18), (DYNBSZ, 18)):
+            with self.subTest(arm=arm):
+                cfg = compose(arm)
+                self.assertAlmostEqual(cfg.async_training.replay_buffer.requires_mini_batches, 0.5)
+                self.assertIn(" rmb-0.5 ", cfg.trainer.experiment_name)
+                self.assertEqual(self._expected_first(cfg), first)
+        cfg = compose_with_env(ORZ, {"replay_requires_mini_batches": "1"})
         self.assertEqual(cfg.async_training.replay_buffer.requires_mini_batches, 1)
         self.assertIn(" rmb-1 ", cfg.trainer.experiment_name)
+
+    def test_the_smoke_keeps_the_full_first_minibatch(self):
+        cfg = compose(SMOKE_3P3, stub_test_file=False)
+        self.assertEqual(cfg.async_training.replay_buffer.requires_mini_batches, 1)
+
+
+class TestReplayArmsConcurrencyRamp(unittest.TestCase):
+    """async_training.concurrency_ramp (per-engine in-flight caps for the warm-up stages, see
+    replay_sizing.concurrency_cap) passes through every replay arm as a list, is tagged in the
+    experiment name only when set, and its default per arm covers that arm's first mini-batch in one
+    wave while every stage fits bsz_per_dp_rank (the rollouter asserts the latter)."""
+
+    DEFAULTS = {ORZ: [5, 12, 20], QWEN: [5, 12, 20], DYNBSZ: [5, 12, 20]}
+
+    @staticmethod
+    def _first(cfg):
+        from recipe.fully_async_policy.replay_sizing import first_minibatch_groups, trainer_dp_size
+
+        rmb = cfg.async_training.replay_buffer.requires_mini_batches
+        mini = cfg.actor_rollout_ref.actor.ppo_mini_batch_size
+        return first_minibatch_groups(rmb, mini, cfg.actor_rollout_ref.rollout.n, trainer_dp_size(cfg)) or mini
+
+    def test_defaults_per_arm_are_tagged_and_fit_the_layout(self):
+        for arm, ramp in self.DEFAULTS.items():
+            with self.subTest(arm=arm):
+                cfg = compose(arm)
+                self.assertEqual(list(cfg.async_training.concurrency_ramp), ramp)
+                self.assertIn(" ramp-" + "-".join(map(str, ramp)) + " ", cfg.trainer.experiment_name)
+                # no stage exceeds bsz_per_dp_rank (the rollouter asserts this at start-up)
+                self.assertLessEqual(max(ramp), cfg.async_training.bsz_per_dp_rank)
+
+    def test_stage_zero_covers_the_first_minibatch_in_one_wave_on_the_5plus3_arms_only(self):
+        """5 engines x 5 = 25 >= the 18-group first mini-batch; the ORZ arm's 3 engines x 5 = 15 hold
+        fewer than its 20 groups, so its first mini-batch takes two waves of stage 0 (documented in
+        the arm; 7 per engine would make it one)."""
+        for arm in (QWEN, DYNBSZ):
+            with self.subTest(arm=arm):
+                cfg = compose(arm)
+                self.assertGreaterEqual(5 * cfg.rollout.n_gpus_per_node, self._first(cfg))
+        cfg = compose(ORZ)
+        self.assertEqual((cfg.rollout.n_gpus_per_node, self._first(cfg)), (3, 20))
+        self.assertLess(5 * 3, 20)
+
+    def test_null_switches_it_off_and_drops_the_tag(self):
+        for arm in (ORZ, QWEN):
+            with self.subTest(arm=arm):
+                cfg = compose_with_env(arm, {"concurrency_ramp": "null"})
+                self.assertIsNone(cfg.async_training.concurrency_ramp)
+                self.assertNotIn("ramp-", cfg.trainer.experiment_name)
+
+    def test_list_form_composes_and_is_tagged(self):
+        cfg = compose_with_env(QWEN, {"concurrency_ramp": "[4,8,16]", "replay_requires_mini_batches": "0.5"})
+        self.assertEqual(list(cfg.async_training.concurrency_ramp), [4, 8, 16])
+        self.assertAlmostEqual(cfg.async_training.replay_buffer.requires_mini_batches, 0.5)
+        name = cfg.trainer.experiment_name
+        self.assertIn(" rmb-0.5 ", name)
+        self.assertIn(" ramp-4-8-16 ", name)
+
+    def test_the_smoke_runs_with_the_ramp_off(self):
+        """Its bsz_per_dp_rank is 3: the arm's [7, 12, 24] would trip the rollouter's per-stage assert."""
+        cfg = compose(SMOKE_3P3, stub_test_file=False)
+        self.assertIsNone(cfg.async_training.concurrency_ramp)
+        self.assertNotIn("ramp-", cfg.trainer.experiment_name)
+        self.assertEqual(cfg.async_training.bsz_per_dp_rank, 3)

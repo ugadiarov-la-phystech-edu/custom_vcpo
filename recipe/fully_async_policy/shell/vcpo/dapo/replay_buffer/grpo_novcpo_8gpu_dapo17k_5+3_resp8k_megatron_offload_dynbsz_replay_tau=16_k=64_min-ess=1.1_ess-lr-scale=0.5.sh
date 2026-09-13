@@ -256,11 +256,30 @@ replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-16}
 replay_staleness_threshold=${replay_staleness_threshold:-64}
 # Pause watermark in mini-batches (>= 1, may be fractional). Values in (0, 1) mean a SMALLER
-# all-fresh FIRST mini-batch only: e.g. 0.5 -> 16.5 groups rounded UP to 18 (18*16=288 seqs split
-# evenly over the 3 trainer ranks) -> update 1 fires after 18 complete groups instead of 33, cutting
-# the pipeline fill; every later update uses the full 33 and the fresh-share floor stays
-# ceil(f*33) NEW arrivals. Tagged rmb-<value> in exp_name.
-replay_requires_mini_batches=${replay_requires_mini_batches:-1}
+# all-fresh FIRST mini-batch only -- the DEFAULT here is 0.5: 16.5 groups rounded UP to 18
+# (18*16=288 seqs split evenly over the 3 trainer ranks; 17*16=272 does not) -> update 1 fires
+# after 18 complete groups instead of 33; every later update uses the full 33 and the fresh-share
+# floor stays ceil(f*33) NEW arrivals. Pass replay_requires_mini_batches=1 for the old
+# behaviour. Tagged rmb-<value> in exp_name. Pairs with concurrency_ramp below: together they cut
+# the ~7 min pipeline fill before update 1 to ~2 min.
+replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
+# Concurrency ramp (DEFAULT "[5, 12, 20]"; null = off). Without it the rollouter dispatches its whole cap at once
+# (5 engines x 33 = 165 groups = 2640 seqs, ~528 per engine) and at that concurrency each
+# sequence decodes at ~20 tok/s, so the first mini-batch's 8k-token tails take ~7 min
+# (timing_s/gen ~430 s at update 1 in every run so far; KV memory is not the limiter: a
+# 4+4 arm at gmu 0.95 filled just as slowly). A list of PER-ENGINE caps for the warm-up
+# stages: "[5, 12, 20]" = 25 groups in flight (80 seqs/engine, single-wave decode) until the
+# first mini-batch (18) is delivered (~2 min), 60 until one more mini-batch (51 delivered), 100
+# until the next (84), then the full 165. Stage widths trade supply for latency: a wider stage
+# delivers more groups but each takes longer, and a composition takes EVERY fresh group present
+# (up to 33), so a stage must still have ~17 groups landing after the previous composition and
+# before the current update ends (~3 min) -- 12/20 rather than 8/16 gives that slack (the openPangu
+# twin's [4, 10, 20] still waited 40 s at update 2). Tagged " ramp-5-12-20" in exp_name; pass
+# concurrency_ramp=null to switch it off. Watch replay/fresh_wait_s at updates 2-4: non-zero means
+# widen the stages further.
+concurrency_ramp=${concurrency_ramp:-"[5, 12, 20]"}
+ramp_tag=""
+if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
 
@@ -309,7 +328,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag}${emu_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo dynbsz B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo dynbsz B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -479,4 +498,5 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.ppo_epochs_shuffle_seed=${SEED} \
     async_training.opportunistic_epochs.shuffle_seed=${SEED} \
     async_training.replay_buffer.save_state="${replay_save_state}" \
-    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
+    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" \
+    async_training.concurrency_ramp="${concurrency_ramp}" "$@"

@@ -1813,15 +1813,22 @@ def test_rmb_at_least_one_is_unchanged_by_the_first_size_plumbing():
 
 
 def test_trainer_source_wires_the_first_size():
-    """Tripwires for what the stub trainer cannot see: the helpers sit ABOVE the @ray.remote
-    decorator (a def in between would steal it), the constructor derives the first size from
-    rollout.n and the trainer DP size, the metric reports the composed size, and the actor
-    iterates a short batch as one mini-batch."""
+    """Tripwires for what the stub trainer cannot see: the sizing helpers live in
+    replay_sizing.py (shared with the rollouter) and are imported, not defined, in the trainer
+    module — nothing sits between the @ray.remote decorator and the class (a def there would
+    steal it); the constructor derives the first size from rollout.n and the trainer DP size;
+    the metric reports the composed size; the actor iterates a short batch as one mini-batch."""
     import inspect
 
-    src = inspect.getsource(inspect.getmodule(_TrainerActor))
-    assert src.index("def first_minibatch_groups(") < src.index("@ray.remote(num_cpus=10)")
-    assert src.index("def trainer_dp_size(") < src.index("@ray.remote(num_cpus=10)")
+    from recipe.fully_async_policy import fully_async_trainer as trainer_mod
+    from recipe.fully_async_policy import replay_sizing
+
+    src = inspect.getsource(trainer_mod)
+    assert "from recipe.fully_async_policy.replay_sizing import" in src
+    assert trainer_mod.first_minibatch_groups is replay_sizing.first_minibatch_groups
+    assert trainer_mod.trainer_dp_size is replay_sizing.trainer_dp_size
+    deco = src.index("@ray.remote(num_cpus=10)")
+    assert src[deco:].lstrip().startswith("@ray.remote(num_cpus=10)\nclass FullyAsyncTrainer(")
     assert "self.replay_first_mini_size = first_minibatch_groups(" in src
     assert '"replay/minibatch_size": info["n_new"] + info["n_replayed"]' in src
     assert "assert self.replay_requires_mini_batches > 0" in src

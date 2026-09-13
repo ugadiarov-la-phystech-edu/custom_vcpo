@@ -39,6 +39,18 @@ async_training:
   # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
   partial_rollout: True
 
+  # Rollouter concurrency ramp (null = off: the in-flight cap is n_engines x
+  # bsz_per_dp_rank from the start). A list of PER-ENGINE caps for the warm-up
+  # stages, e.g. [4, 8, 16]: stage 0 holds 4 x n_engines groups in flight until the
+  # trainer's first mini-batch has been delivered to the queue (ppo_mini_batch_size
+  # groups, or the smaller first mini-batch of replay_buffer.requires_mini_batches
+  # < 1), stage i holds ramp[i] x n_engines until first + i x ppo_mini_batch_size
+  # deliveries, then the normal cap. Few sequences in flight at start decode at
+  # single-wave speed, so update 1 arrives in ~2 min instead of the ~7 min a full
+  # burst needs; the later stages still over-supply the trainer. Counted on
+  # total_generated_samples (persisted), so a resumed run starts at the full cap.
+  concurrency_ramp: null
+
   # Whether to use rollout log probs for training
   use_rollout_log_probs: True
 

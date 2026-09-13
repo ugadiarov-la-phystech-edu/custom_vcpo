@@ -388,11 +388,30 @@ replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-8} # the twin: 16 (see REPLAY DEPTH)
 replay_staleness_threshold=${replay_staleness_threshold:-32} # the twin: 64
 # Pause watermark in mini-batches (>= 1, may be fractional). Values in (0, 1) mean a SMALLER
-# all-fresh FIRST mini-batch only: e.g. 0.5 -> 17.5 groups rounded UP to 20 (20*16=320 seqs split
-# evenly over the 5 trainer ranks) -> update 1 fires after 20 complete groups instead of 35, cutting
-# the pipeline fill; every later update uses the full 35 and the fresh-share floor stays
-# ceil(f*35) NEW arrivals. Tagged rmb-<value> in exp_name.
-replay_requires_mini_batches=${replay_requires_mini_batches:-1}
+# all-fresh FIRST mini-batch only -- the DEFAULT here is 0.5: 17.5 groups rounded UP to 20
+# (20*16=320 seqs split evenly over the 5 trainer ranks; 18*16 and 19*16 do not) -> update 1
+# fires after 20 complete groups instead of 35; every later update uses the full 35 and the
+# fresh-share floor stays ceil(f*35) NEW arrivals. Pass replay_requires_mini_batches=1 for the
+# old behaviour. Tagged rmb-<value> in exp_name. Pairs with concurrency_ramp below: together they
+# cut the pipeline fill before update 1 from ~7 min to ~2 min.
+replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
+# Concurrency ramp (DEFAULT "[5, 12, 20]", the same list as the 5+3 twins; null = off). Without it the
+# rollouter dispatches its whole cap at once (3 engines x 35 = 105 groups = 1680 seqs, 560 per
+# engine) and at that concurrency each sequence decodes at ~20 tok/s, so the first mini-batch's
+# 8k-token tails take ~7 min (measured on the 5+3 twins: timing_s/gen ~430 s at update 1; KV memory
+# is not the limiter). A list of PER-ENGINE caps for the warm-up stages: "[5, 12, 20]" = 15 groups
+# in flight (80 seqs/engine) until the first mini-batch (20) is delivered, 36 until one more
+# mini-batch (55 delivered), 60 until the next (90), then the full 105. NOTE: with only 3 engines
+# stage 0 holds 15 < 20 groups, so the first mini-batch takes TWO waves (the 5+3 twins' 25 >= 18
+# take one); 7 per engine (21 in flight) would cover it in one wave at a slower per-sequence decode.
+# Every stage must be <= bsz_per_dp_rank (35; the rollouter asserts it). Stage widths trade supply
+# for latency: a composition takes EVERY fresh group present (up to 35), so a stage must still have
+# enough groups landing between the previous composition and the end of the current update. Tagged
+# " ramp-5-12-20" in exp_name; pass concurrency_ramp=null to switch it off. Watch
+# replay/fresh_wait_s at updates 2-4: non-zero means widen the stages further.
+concurrency_ramp=${concurrency_ramp:-"[5, 12, 20]"}
+ramp_tag=""
+if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 # Reuse-decay half-life in trainings (see REUSE DECAY in the header); null = staleness-only draw
 replay_reuse_halflife=${replay_reuse_halflife:-1}
@@ -474,7 +493,7 @@ val_temperature=${val_temperature:-1.0}
 val_top_p=${val_top_p:-1.0}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife}${replay_fresh_tag} ess-${ess_tag}${emu_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -645,4 +664,5 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
     async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
-    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
+    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" \
+    async_training.concurrency_ramp="${concurrency_ramp}" "$@"
