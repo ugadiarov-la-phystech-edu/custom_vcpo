@@ -109,7 +109,10 @@ use_rollout_log_probs=True
 replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-8}
 replay_staleness_threshold=${replay_staleness_threshold:-32}
-replay_requires_mini_batches=${replay_requires_mini_batches:-1}
+replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
+concurrency_ramp=${concurrency_ramp:-"[5, 12, 20]"}
+ramp_tag=""
+if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 replay_reuse_halflife=${replay_reuse_halflife:-1}
 replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}
@@ -141,7 +144,7 @@ reward_fn_name=${reward_fn_name:-"compute_score"}
 val_temperature=${val_temperature:-1.0}
 val_top_p=${val_top_p:-1.0}
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife}${replay_fresh_tag} ess-${ess_tag}${emu_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -310,4 +313,5 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
     async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
-    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
+    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" \
+    async_training.concurrency_ramp="${concurrency_ramp}" "$@"

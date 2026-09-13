@@ -25,6 +25,8 @@ async_training:
   # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
   partial_rollout: True
 
+  concurrency_ramp: null
+
   # Whether to use rollout log probs for training
   use_rollout_log_probs: True
 
