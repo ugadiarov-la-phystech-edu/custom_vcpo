@@ -38,6 +38,7 @@ from omegaconf import OmegaConf
 from recipe.fully_async_policy.detach_utils import RolloutSample, ValidateMetrics
 from recipe.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter as _RollouterActor
 from recipe.fully_async_policy.fully_async_trainer import FullyAsyncTrainer as _TrainerActor
+from recipe.fully_async_policy.fully_async_trainer import first_minibatch_groups, trainer_dp_size
 from recipe.fully_async_policy.message_queue import MessageQueue as _MessageQueueActor
 from recipe.fully_async_policy.replay_buffer import (
     GroupEntry,
@@ -658,12 +659,15 @@ def _make_replay_trainer(
     reuse_halflife=None,
     min_fresh_ratio=0.0,
     wait_timeout_s=3600.0,
+    first_mini_size=None,
 ):
     t = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
     t.replay_buffer = ReplayBuffer(tau=4.0, staleness_threshold=100, seed=0, reuse_halflife=reuse_halflife)
     t.replay_updates_done = 0
     t.replay_requires_mini_batches = float(requires_mini_batches)
     t.required_samples = mini_size
+    t.replay_first_mini_size = first_mini_size
+    t._replay_first_composed = False
     t.replay_min_fresh_ratio = float(min_fresh_ratio)
     t.replay_min_fresh_wait_timeout_s = float(wait_timeout_s)
     t.replay_fresh_poll_interval_s = 0.0  # never sleep in tests
@@ -1651,3 +1655,178 @@ def test_total_training_steps_is_null_in_the_base_configs_and_read_by_init():
     for name in ("_generated_ppo_trainer.yaml", "_generated_ppo_megatron_trainer.yaml"):
         cfg = OmegaConf.load(os.path.join(cfg_dir, name))
         assert cfg.trainer.total_training_steps is None, name
+
+
+# ------------------------------------------- fractional requires_mini_batches (< 1): first mini-batch
+
+
+class TestFirstMinibatchGroups:
+    """requires_mini_batches in (0, 1) sizes ONLY the first mini-batch: the smallest group count
+    >= rmb x mini_size whose sequences (groups x n) split evenly over the trainer DP ranks."""
+
+    @pytest.mark.parametrize(
+        "rmb, mini, n, dp, expected",
+        [
+            (0.5, 33, 16, 3, 18),  # 16.5 -> 17 (272 % 3 != 0) -> 18 (288 % 3 == 0): the user's case
+            (0.5, 33, 16, 4, 17),  # 17 x 16 = 272 divides by 4
+            (0.5, 33, 16, 1, 17),  # no divisibility constraint
+            (0.5, 34, 16, 3, 18),  # exactly 17.0 -> 17 not divisible -> 18
+            (0.9, 33, 16, 3, 30),  # 29.7 -> 30, 480 % 3 == 0
+            (0.99, 33, 16, 3, 33),  # 32.67 -> 33 = cap at mini_size
+            (0.01, 33, 16, 3, 3),  # 0.33 -> 1 -> 2 -> 3 (48 % 3 == 0)
+            (0.5, 2, 3, 2, 1),  # 1 x 3 = 3 is odd -> 2? no: g=1 -> 3 % 2 != 0 -> g=2 = cap  (see below)
+        ],
+    )
+    def test_rounding(self, rmb, mini, n, dp, expected):
+        if (rmb, mini, n, dp) == (0.5, 2, 3, 2):
+            expected = 2  # 1 group = 3 seqs (odd); 2 groups = 6 seqs -> the cap coincides with the fix
+        assert first_minibatch_groups(rmb, mini, n, dp) == expected
+
+    @pytest.mark.parametrize("rmb", [1.0, 1.5, 2, 2.0])
+    def test_at_least_one_keeps_the_watermark_semantics(self, rmb):
+        assert first_minibatch_groups(rmb, 33, 16, 3) is None
+
+    @pytest.mark.parametrize("bad", [0, 0.0, -1, -0.5])
+    def test_non_positive_is_an_error(self, bad):
+        with pytest.raises(ValueError, match="requires_mini_batches"):
+            first_minibatch_groups(bad, 33, 16, 3)
+
+    def test_result_always_splits_over_dp_or_hits_the_cap(self):
+        for mini in (2, 5, 33, 64):
+            for n in (1, 4, 16):
+                for dp in (1, 2, 3, 4, 8):
+                    for rmb in (0.1, 0.3, 0.5, 0.75, 0.999):
+                        g = first_minibatch_groups(rmb, mini, n, dp)
+                        assert 1 <= g <= mini
+                        assert g >= rmb * mini - 1e-9
+                        assert (g * n) % dp == 0 or g == mini
+
+
+class TestTrainerDpSize:
+    @staticmethod
+    def _cfg(gpus, strategy="megatron", tp=1, pp=1, cp=1, ulysses=1, nnodes=1):
+        return OmegaConf.create(
+            {
+                "trainer": {"nnodes": nnodes, "n_gpus_per_node": gpus},
+                "actor_rollout_ref": {
+                    "actor": {
+                        "strategy": strategy,
+                        "megatron": {
+                            "tensor_model_parallel_size": tp,
+                            "pipeline_model_parallel_size": pp,
+                            "context_parallel_size": cp,
+                        },
+                        "ulysses_sequence_parallel_size": ulysses,
+                    }
+                },
+            }
+        )
+
+    def test_megatron_pure_dp(self):
+        assert trainer_dp_size(self._cfg(3)) == 3  # the 5+3 arms
+
+    def test_megatron_model_parallel_divides(self):
+        assert trainer_dp_size(self._cfg(4, tp=2)) == 2
+        assert trainer_dp_size(self._cfg(8, tp=2, pp=2)) == 2
+        assert trainer_dp_size(self._cfg(4, nnodes=2, tp=2)) == 4
+
+    def test_megatron_non_divisible_is_an_error(self):
+        with pytest.raises(ValueError, match="not divisible"):
+            trainer_dp_size(self._cfg(3, tp=2))
+
+    def test_fsdp_uses_ulysses(self):
+        assert trainer_dp_size(self._cfg(4, strategy="fsdp2", ulysses=2)) == 2
+        assert trainer_dp_size(self._cfg(4, strategy="fsdp")) == 4
+
+
+def test_first_minibatch_is_small_and_all_fresh_then_full_size():
+    """rmb < 1: the first composition uses the small size on a small watermark; the leftover
+    fresh group joins the pool with NO carried freshness; the second composition is full-size,
+    watermark = one full mini-batch, and its fresh-share floor counts only arrivals AFTER the
+    first composition."""
+    s = [_sample(group_version=v) for v in range(8)]
+    trainer = _make_replay_trainer(
+        mini_size=4,
+        requires_mini_batches=0.5,
+        first_mini_size=2,
+        min_fresh_ratio=0.5,
+        available=[[s[0], s[1], s[2]], [], [s[4]], [s[5]]],
+        blocking=[s[3]],
+    )
+    # update 1: three groups drained at once, watermark 2 met without blocking pulls; the
+    # composition takes 2 of them (newest first) and the third is overflow, not fresh
+    entries, info = trainer._acquire_replay_minibatch()
+    assert trainer.message_queue_client.blocking_calls == 0
+    assert len(entries) == 2 and info["n_new"] == 2 and info["n_replayed"] == 0
+    assert [e.sample.group_version for e in entries] == [2, 1]
+    assert trainer.replay_buffer.pending_fresh_count() == 0  # s0 lost its one-shot freshness
+    trainer.replay_buffer.mark_trained(entries)
+    trainer.replay_updates_done = 1
+
+    # update 2: full mini-batch (4). The drain finds nothing, the buffer holds 3 < watermark 4
+    # -> one blocking pull (s3). The fresh floor is ceil(0.5 x 4) = 2 on the FULL size and only
+    # s3 arrived after the first composition -> the gate polls the drains until s4 arrives too.
+    entries, info = trainer._acquire_replay_minibatch()
+    assert trainer.message_queue_client.blocking_calls == 1
+    assert len(entries) == 4
+    assert info["n_new"] == 2 and info["n_replayed"] == 2
+    assert {e.sample.group_version for e in entries[:2]} == {3, 4}  # the fresh prefix = post-first arrivals
+    assert trainer.replay_buffer.pending_fresh_count() == 0
+
+
+def test_first_minibatch_size_is_never_used_after_a_resume():
+    """A restored run (updates_done > 0) composes full-size from the first call."""
+    s = [_sample(group_version=v) for v in range(6)]
+    trainer = _make_replay_trainer(
+        mini_size=4, requires_mini_batches=0.5, first_mini_size=2, available=[s[0], s[1]], blocking=[s[2], s[3]]
+    )
+    trainer.replay_updates_done = 3  # as restored from replay_buffer.pt
+    entries, info = trainer._acquire_replay_minibatch()
+    assert trainer.message_queue_client.blocking_calls == 2  # watermark 4, not 2
+    assert len(entries) == 4 and info["n_new"] == 4
+
+
+def test_first_minibatch_watermark_waits_for_the_small_size_only():
+    s = [_sample(group_version=v) for v in range(4)]
+    trainer = _make_replay_trainer(
+        mini_size=4, requires_mini_batches=0.5, first_mini_size=2, available=[s[0]], blocking=[s[1], s[2], s[3]]
+    )
+    entries, info = trainer._acquire_replay_minibatch()
+    assert trainer.message_queue_client.blocking_calls == 1  # 1 drained + 1 pulled = watermark 2
+    assert len(entries) == 2 and info["n_new"] == 2
+
+
+def test_rmb_at_least_one_is_unchanged_by_the_first_size_plumbing():
+    """With rmb >= 1 the constructor sets replay_first_mini_size=None and the loop is bit-for-bit
+    the old one (watermark rmb x mini_size on every call)."""
+    s = [_sample(group_version=v) for v in range(6)]
+    trainer = _make_replay_trainer(
+        mini_size=2,
+        requires_mini_batches=1.5,
+        first_mini_size=None,
+        available=[s[0]],
+        blocking=[s[1], s[2], s[3], s[4]],
+    )
+    entries, info = trainer._acquire_replay_minibatch()
+    assert trainer.message_queue_client.blocking_calls == 2  # watermark 3
+    assert len(entries) == 2 and info["n_new"] == 2
+
+
+def test_trainer_source_wires_the_first_size():
+    """Tripwires for what the stub trainer cannot see: the helpers sit ABOVE the @ray.remote
+    decorator (a def in between would steal it), the constructor derives the first size from
+    rollout.n and the trainer DP size, the metric reports the composed size, and the actor
+    iterates a short batch as one mini-batch."""
+    import inspect
+
+    src = inspect.getsource(inspect.getmodule(_TrainerActor))
+    assert src.index("def first_minibatch_groups(") < src.index("@ray.remote(num_cpus=10)")
+    assert src.index("def trainer_dp_size(") < src.index("@ray.remote(num_cpus=10)")
+    assert "self.replay_first_mini_size = first_minibatch_groups(" in src
+    assert '"replay/minibatch_size": info["n_new"] + info["n_replayed"]' in src
+    assert "assert self.replay_requires_mini_batches > 0" in src
+    from verl.workers.actor import megatron_actor
+
+    actor_src = inspect.getsource(megatron_actor.MegatronPPOActor.make_minibatch_iterator)
+    assert "if data.batch.batch_size[0] < mini_batch_size:" in actor_src
+    assert "mini_batch_size = int(data.batch.batch_size[0])" in actor_src

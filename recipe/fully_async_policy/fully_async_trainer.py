@@ -55,6 +55,35 @@ def parse_max_train_steps(value) -> int | None:
     return steps
 
 
+def trainer_dp_size(config) -> int:
+    gpus = int(config.trainer.nnodes) * int(config.trainer.n_gpus_per_node)
+    actor_cfg = config.actor_rollout_ref.actor
+    strategy = str(actor_cfg.get("strategy", "megatron"))
+    if strategy == "megatron":
+        mp = int(actor_cfg.megatron.get("tensor_model_parallel_size", 1))
+        mp *= int(actor_cfg.megatron.get("pipeline_model_parallel_size", 1))
+        mp *= int(actor_cfg.megatron.get("context_parallel_size", 1))
+    else:
+        mp = int(actor_cfg.get("ulysses_sequence_parallel_size", 1))
+    if mp < 1 or gpus % mp != 0:
+        raise ValueError(f"trainer GPUs ({gpus}) are not divisible by the model-parallel degree ({mp})")
+    return gpus // mp
+
+
+def first_minibatch_groups(requires_mini_batches: float, mini_size: int, n: int, dp: int) -> int | None:
+    rmb = float(requires_mini_batches)
+    if rmb <= 0:
+        raise ValueError(f"replay_buffer.requires_mini_batches must be > 0, got {requires_mini_batches!r}")
+    if rmb >= 1:
+        return None
+    if mini_size < 1 or n < 1 or dp < 1:
+        raise ValueError(f"invalid mini_size={mini_size}, n={n}, dp={dp}")
+    g = max(1, math.ceil(rmb * mini_size - 1e-9))
+    while g < mini_size and (g * n) % dp != 0:
+        g += 1
+    return min(g, mini_size)
+
+
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
     """
@@ -154,7 +183,21 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             _reuse_halflife = replay_cfg.get("reuse_halflife", None)
             self.replay_reuse_halflife = float(_reuse_halflife) if _reuse_halflife is not None else None
             self.replay_requires_mini_batches = float(replay_cfg.get("requires_mini_batches", 2))
-            assert self.replay_requires_mini_batches >= 1, "replay_buffer.requires_mini_batches must be >= 1"
+            assert self.replay_requires_mini_batches > 0, "replay_buffer.requires_mini_batches must be > 0"
+            self.replay_first_mini_size = first_minibatch_groups(
+                self.replay_requires_mini_batches,
+                self.required_samples,
+                int(config.actor_rollout_ref.rollout.n),
+                trainer_dp_size(config),
+            )
+            self._replay_first_composed = False
+            if self.replay_first_mini_size is not None:
+                print(
+                    f"[FullyAsyncTrainer][Replay] first mini-batch: {self.replay_first_mini_size} groups "
+                    f"(requires_mini_batches={self.replay_requires_mini_batches}, mini_size={self.required_samples}, "
+                    f"n={int(config.actor_rollout_ref.rollout.n)}, dp={trainer_dp_size(config)}); "
+                    f"later mini-batches: {self.required_samples} groups"
+                )
             self.replay_min_fresh_ratio = float(replay_cfg.get("min_fresh_ratio", 0.0))
             assert 0.0 <= self.replay_min_fresh_ratio <= 1.0, (
                 f"replay_buffer.min_fresh_ratio must be in [0, 1], got {self.replay_min_fresh_ratio}"
@@ -504,8 +547,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         return True
 
     def _acquire_replay_minibatch(self):
-        mini_size = self.required_samples
-        watermark = self.replay_requires_mini_batches * mini_size
+        first = getattr(self, "replay_first_mini_size", None)
+        use_first = (
+            first is not None
+            and int(getattr(self, "replay_updates_done", 0)) == 0
+            and not getattr(self, "_replay_first_composed", False)
+        )
+        mini_size = int(first) if use_first else self.required_samples
+        if self.replay_requires_mini_batches < 1:
+            watermark = mini_size
+        else:
+            watermark = self.replay_requires_mini_batches * mini_size
         self._drain_queue_into_buffer()
         while self.replay_buffer.size() < watermark:
             if self.rollout_done:
@@ -517,6 +569,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._wait_one_sample_into_buffer()
         self._replay_fresh_wait_s, self._replay_fresh_floor_waived = self._wait_for_fresh_floor(mini_size)
         entries, info = self.replay_buffer.compose_minibatch(mini_size, self.current_param_version)
+        self._replay_first_composed = True
         consumer_end = time.time()
         self._open_virtual_step(consumer_end, [e.sample for e in entries[: info["n_new"]]])
         return entries, info
@@ -620,6 +673,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 "replay/buffer_size": self.replay_buffer.size(),
                 "replay/buffer_new": self.replay_buffer.untrained_count(),
                 "replay/buffer_max_staleness": float(self.replay_buffer.max_staleness(new_version) or 0),
+                "replay/minibatch_size": info["n_new"] + info["n_replayed"],
                 "replay/minibatch_new": info["n_new"],
                 "replay/minibatch_replayed": info["n_replayed"],
                 "replay/minibatch_new_ratio": info["n_new"] / (info["n_new"] + info["n_replayed"]),
