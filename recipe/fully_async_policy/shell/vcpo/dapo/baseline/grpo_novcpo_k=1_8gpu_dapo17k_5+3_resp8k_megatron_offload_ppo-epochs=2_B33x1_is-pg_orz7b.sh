@@ -149,6 +149,14 @@
 # silent stall, probe 2026-07-30). calculate_entropy=True clones the logits on the
 # non-fused megatron path (~3 GB at 10k tokens x 152k vocab) inside the training
 # forward; if the trainer OOMs, set use_fused_kernels=True or calculate_entropy=False.
+#
+# SEEDS. One SEED variable (default 1) feeds the same seed knobs the Qwen3-8B
+# sync arm sets: data.seed (prompt order), actor.megatron.seed (trainer rng; ref
+# follows via oc.select), critic.megatron.seed (inert without a critic, set for
+# completeness) and actor.data_loader_seed (mini-batch shuffle). vLLM's sampling
+# seed is NOT settable from a script (RolloutConfig has no seed field; always 0).
+# The seed is part of exp_name ("seed-N") so repeats get their own log dir.
+#
 
 set -xeuo pipefail
 
@@ -169,6 +177,11 @@ TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k
 # The rollout-dapo arm also validated on math500.parquet; that set needs the
 # math500_dapo scorer, which this branch does not carry.
 TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+
+# ================= Seeds =================
+# The seed knobs shared with the main_ppo arms (see the SEEDS header block).
+# vLLM's sampling seed is not among them: it is hard-wired to 0 by RolloutConfig.
+SEED=${SEED:-1}
 
 project_name='vcpo'
 
@@ -314,7 +327,7 @@ reward_fn_path=${reward_fn_path:-"${_recipe_root}/reward/orz_tag_aware_math.py"}
 reward_fn_name=${reward_fn_name:-"compute_score"}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO is-pg k-${staleness_threshold} DAPO17K-AIME24 ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO is-pg k-${staleness_threshold} DAPO17K-AIME24 ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -339,6 +352,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
+    data.seed=${SEED} \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.return_raw_chat=${return_raw_chat} \
     data.filter_overlong_prompts=True \
@@ -400,6 +414,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+    actor_rollout_ref.actor.data_loader_seed=${SEED} \
+    actor_rollout_ref.actor.megatron.seed=${SEED} \
     actor_rollout_ref.actor.use_rollout_log_probs=${use_rollout_log_probs} \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
@@ -433,6 +449,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     critic.megatron.context_parallel_size=${train_cp} \
     critic.megatron.sequence_parallel=${sequence_parallel} \
     critic.megatron.dtype=${precision_dtype} \
+    critic.megatron.seed=${SEED} \
     trainer.logger=${trainer_logger} \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \

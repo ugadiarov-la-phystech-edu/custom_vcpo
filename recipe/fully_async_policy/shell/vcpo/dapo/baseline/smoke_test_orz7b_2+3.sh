@@ -105,6 +105,7 @@ export n_gpus_rollout=${n_gpus_rollout:-2}   # -> n_gpus_training = 5 - 2 = 3
 
 # ---- 2 steps, cheap ones -----------------------------------------------------
 export MODEL_PATH TRAIN_FILE TEST_FILE exp_name
+export SEED=${SEED:-1}                    # the arm's seed knobs (data / trainer rng / mini-batch shuffle)
 export n_resp_per_prompt=${n_resp_per_prompt:-2}
 export train_prompt_mini_bsz=${train_prompt_mini_bsz:-3}
 export max_response_length=${max_response_length:-8192}   # the arm's own length, not a shortened one
