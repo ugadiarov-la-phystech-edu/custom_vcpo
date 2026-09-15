@@ -18,6 +18,8 @@ TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/orz-math-72k.p
 TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/orz/aime-2024-orz.parquet','/home/jovyan/datasets/math_datasets/orz/aime-2025-orz.parquet']"}
 REWARD_FILE=${REWARD_FILE:-"recipe/fully_async_policy/reward/orz_tag_aware_math.py"}
 
+SEED=${SEED:-1}
+
 max_prompt_length=$((1024 * 2))
 max_response_length=$((1024 * 8))
 filter_overlong_prompts=True
@@ -87,7 +89,7 @@ resume_mode=${resume_mode:-disable}
 NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} ORZ72K-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} ORZ72K-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -103,6 +105,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
+    data.seed=${SEED} \
     data.filter_overlong_prompts=${filter_overlong_prompts} \
     data.filter_overlong_prompts_workers=8 \
     custom_reward_function.path="${REWARD_FILE}" \
@@ -127,6 +130,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+    actor_rollout_ref.actor.data_loader_seed=${SEED} \
+    actor_rollout_ref.actor.megatron.seed=${SEED} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \
@@ -170,6 +175,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    critic.megatron.seed=${SEED} \
     trainer.logger="['console','tensorboard']" \
     trainer.project_name=vcpo \
     trainer.experiment_name="${exp_name}" \

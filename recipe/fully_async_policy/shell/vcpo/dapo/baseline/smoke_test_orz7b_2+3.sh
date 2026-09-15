@@ -21,6 +21,7 @@ export NGPUS_PER_NODE=${NGPUS_PER_NODE:-5}
 export n_gpus_rollout=${n_gpus_rollout:-2}
 
 export MODEL_PATH TRAIN_FILE TEST_FILE exp_name
+export SEED=${SEED:-1}
 export n_resp_per_prompt=${n_resp_per_prompt:-2}
 export train_prompt_mini_bsz=${train_prompt_mini_bsz:-3}
 export max_response_length=${max_response_length:-8192}
