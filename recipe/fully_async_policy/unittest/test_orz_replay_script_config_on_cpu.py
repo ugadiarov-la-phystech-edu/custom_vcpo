@@ -250,20 +250,21 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         self.assertEqual(qwen.async_training.replay_buffer.reuse_halflife, 1)
         self.assertIn(" nu-1 ", qwen.trainer.experiment_name)
 
-    def test_fresh_share_gate_is_off_by_default_and_env_overridable(self):
+    def test_fresh_share_gate_is_on_by_default_and_env_overridable(self):
         """replay_buffer.min_fresh_ratio (the trainer waits for ceil(ratio x mini) groups that arrived
-        from the rollouter since the last composition) defaults to 0 here, while the Qwen twin runs
-        0.5 and tags it; the knob reaches hydra and tags the experiment name only when set."""
-        self.assertEqual(self.cfg.async_training.replay_buffer.min_fresh_ratio, 0)
-        self.assertNotIn("fresh-", self.cfg.trainer.experiment_name)
+        from the rollouter since the last composition) defaults to 0.5 here as on the Qwen twin
+        (since 2026-09-16) and is tagged; replay_min_fresh_ratio=0 restores the gate-free arm and
+        drops the tag."""
+        self.assertAlmostEqual(self.cfg.async_training.replay_buffer.min_fresh_ratio, 0.5)
+        self.assertIn(" nu-1 fresh-0.5 ", self.cfg.trainer.experiment_name)
         qwen = compose(QWEN)
         self.assertAlmostEqual(qwen.async_training.replay_buffer.min_fresh_ratio, 0.5)
         self.assertIn(" nu-1 fresh-0.5 ", qwen.trainer.experiment_name)
         text = open(os.path.join(REPLAY, ORZ)).read()
         self.assertIn('async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}"', text)
-        self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}", text)
+        self.assertIn("replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}", text)
         env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet")
-        env["replay_min_fresh_ratio"] = "0.5"
+        env["replay_min_fresh_ratio"] = "0"
         with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
             proc = subprocess.run(
                 ["bash", os.path.join(REPLAY, ORZ), "--cfg", "job", "--resolve"],
@@ -278,8 +279,8 @@ class TestOrzReplayArmConfig(unittest.TestCase):
             out.flush()
             out.seek(0)
             cfg = OmegaConf.load(out.name)
-        self.assertAlmostEqual(cfg.async_training.replay_buffer.min_fresh_ratio, 0.5)
-        self.assertIn(" nu-1 fresh-0.5 ", cfg.trainer.experiment_name)
+        self.assertEqual(cfg.async_training.replay_buffer.min_fresh_ratio, 0)
+        self.assertNotIn("fresh-", cfg.trainer.experiment_name)
 
     def test_max_updates_caps_updates_and_is_unset_by_default(self):
         """trainer.total_training_steps (verl's key, read by FullyAsyncTrainer as a cap on
@@ -580,7 +581,7 @@ class TestReplayArmsConcurrencyRamp(unittest.TestCase):
     experiment name only when set, and its default per arm covers that arm's first mini-batch in one
     wave while every stage fits bsz_per_dp_rank (the rollouter asserts the latter)."""
 
-    DEFAULTS = {ORZ: [5, 12, 20], QWEN: [5, 12, 20], DYNBSZ: [5, 12, 20]}
+    DEFAULTS = {ORZ: [4, 10, 20], QWEN: [5, 12, 20], DYNBSZ: [5, 12, 20]}
 
     @staticmethod
     def _first(cfg):
@@ -600,7 +601,7 @@ class TestReplayArmsConcurrencyRamp(unittest.TestCase):
                 self.assertLessEqual(max(ramp), cfg.async_training.bsz_per_dp_rank)
 
     def test_stage_zero_covers_the_first_minibatch_in_one_wave_on_the_5plus3_arms_only(self):
-        """5 engines x 5 = 25 >= the 18-group first mini-batch; the ORZ arm's 3 engines x 5 = 15 hold
+        """5 engines x 5 = 25 >= the 18-group first mini-batch; the ORZ arm's 3 engines x 4 = 12 hold
         fewer than its 20 groups, so its first mini-batch takes two waves of stage 0 (documented in
         the arm; 7 per engine would make it one)."""
         for arm in (QWEN, DYNBSZ):
@@ -609,7 +610,7 @@ class TestReplayArmsConcurrencyRamp(unittest.TestCase):
                 self.assertGreaterEqual(5 * cfg.rollout.n_gpus_per_node, self._first(cfg))
         cfg = compose(ORZ)
         self.assertEqual((cfg.rollout.n_gpus_per_node, self._first(cfg)), (3, 20))
-        self.assertLess(5 * 3, 20)
+        self.assertLess(4 * 3, 20)
 
     def test_null_switches_it_off_and_drops_the_tag(self):
         for arm in (ORZ, QWEN):
@@ -626,9 +627,12 @@ class TestReplayArmsConcurrencyRamp(unittest.TestCase):
         self.assertIn(" rmb-0.5 ", name)
         self.assertIn(" ramp-4-8-16 ", name)
 
-    def test_the_smoke_runs_with_the_ramp_off(self):
-        """Its bsz_per_dp_rank is 3: the arm's [7, 12, 24] would trip the rollouter's per-stage assert."""
+    def test_the_smoke_runs_with_the_ramp_and_the_fresh_gate_off(self):
+        """Its bsz_per_dp_rank is 3: the arm's [4, 10, 20] would trip the rollouter's per-stage assert;
+        and its 3-step generation budget never delivers the fresh groups the arm's 0.5 gate would wait
+        for before update 2."""
         cfg = compose(SMOKE_3P3, stub_test_file=False)
         self.assertIsNone(cfg.async_training.concurrency_ramp)
         self.assertNotIn("ramp-", cfg.trainer.experiment_name)
         self.assertEqual(cfg.async_training.bsz_per_dp_rank, 3)
+        self.assertEqual(cfg.async_training.replay_buffer.min_fresh_ratio, 0)

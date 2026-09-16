@@ -110,12 +110,12 @@ replay_enable=${replay_enable:-True}
 replay_tau=${replay_tau:-8}
 replay_staleness_threshold=${replay_staleness_threshold:-32}
 replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
-concurrency_ramp=${concurrency_ramp:-"[5, 12, 20]"}
+concurrency_ramp=${concurrency_ramp:-"[4, 10, 20]"}
 ramp_tag=""
 if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
 replay_reuse_halflife=${replay_reuse_halflife:-1}
-replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}
+replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}
 replay_fresh_tag=""
 if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
 replay_save_state=False
