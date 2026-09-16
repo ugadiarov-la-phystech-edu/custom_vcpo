@@ -140,7 +140,8 @@ export max_response_length=${max_response_length:-8192}   # the arm's own length
 export total_rollout_steps=${total_rollout_steps:-3}      # ONE fresh mini-batch (3 x require_batches 1)
 export replay_staleness_threshold=${replay_staleness_threshold:-1}  # drains the buffer after update 2
 export replay_requires_mini_batches=${replay_requires_mini_batches:-1}
-export concurrency_ramp=${concurrency_ramp:-null}   # the arm's [7, 12, 24] exceeds this run's bsz_per_dp_rank 3
+export concurrency_ramp=${concurrency_ramp:-null}   # the arm's [4, 10, 20] exceeds this run's bsz_per_dp_rank 3
+export replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}  # the arm's 0.5 gate would wait for fresh arrivals the 3-step budget never produces before update 2
                                                    # (rollouter assert); the smoke measures one mini-batch, not the fill
 export test_freq=${test_freq:-1}          # validate after every param version
 export save_freq=${save_freq:-1}          # and checkpoint every one

@@ -30,7 +30,8 @@
 # only to be evicted unseen.
 #
 # REUSE DECAY. replay_buffer.reuse_halflife=1 (the twin: 1 as well since 2026-09-07,
-# plus a fresh-share gate of 0.5 this arm does not use): the replay
+# plus the fresh-share gate of 0.5 this arm also runs since 2026-09-16, see
+# replay_min_fresh_ratio below): the replay
 # draw weight is 2^(-staleness/tau) * 2^(-times_trained/1), so each training
 # halves a group's chance of being drawn again. This cannot change the mean
 # number of trainings per group (fixed at mini-batch groups per update / kept
@@ -395,21 +396,22 @@ replay_staleness_threshold=${replay_staleness_threshold:-32} # the twin: 64
 # old behaviour. Tagged rmb-<value> in exp_name. Pairs with concurrency_ramp below: together they
 # cut the pipeline fill before update 1 from ~7 min to ~2 min.
 replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
-# Concurrency ramp (DEFAULT "[5, 12, 20]", the same list as the 5+3 twins; null = off). Without it the
+# Concurrency ramp (DEFAULT "[4, 10, 20]", the list the openPangu 5+3 runs used; the local 5+3 twins
+# default to "[5, 12, 20]"; null = off). Without it the
 # rollouter dispatches its whole cap at once (3 engines x 35 = 105 groups = 1680 seqs, 560 per
 # engine) and at that concurrency each sequence decodes at ~20 tok/s, so the first mini-batch's
 # 8k-token tails take ~7 min (measured on the 5+3 twins: timing_s/gen ~430 s at update 1; KV memory
-# is not the limiter). A list of PER-ENGINE caps for the warm-up stages: "[5, 12, 20]" = 15 groups
-# in flight (80 seqs/engine) until the first mini-batch (20) is delivered, 36 until one more
+# is not the limiter). A list of PER-ENGINE caps for the warm-up stages: "[4, 10, 20]" = 12 groups
+# in flight (64 seqs/engine) until the first mini-batch (20) is delivered, 30 until one more
 # mini-batch (55 delivered), 60 until the next (90), then the full 105. NOTE: with only 3 engines
-# stage 0 holds 15 < 20 groups, so the first mini-batch takes TWO waves (the 5+3 twins' 25 >= 18
+# stage 0 holds 12 < 20 groups, so the first mini-batch takes TWO waves (the 5+3 twins' 20-25 >= 18
 # take one); 7 per engine (21 in flight) would cover it in one wave at a slower per-sequence decode.
 # Every stage must be <= bsz_per_dp_rank (35; the rollouter asserts it). Stage widths trade supply
 # for latency: a composition takes EVERY fresh group present (up to 35), so a stage must still have
 # enough groups landing between the previous composition and the end of the current update. Tagged
-# " ramp-5-12-20" in exp_name; pass concurrency_ramp=null to switch it off. Watch
+# " ramp-4-10-20" in exp_name; pass concurrency_ramp=null to switch it off. Watch
 # replay/fresh_wait_s at updates 2-4: non-zero means widen the stages further.
-concurrency_ramp=${concurrency_ramp:-"[5, 12, 20]"}
+concurrency_ramp=${concurrency_ramp:-"[4, 10, 20]"}
 ramp_tag=""
 if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
@@ -421,12 +423,14 @@ replay_reuse_halflife=${replay_reuse_halflife:-1}
 # next mini-batch; untrained groups already in the buffer do not count). Mean
 # trainings per group become ~1/f instead of M/A (mini-batch groups / arrivals per
 # update) at the cost of trainer idle time (~f x M/A - 1 update-times per update);
-# waiting does not age the fresh groups (no version is produced meanwhile). 0 keeps
-# the arm bit-for-bit. The wait is capped by replay_buffer.min_fresh_wait_timeout_s
+# waiting does not age the fresh groups (no version is produced meanwhile). The
+# DEFAULT here is 0.5, the twin's value (tagged " fresh-0.5"); pass
+# replay_min_fresh_ratio=0 for the gate-free arm (no tag). The wait is capped by
+# replay_buffer.min_fresh_wait_timeout_s
 # (yaml default 3600 s; on the cap the update runs anyway and
 # replay/fresh_floor_waived logs 1). Fresh groups are NOT on-policy — a long
 # rollout spans several updates — so watch replay/minibatch_fresh_staleness_mean.
-replay_min_fresh_ratio=${replay_min_fresh_ratio:-0}
+replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}
 replay_fresh_tag=""
 if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
 replay_save_state=False # no replay_buffer.pt in checkpoints: resume is disabled
