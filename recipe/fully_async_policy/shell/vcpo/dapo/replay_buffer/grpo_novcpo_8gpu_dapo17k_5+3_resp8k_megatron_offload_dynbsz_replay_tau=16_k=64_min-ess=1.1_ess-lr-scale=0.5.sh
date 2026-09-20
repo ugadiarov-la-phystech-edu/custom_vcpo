@@ -183,7 +183,8 @@ bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}} # Rollout Bsz
 
 # ================= Algorithm =================
 adv_estimator=grpo
-loss_agg_mode="seq-mean-token-mean"
+loss_agg_mode=${loss_agg_mode:-"seq-mean-token-mean"} # env-overridable, but the packed (dynbsz) per-traj path
+# asserts seq-mean-token-mean: any other value stops the first update
 clip_ratio=0.2
 clip_ratio_low=0.2
 clip_ratio_high=0.2

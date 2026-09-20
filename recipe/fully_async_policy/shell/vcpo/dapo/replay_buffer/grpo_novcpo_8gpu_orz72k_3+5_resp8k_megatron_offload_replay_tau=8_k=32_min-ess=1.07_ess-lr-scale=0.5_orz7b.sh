@@ -319,7 +319,8 @@ bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}} # Rollout Bsz
 
 # ================= Algorithm =================
 adv_estimator=grpo
-loss_agg_mode="seq-mean-token-mean"
+loss_agg_mode=${loss_agg_mode:-"seq-mean-token-mean"} # env-overridable; on this per-traj (mbs=1) path "token-mean"
+# is the same loss, "seq-mean-token-sum-norm" is the length-neutral one (constant 1/max_response_length)
 clip_ratio=0.2
 clip_ratio_low=0.2
 clip_ratio_high=0.2
