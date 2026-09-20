@@ -22,7 +22,11 @@ import torch.distributed
 from omegaconf import DictConfig
 
 from recipe.fully_async_policy.gpu_memory_cap import apply_gpu_memory_cap
-from recipe.fully_async_policy.megatron_utils import copy_megatron_model_to_cpu, restore_megatron_model_from_cpu
+from recipe.fully_async_policy.megatron_utils import (
+    copy_actor_params_to_ref,
+    copy_megatron_model_to_cpu,
+    restore_megatron_model_from_cpu,
+)
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
@@ -38,6 +42,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 __all__ = ["DetachActorWorker", "DetachAsyncRolloutWorker", "CriticWorker"]
+
+# The trainer-side workers of one GPU (actor, reference, critic) are separate worker objects fused
+# into ONE process (create_colocated_worker_cls). The actor leaves its model chunks here so that the
+# reference worker of the same process can copy them (reset_ref_to_actor) without shipping a
+# 15 GB state through Ray.
+_LOCAL_ACTOR_MODULES: dict[str, list] = {}
 
 
 def get_inference_model(rollout):
@@ -127,6 +137,28 @@ class DetachActorWorker(DetachNcclSync):
         # Optional smaller-card emulation (VERL_GPU_MEM_CAP_GB); trainer-process-only
         # for the same reason as the line above (see gpu_memory_cap.apply_gpu_memory_cap).
         apply_gpu_memory_cap()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        super().init_model()
+        if self._is_actor:
+            _LOCAL_ACTOR_MODULES["actor"] = self.actor_module
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_ref_to_actor(self):
+        """KL-reference reset (async_training.kl_ref_reset_interval): overwrite this reference
+        worker's weights with the current weights of the actor living in the same process."""
+        assert self._is_ref, "reset_ref_to_actor must be called on the reference worker group"
+        actor_module = _LOCAL_ACTOR_MODULES.get("actor")
+        if actor_module is None:
+            raise RuntimeError(
+                "KL reference reset needs the actor and the reference worker in the same process "
+                "(the colocated trainer pool); no actor model is registered in this process"
+            )
+        copied = copy_actor_params_to_ref(actor_module, self.ref_module)
+        if torch.distributed.get_rank() == 0:
+            print(f"[DetachActorWorker] KL reference reset: {copied} parameter tensors copied from the actor")
+        return copied
 
     def _get_actor_params_generator(self):
         assert self._is_actor

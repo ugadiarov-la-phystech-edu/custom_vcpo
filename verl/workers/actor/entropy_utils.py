@@ -24,7 +24,7 @@ import torch
 
 from verl.trainer.ppo.core_algos import agg_loss
 
-__all__ = ["should_calculate_entropy", "log_entropy_and_apply_to_loss"]
+__all__ = ["should_calculate_entropy", "log_entropy_and_get_bonus", "log_entropy_and_apply_to_loss"]
 
 
 def should_calculate_entropy(config) -> bool:
@@ -35,6 +35,26 @@ def should_calculate_entropy(config) -> bool:
     ``getattr`` keeps configs that predate the ``calculate_entropy`` field working.
     """
     return bool(getattr(config, "calculate_entropy", False)) or config.entropy_coeff != 0
+
+
+def log_entropy_and_get_bonus(
+    entropy: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str,
+    entropy_coeff: float,
+    metrics: dict,
+) -> torch.Tensor | None:
+    """Record ``actor/entropy`` and return the entropy bonus as a separate loss term.
+
+    Returns ``-entropy_coeff * entropy_loss`` when ``entropy_coeff != 0`` and ``None`` otherwise.
+    Callers that scale the policy-gradient loss by a per-trajectory advantage (the Megatron
+    per-traj path) need the term on its own: it must NOT be multiplied by the advantage.
+    """
+    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    metrics["actor/entropy"] = entropy_loss.detach().item()
+    if entropy_coeff != 0:
+        return -entropy_coeff * entropy_loss
+    return None
 
 
 def log_entropy_and_apply_to_loss(
@@ -52,8 +72,7 @@ def log_entropy_and_apply_to_loss(
     ``pg_loss`` unchanged otherwise, so pure monitoring never perturbs the
     objective (the caller may then compute ``entropy`` under ``torch.no_grad()``).
     """
-    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    metrics["actor/entropy"] = entropy_loss.detach().item()
-    if entropy_coeff != 0:
-        return pg_loss - entropy_coeff * entropy_loss
+    bonus = log_entropy_and_get_bonus(entropy, response_mask, loss_agg_mode, entropy_coeff, metrics)
+    if bonus is not None:
+        return pg_loss + bonus
     return pg_loss

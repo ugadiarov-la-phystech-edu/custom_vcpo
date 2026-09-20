@@ -196,8 +196,30 @@ clip_ratio=0.2
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 clip_ratio_c=3.0
-use_kl_loss=False
-kl_loss_coef=0.0
+# KL to a reference policy (the initial model), env-overridable, OFF by default:
+#   use_kl_loss=True   adds kl_loss_coef x KL(pi || pi_ref) (kl_loss_type, low_var_kl = k3) to the loss; the
+#                      trainer computes the reference log-probs once per group when it is first composed into a
+#                      mini-batch and caches them in the replay buffer, so only the FRESH groups cost a
+#                      reference forward (est. +15-25 % step time; ref_param_offload=False keeps the ~15 GB
+#                      reference on the GPU and saves the load/offload per update).
+#   kl_ref_reset_interval=K  re-anchors the reference at the current policy every K updates (null = frozen
+#                      reference); the cached log-probs are dropped, the optimizer state is kept.
+# Watch actor/kl_loss: ~0 right after the start and after every reset; flat-and-high means the term binds.
+# With loss_agg_mode=seq-mean-token-sum-norm the logged value is length-scaled like actor/entropy.
+# Incompatible with OPOB (grad_baselining). Tagged " kl-<coef>[-reset<K>]" in exp_name only when enabled.
+use_kl_loss=${use_kl_loss:-False}
+if [[ "${use_kl_loss}" == "True" ]]; then kl_loss_coef=${kl_loss_coef:-0.001}; else kl_loss_coef=${kl_loss_coef:-0.0}; fi
+kl_loss_type=${kl_loss_type:-low_var_kl}
+kl_ref_reset_interval=${kl_ref_reset_interval:-null}
+ref_param_offload=${ref_param_offload:-True}
+kl_tag=""
+if [[ "${use_kl_loss}" == "True" ]]; then
+    kl_tag=" kl-${kl_loss_coef}"
+    if [[ "${kl_ref_reset_interval}" != "null" ]]; then kl_tag="${kl_tag}-reset${kl_ref_reset_interval}"; fi
+elif [[ "${kl_ref_reset_interval}" != "null" ]]; then
+    echo "kl_ref_reset_interval=${kl_ref_reset_interval} needs use_kl_loss=True" >&2
+    exit 2
+fi
 use_kl_in_reward=False
 kl_coef=0.0
 entropy_coeff=0
@@ -355,7 +377,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag}${kl_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -400,6 +422,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     critic.strategy=megatron \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
+    actor_rollout_ref.actor.kl_loss_type=${kl_loss_type} \
     actor_rollout_ref.actor.clip_ratio=${clip_ratio} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
@@ -453,7 +476,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.megatron.sequence_parallel=${sequence_parallel} \
     actor_rollout_ref.ref.megatron.dtype=${precision_dtype} \
     actor_rollout_ref.ref.megatron.use_remove_padding=${use_remove_padding} \
-    actor_rollout_ref.ref.megatron.param_offload=True \
+    actor_rollout_ref.ref.megatron.param_offload=${ref_param_offload} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
     actor_rollout_ref.rollout.name=${rollout_name} \
@@ -525,4 +548,5 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
     async_training.replay_buffer.save_state="${replay_save_state}" \
     +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" \
+    async_training.kl_ref_reset_interval="${kl_ref_reset_interval}" \
     async_training.concurrency_ramp="${concurrency_ramp}" "$@"

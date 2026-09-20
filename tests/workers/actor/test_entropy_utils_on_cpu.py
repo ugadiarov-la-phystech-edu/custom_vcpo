@@ -19,7 +19,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl.workers.actor.entropy_utils import log_entropy_and_apply_to_loss, should_calculate_entropy
+from verl.workers.actor.entropy_utils import (
+    log_entropy_and_apply_to_loss,
+    log_entropy_and_get_bonus,
+    should_calculate_entropy,
+)
 from verl.workers.config.actor import ActorConfig
 
 
@@ -176,3 +180,23 @@ class TestLogEntropyAndApplyToLoss:
             metrics=metrics,
         )
         assert isinstance(metrics["actor/entropy"], float)
+
+
+class TestEntropyBonusTerm:
+    """log_entropy_and_get_bonus: the entropy bonus as a separate, advantage-free loss term."""
+
+    def test_monitoring_only_returns_no_term(self):
+        _, entropy, mask = _make_inputs()
+        metrics = {}
+        assert log_entropy_and_get_bonus(entropy, mask, "token-mean", 0, metrics) is None
+        assert "actor/entropy" in metrics
+
+    def test_term_equals_what_apply_to_loss_adds(self):
+        pg_loss, entropy, mask = _make_inputs()
+        for mode in ("token-mean", "seq-mean-token-mean"):
+            m1, m2 = {}, {}
+            bonus = log_entropy_and_get_bonus(entropy, mask, mode, 0.01, m1)
+            applied = log_entropy_and_apply_to_loss(pg_loss, entropy, mask, mode, 0.01, m2)
+            assert torch.equal(pg_loss + bonus, applied)
+            assert bonus.item() == pytest.approx(-0.01 * m1["actor/entropy"])
+            assert m1 == m2

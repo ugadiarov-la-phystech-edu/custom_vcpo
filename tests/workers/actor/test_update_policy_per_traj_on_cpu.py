@@ -142,6 +142,7 @@ def _make_actor(grad_baselining: bool) -> tuple[MegatronPPOActor, dict]:
 
     calls = {
         "fbb_loss_multipliers": [],
+        "fbb_aux_loss_multipliers": [],
         "fbb_finalize_funcs": [],
         "step_accum_buffers": [],
         "grad_norm_uids": [],
@@ -150,6 +151,7 @@ def _make_actor(grad_baselining: bool) -> tuple[MegatronPPOActor, dict]:
 
     def fake_forward_backward_batch(data, **kwargs):
         calls["fbb_loss_multipliers"].append(float(data.meta_info["loss_multiplier"]))
+        calls["fbb_aux_loss_multipliers"].append(data.meta_info.get("aux_loss_multiplier"))
         calls["fbb_finalize_funcs"].append(actor.actor_module[0].config.finalize_model_grads_func)
         return {"output": [({}, None, None, None)]}
 
@@ -216,6 +218,14 @@ class TestBufferFreeMode:
         scale = 1.0 / len(TRAJ_UIDS)
         assert calls["fbb_loss_multipliers"] == pytest.approx([scale * adv for adv in ADVANTAGES])
 
+    def test_advantage_free_terms_get_the_unscaled_multiplier(self, patched_env):
+        # KL-to-reference / entropy terms must see 1/N only: the advantage fold would weight
+        # them by A_i and flip their sign on negative-advantage trajectories.
+        actor, calls = _make_actor(grad_baselining=False)
+        actor.update_policy_per_traj([_make_minibatch()], grad_baselining=False)
+        scale = 1.0 / len(TRAJ_UIDS)
+        assert calls["fbb_aux_loss_multipliers"] == pytest.approx([scale] * len(TRAJ_UIDS))
+
     def test_no_gradient_zeroing_between_trajectories(self, patched_env):
         actor, _ = _make_actor(grad_baselining=False)
         actor.update_policy_per_traj([_make_minibatch()], grad_baselining=False)
@@ -266,6 +276,16 @@ class TestOpobMode:
         actor.update_policy_per_traj([_make_minibatch()], grad_baselining=True)
         scale = 1.0 / len(TRAJ_UIDS)
         assert calls["fbb_loss_multipliers"] == pytest.approx([scale] * len(TRAJ_UIDS))
+        # no separate multiplier: the loss falls back to loss_multiplier for the aux terms
+        assert calls["fbb_aux_loss_multipliers"] == [None] * len(TRAJ_UIDS)
+
+    def test_kl_loss_is_rejected(self, patched_env):
+        # OPOB scales the accumulated score gradients by the advantage afterwards: a KL term
+        # inside them would be scaled too.
+        actor, _ = _make_actor(grad_baselining=True)
+        actor.config.use_kl_loss = True
+        with pytest.raises(AssertionError, match="incompatible with OPOB"):
+            actor.update_policy_per_traj([_make_minibatch()], grad_baselining=True)
 
     def test_finalize_left_untouched(self, patched_env):
         actor, calls = _make_actor(grad_baselining=True)
@@ -339,3 +359,33 @@ class TestOptimizerStepWithBuffer:
         actor._optimizer_step_with_buffer(None, [], None, do_grad_sync=False)
         # ESS 4.0 > min_ess 1.1 -> full nominal lr
         assert actor.actor_optimizer.stepped_lrs == pytest.approx([1e-6])
+
+
+class TestCombineLosses:
+    """megatron_actor._combine_losses / _resolve_aux_loss_multiplier: the policy-gradient loss takes
+    the (advantage-carrying) loss multiplier, the KL / entropy terms the advantage-free one."""
+
+    def test_no_aux_term_is_the_former_behaviour(self):
+        pg = torch.tensor(-0.75, requires_grad=True)
+        assert megatron_actor._combine_losses(pg, None, 1.0, 1.0) is pg  # untouched at multiplier 1
+        out = megatron_actor._combine_losses(pg, None, -0.5, 0.25)
+        assert out.item() == pytest.approx(0.375)
+        (grad,) = torch.autograd.grad(out, pg)
+        assert grad.item() == pytest.approx(-0.5)
+
+    def test_negative_advantage_does_not_flip_the_kl_term(self):
+        pg = torch.tensor(-1.0, requires_grad=True)  # A=+1 score loss, as on the per-traj path
+        kl = torch.tensor(0.2, requires_grad=True)  # already kl_coef * kl_loss
+        n, adv = 4, -2.0
+        out = megatron_actor._combine_losses(pg, kl, adv / n, 1.0 / n)
+        assert out.item() == pytest.approx(adv / n * -1.0 + 0.2 / n)
+        g_pg, g_kl = torch.autograd.grad(out, [pg, kl])
+        assert g_pg.item() == pytest.approx(adv / n)
+        assert g_kl.item() == pytest.approx(1.0 / n)  # positive: the KL is still minimised
+
+    def test_aux_multiplier_falls_back_to_the_loss_multiplier(self):
+        # paths that keep real advantages in the tensor set no aux_loss_multiplier
+        assert megatron_actor._resolve_aux_loss_multiplier({}, 0.125) == 0.125
+        assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": None}, 0.125) == 0.125
+        assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": 0.25}, -3.0) == 0.25
+        assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": 0.0}, -3.0) == 0.0

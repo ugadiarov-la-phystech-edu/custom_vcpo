@@ -63,6 +63,14 @@ async_training:
   # save partial rollouts and completed rollouts in the replay buffer queue
   save_queue_state: True
 
+  # KL to a reference policy (actor_rollout_ref.actor.use_kl_loss=True; the reference is the initial
+  # model): every kl_ref_reset_interval parameter versions the reference is re-anchored at the current
+  # policy (the actor's weights are copied into the reference workers in-process, cached reference
+  # log-probs of replay-buffer groups are dropped, the optimizer state is kept). null = the reference
+  # stays frozen for the whole run. Megatron strategy only. After a resume the reference restarts
+  # from model.path until the next reset.
+  kl_ref_reset_interval: null
+
   # Opportunistic PPO epochs (rollout-bound elasticity): after the scheduled
   # update, keep running extra shuffled group-complete mini-batch updates on the
   # current batch while the queue holds fewer than

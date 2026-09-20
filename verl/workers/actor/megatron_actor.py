@@ -59,7 +59,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
-from verl.workers.actor.entropy_utils import log_entropy_and_apply_to_loss, should_calculate_entropy
+from verl.workers.actor.entropy_utils import log_entropy_and_get_bonus, should_calculate_entropy
 from verl.workers.utils.ess import (
     compute_global_ess_from_log_weights,
     compute_min_ess_lr_scale,
@@ -86,6 +86,30 @@ def _resolve_loss_multiplier(meta_info) -> float:
     silently turn zero-advantage trajectories into full-weight score gradients)."""
     value = meta_info.get("loss_multiplier", None)
     return 1.0 if value is None else float(value)
+
+
+def _resolve_aux_loss_multiplier(meta_info, loss_multiplier: float) -> float:
+    """Multiplier of the advantage-free loss terms (KL-to-reference, entropy bonus).
+
+    The per-trajectory path folds the trajectory's advantage into ``loss_multiplier``; those
+    terms must only see the 1/N micro-batch scale, which that path passes as
+    ``aux_loss_multiplier``. Every other path keeps real advantages in the tensor and sets no
+    such key, so the terms share ``loss_multiplier`` exactly as before."""
+    value = meta_info.get("aux_loss_multiplier", None)
+    return loss_multiplier if value is None else float(value)
+
+
+def _combine_losses(pg_loss, aux_loss, loss_multiplier: float, aux_loss_multiplier: float):
+    """``pg_loss * loss_multiplier + aux_loss * aux_loss_multiplier``.
+
+    With no auxiliary term this is exactly the former ``pg_loss * loss_multiplier`` (and the
+    untouched ``pg_loss`` at a multiplier of 1.0). Scaling the KL / entropy terms by an
+    advantage-carrying multiplier would weight them by A_i and flip their sign on
+    negative-advantage trajectories."""
+    loss = pg_loss if loss_multiplier == 1.0 else pg_loss * loss_multiplier
+    if aux_loss is None:
+        return loss
+    return loss + (aux_loss if aux_loss_multiplier == 1.0 else aux_loss * aux_loss_multiplier)
 
 
 logger = logging.getLogger(__file__)
@@ -613,11 +637,13 @@ class MegatronPPOActor(BasePPOActor):
                 stats["actor/pg_loss"] = pg_loss.detach().item()
                 policy_loss = pg_loss
 
+            # Advantage-free terms (entropy bonus, KL to the reference): kept apart from the
+            # policy-gradient loss so that the per-traj advantage fold never scales them.
+            aux_loss = None
             if calculate_entropy:
                 entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
                 if not forward_only:
-                    policy_loss = log_entropy_and_apply_to_loss(
-                        pg_loss=policy_loss,
+                    aux_loss = log_entropy_and_get_bonus(
                         entropy=entropy,
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
@@ -636,7 +662,8 @@ class MegatronPPOActor(BasePPOActor):
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                     kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
 
-                    policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                    kl_term = kl_loss * self.config.kl_loss_coef
+                    aux_loss = kl_term if aux_loss is None else aux_loss + kl_term
                     metrics["actor/kl_loss"] = kl_loss.detach().item()
                     metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
@@ -646,8 +673,9 @@ class MegatronPPOActor(BasePPOActor):
             if forward_only:
                 return policy_loss, [metrics, ret_entropy, None, None]
             loss_multiplier = _resolve_loss_multiplier(meta_info)
-            if loss_multiplier != 1.0:
-                policy_loss = policy_loss * loss_multiplier
+            policy_loss = _combine_losses(
+                policy_loss, aux_loss, loss_multiplier, _resolve_aux_loss_multiplier(meta_info, loss_multiplier)
+            )
             global_seq_count = meta_info.get("global_seq_mean_count")
             if global_seq_count:
                 # Packed per-traj parity (dynamic bsz): the Megatron schedule
@@ -1208,6 +1236,10 @@ class MegatronPPOActor(BasePPOActor):
                 "seq-mean-token-sum",
                 "seq-mean-token-sum-norm",
             ]
+            assert not getattr(self.config, "use_kl_loss", False), (
+                "actor.use_kl_loss is incompatible with OPOB (grad_baselining): the accumulated per-trajectory "
+                "score gradients are scaled by the advantage afterwards, which would scale the KL term too"
+            )
             accum_buffers = allocate_grad_accum_buffers(self.actor_module)
             score_gradient_buffers = allocate_grad_accum_buffers(self.actor_module)
 
@@ -1289,6 +1321,8 @@ class MegatronPPOActor(BasePPOActor):
                     # gradient equals the former `accum += adv_i * g_i` exactly,
                     # regardless of the loss shape.
                     microbatch.meta_info["loss_multiplier"] = microbatch_loss_scale * adv_scalar
+                    # ... but not into the advantage-free terms (KL to the reference, entropy bonus)
+                    microbatch.meta_info["aux_loss_multiplier"] = microbatch_loss_scale
 
                 with ExitStack() as stack:
                     if dp_world_size > 1 or not grad_baselining:

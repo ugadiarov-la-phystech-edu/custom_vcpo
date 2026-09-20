@@ -40,6 +40,7 @@ from recipe.fully_async_policy.replay_sizing import (  # noqa: F401  (re-exporte
     first_minibatch_groups,
     trainer_dp_size,
 )
+from verl.protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -51,6 +52,40 @@ from verl.utils.metric import reduce_metrics
 
 # make_opportunistic_minibatch_indices moved to ray_trainer (imported above) so
 # the fractional-ppo_epochs update path can use it too.
+
+
+REF_LOG_PROB_KEY = "ref_log_prob"
+# the only tensors a reference forward pass reads (MegatronPPOActor.compute_log_prob)
+_REF_FORWARD_KEYS = ("responses", "input_ids", "attention_mask", "position_ids")
+
+
+def parse_kl_ref_reset_interval(value) -> int | None:
+    """async_training.kl_ref_reset_interval -> number of parameter versions between two resets of
+    the KL reference to the current policy; None (also "", "null", "none") = never reset."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip().lower() in ("", "null", "none"):
+            return None
+        value = float(value)
+    interval = int(value)
+    if interval != float(value) or interval <= 0:
+        raise ValueError(f"async_training.kl_ref_reset_interval must be a positive integer or null, got {value!r}")
+    return interval
+
+
+def resolve_kl_ref_reset_interval(config) -> int | None:
+    """The validated async_training.kl_ref_reset_interval of a run config: a reset needs the KL
+    loss to be on, and the in-process actor -> reference copy exists for Megatron workers only."""
+    interval = parse_kl_ref_reset_interval(config.async_training.get("kl_ref_reset_interval", None))
+    if interval is not None:
+        assert bool(config.actor_rollout_ref.actor.get("use_kl_loss", False)), (
+            "async_training.kl_ref_reset_interval needs actor_rollout_ref.actor.use_kl_loss=True"
+        )
+        assert str(config.actor_rollout_ref.actor.strategy) == "megatron", (
+            "async_training.kl_ref_reset_interval is implemented for the megatron strategy only"
+        )
+    return interval
 
 
 def parse_max_train_steps(value) -> int | None:
@@ -181,6 +216,15 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         # staleness-score-weighted sample of the rest, syncs weights after
         # every update, and evicts groups staler than
         # replay_buffer.staleness_threshold updates.
+        # KL to a reference policy (actor.use_kl_loss): the reference is the initial model, optionally
+        # re-anchored at the current policy every kl_ref_reset_interval parameter versions
+        # (_maybe_reset_reference). The optimizer state is kept across a reset.
+        self.kl_ref_reset_interval = resolve_kl_ref_reset_interval(config)
+        self.kl_ref_resets_total = 0
+        self.kl_ref_last_reset_version = 0
+        self._kl_ref_pending_metrics: dict = {}
+        self._replay_ref_computed_groups = 0
+
         replay_cfg = config.async_training.get("replay_buffer", None)
         self.replay_enable = bool(replay_cfg.get("enable", False)) if replay_cfg else False
         if self.replay_enable:
@@ -546,6 +590,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 self._log_rollout(batch, reward_extra_infos_dict, timing_raw)
                 self._run_opportunistic_epochs(batch, metrics, timing_raw)
 
+            self._add_kl_ref_metrics(metrics)
             self._collect_metrics(batch, 0, metrics, timing_raw)
             structured_metrics = self.metrics_aggregator.add_step_metrics(
                 metrics=metrics,
@@ -566,6 +611,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
             # [NOTE] Skip self._log_validation_data() already logged in _trigger_parameter_sync_after_step
             self._check_save_checkpoint(timing_raw)
+            self._maybe_reset_reference()
             self._advance_virtual_clock()
             self.global_steps += 1
 
@@ -732,6 +778,76 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.replay_buffer.mark_trained(entries)
         self.replay_buffer.evict(new_version)
         self.replay_buffer.recompute_scores(new_version)
+
+    def _ensure_ref_log_probs(self, entries) -> int:
+        """Give every group of the composed mini-batch its reference log-probs
+        (actor.use_kl_loss). The reference is frozen between resets, so a group's
+        values never go stale: they are computed once, in one reference forward
+        over the groups that lack them (the fresh ones), and cached in the group's
+        ``full_batch`` for every later replay; _maybe_reset_reference drops the
+        cache. Returns the number of groups computed."""
+        missing = [e for e in entries if REF_LOG_PROB_KEY not in e.sample.full_batch.batch.keys()]
+        if not missing:
+            return 0
+        sub = DataProto.concat(
+            [e.sample.full_batch.select(batch_keys=list(_REF_FORWARD_KEYS), non_tensor_batch_keys=[]) for e in missing]
+        )
+        # a fresh subset does not split evenly over the trainer DP ranks in general
+        padded, pad_size = pad_dataproto_to_divisor(sub, trainer_dp_size(self.config))
+        output = unpad_dataproto(self.ref_policy_wg.compute_ref_log_prob(padded), pad_size)
+        ref_log_prob = output.batch[REF_LOG_PROB_KEY]
+        assert ref_log_prob.shape[0] == len(sub), (ref_log_prob.shape, len(sub))
+        offset = 0
+        for e in missing:
+            n = len(e.sample.full_batch)
+            e.sample.full_batch.batch[REF_LOG_PROB_KEY] = ref_log_prob[offset : offset + n].clone()
+            offset += n
+        return len(missing)
+
+    def _maybe_reset_reference(self) -> bool:
+        """Re-anchor the KL reference at the current policy every
+        async_training.kl_ref_reset_interval parameter versions (null = never):
+        the reference workers copy the actor's weights in-process, and the cached
+        reference log-probs of the buffered groups are dropped (recomputed lazily
+        against the new reference). Called at the end of an iteration, after the
+        weight sync and the checkpoint of that version, so the new reference is
+        exactly the saved / validated policy. The optimizer state is kept."""
+        interval = getattr(self, "kl_ref_reset_interval", None)
+        if interval is None or not self.use_reference_policy:
+            return False
+        version = int(self.current_param_version)
+        if version <= 0 or version % interval != 0 or version == self.kl_ref_last_reset_version:
+            return False
+        start = time.time()
+        self.ref_policy_wg.reset_ref_to_actor()
+        dropped = 0
+        if getattr(self, "replay_enable", False):
+            for entry in self.replay_buffer.entries:
+                tensors = entry.sample.full_batch.batch
+                if REF_LOG_PROB_KEY in tensors.keys():
+                    del tensors[REF_LOG_PROB_KEY]
+                    dropped += 1
+        self.kl_ref_resets_total += 1
+        self.kl_ref_last_reset_version = version
+        elapsed = time.time() - start
+        # this iteration's metrics are already logged: report with the next one
+        self._kl_ref_pending_metrics = {"timing_s/ref_reset": elapsed, "kl_ref/dropped_cached_groups": dropped}
+        print(
+            f"[FullyAsyncTrainer] KL reference reset to the policy of version {version} "
+            f"({elapsed:.1f}s, {dropped} cached groups dropped)"
+        )
+        return True
+
+    def _add_kl_ref_metrics(self, metrics) -> None:
+        if not self.use_reference_policy:
+            return
+        if getattr(self, "replay_enable", False):
+            metrics["replay/ref_computed_groups"] = self._replay_ref_computed_groups
+        if getattr(self, "kl_ref_reset_interval", None) is not None:
+            metrics["kl_ref/resets_total"] = self.kl_ref_resets_total
+            metrics["kl_ref/last_reset_version"] = self.kl_ref_last_reset_version
+            metrics.update(self._kl_ref_pending_metrics)
+            self._kl_ref_pending_metrics = {}
 
     def _build_replay_batch(self, entries):
         """Assemble a training DataProto from buffered groups using the frozen
@@ -900,6 +1016,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     entries, info = self._acquire_replay_minibatch()
                     if entries is None:
                         break
+                if self.use_reference_policy:
+                    with marked_timer("ref", timing_raw, color="olive"):
+                        self._replay_ref_computed_groups = self._ensure_ref_log_probs(entries)
+                with marked_timer("gen", timing_raw, color="red"):
                     batch = self._build_replay_batch(entries)
                     self._collect_metrics_from_samples(batch, metrics)
                 with marked_timer("update_actor", timing_raw, color="red"):
@@ -913,6 +1033,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._replay_post_update_maintenance(entries, new_version)
             self.replay_updates_done += 1
             self._add_replay_metrics(metrics, info, new_version)
+            self._add_kl_ref_metrics(metrics)
 
             self._collect_metrics(batch, 0, metrics, timing_raw)
             structured_metrics = self.metrics_aggregator.add_step_metrics(
@@ -932,6 +1053,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
             self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
             self._check_save_checkpoint(timing_raw)
+            self._maybe_reset_reference()
             self._advance_virtual_clock()
             self.global_steps += 1
 
