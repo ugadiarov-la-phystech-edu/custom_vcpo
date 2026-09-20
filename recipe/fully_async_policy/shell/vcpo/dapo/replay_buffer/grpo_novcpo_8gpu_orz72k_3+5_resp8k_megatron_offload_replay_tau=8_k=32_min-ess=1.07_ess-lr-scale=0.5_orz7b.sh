@@ -337,6 +337,18 @@ grad_clip=1.0
 lr=${lr:-1e-6} # env-overridable for the smoke wrapper; the arm runs 1e-6
 lr_warmup_steps=0
 weight_decay=0.1
+# Adam's second-moment decay. verl's megatron path does NOT forward optim.betas to Megatron's
+# OptimizerConfig (verl/utils/megatron/optimizer.py::init_megatron_optim_config builds it without
+# them), so without this override Megatron's own default adam_beta2=0.999 applies: a ~1/(1-beta2)
+# = 1000-update averaging window, longer than any run of this arm (240 updates) -- the second-moment
+# estimate never converges. ORZ-7B's own PPO used betas (0.9, 0.95), a ~20-update window. This goes
+# through the override_optimizer_config channel that already carries the offload settings; the
+# composed values are echoed at start-up as "optimizer config after override: {...}". adam_beta1
+# stays 0.9 (ORZ and Megatron agree). Tagged " b2-<value>" in exp_name whenever it differs from
+# Megatron's 0.999, so these runs never share a log directory with the earlier beta2=0.999 ones.
+adam_beta2=${adam_beta2:-0.95}
+beta2_tag=""
+if [[ "${adam_beta2}" != "0.999" ]]; then beta2_tag=" b2-${adam_beta2}"; fi
 
 # ================= ESS-guided LR scaling (VCPO) =================
 update_policy_per_traj=True
@@ -498,7 +510,7 @@ val_temperature=${val_temperature:-1.0}
 val_top_p=${val_top_p:-1.0}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches} nu-${replay_reuse_halflife}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag}${beta2_tag} ORZ72K-AIME24ORZ ORZ-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -588,6 +600,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=False \
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True \
     +actor_rollout_ref.actor.optim.override_optimizer_config.main_params_dtype=bfloat16 \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.adam_beta2=${adam_beta2} \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
