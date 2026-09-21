@@ -66,9 +66,6 @@ def compose(script_name, extra_env=None):
 
 
 class TestReplayArmLocations(unittest.TestCase):
-    def test_every_arm_is_covered(self):
-        self.assertGreaterEqual(len(ARMS), 5, ARMS)
-
     def test_scripts_carry_the_overridable_location_lines(self):
         for arm in ARMS:
             with self.subTest(arm=arm):

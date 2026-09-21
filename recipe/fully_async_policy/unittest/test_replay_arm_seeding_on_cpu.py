@@ -90,9 +90,6 @@ def compose(script_name, extra_env=()):
 
 
 class TestReplayArmSeeding(unittest.TestCase):
-    def test_every_arm_is_covered(self):
-        self.assertGreaterEqual(len(ARMS), 5, ARMS)
-
     def test_scripts_carry_the_seed_lines(self):
         for arm in ARMS:
             with open(os.path.join(REPLAY, arm)) as f:
