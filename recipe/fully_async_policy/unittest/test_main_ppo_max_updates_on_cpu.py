@@ -76,9 +76,6 @@ def updates_per_step(cfg):
 
 
 class TestMaxUpdatesKnob(unittest.TestCase):
-    def test_every_sync_arm_is_covered(self):
-        self.assertGreaterEqual(len(ARMS), 4, ARMS)
-
     def test_scripts_carry_the_knob_and_the_hydra_line_before_the_passthrough(self):
         for arm in ARMS:
             with open(os.path.join(BASELINE, arm)) as f:

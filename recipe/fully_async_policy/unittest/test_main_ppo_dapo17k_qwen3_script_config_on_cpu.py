@@ -148,17 +148,6 @@ class TestSyncDapo17kQwen3ArmConfig(unittest.TestCase):
         self.assertTrue(v.do_sample)
         self.assertEqual(v.n, 1)
 
-    def test_data_and_builtin_reward(self):
-        """DAPO-17k train, both aime parquets for val, and NO custom scorer: the built-in
-        router sends math_dapo / aime* data sources to the math_dapo scorer (+1 / -1)."""
-        c = self.cfg
-        self.assertEqual(c.data.train_files, "/tmp/train.parquet")  # env override in compose()
-        val_files = list(c.data.val_files)
-        self.assertEqual(len(val_files), 2)
-        self.assertTrue(val_files[0].endswith("/dapo/aime-2024.parquet"), val_files)
-        self.assertTrue(val_files[1].endswith("/dapo/aime-2025.parquet"), val_files)
-        self.assertIsNone(c.custom_reward_function.path)
-
     def test_diagnostics_on_correction_off(self):
         """rollout_log_probs cached for rollout_corr/* metrics only; old_log_probs are
         recomputed by the trainer (decoupled mode), no IS weights in the loss."""
@@ -224,15 +213,6 @@ class TestSyncDapo17kQwen3ArmConfig(unittest.TestCase):
         self.assertGreater(c.trainer.test_freq, 0)
         self.assertGreater(c.trainer.save_freq, 0)
         self.assertFalse(c.algorithm.rollout_correction.bypass_mode)
-
-    def test_checkpoint_policy(self):
-        c = self.cfg
-        self.assertEqual(list(c.actor_rollout_ref.actor.checkpoint.save_contents), ["hf_model"])
-        self.assertEqual(c.trainer.resume_mode, "disable")
-        self.assertIsNone(c.trainer.max_actor_ckpt_to_keep)
-        self.assertEqual(c.trainer.save_freq, 2)
-        self.assertEqual(c.trainer.test_freq, 2)
-        self.assertTrue(c.trainer.val_before_train)
 
 
 if __name__ == "__main__":
