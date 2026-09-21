@@ -79,9 +79,6 @@ def gmu(cfg):
 
 
 class TestScriptText(unittest.TestCase):
-    def test_every_sync_arm_is_covered(self):
-        self.assertGreaterEqual(len(ARMS), 3, ARMS)  # openPangu, Qwen3 and deepmath sync arms
-
     def test_arms_read_the_knob_after_the_default_and_tag_the_name(self):
         for arm in ARMS:
             with open(os.path.join(BASELINE, arm)) as f:

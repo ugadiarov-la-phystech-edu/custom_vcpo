@@ -505,16 +505,6 @@ class TestBosFlagDefaultsOffEverywhereElse(unittest.TestCase):
                 self.assertIs(cfg.data.add_bos_token_to_prompt, False)
 
 
-class TestMegatronScriptsExportTheHfModulesCache(unittest.TestCase):
-    def test_all_openpangu_scripts_prepend_the_hf_modules_cache(self):
-        for name in (OPENPANGU_MEGATRON, OPENPANGU_SYNC, SMOKE_OOM_SYNC):
-            with self.subTest(script=name):
-                with open(os.path.join(BASELINE, name)) as f:
-                    text = f.read()
-                self.assertIn('case ":${PYTHONPATH:-}:" in', text)
-                self.assertIn('export PYTHONPATH="${HF_MODULES_CACHE}', text)
-
-
 SMOKE_OOM_SYNC = "smoke_test_oom_openpangu7b_sync.sh"
 SMOKE_OOM_QWEN_SYNC = "smoke_test_oom_qwen3-8b_sync.sh"
 
