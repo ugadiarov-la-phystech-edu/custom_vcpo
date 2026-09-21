@@ -184,6 +184,20 @@ def test_only_groups_without_cached_values_are_forwarded():
     assert torch.all(fresh.sample.full_batch.batch[REF_LOG_PROB_KEY] == 4.5)
 
 
+def test_groups_with_the_rollouters_meta_info_are_forwarded_together():
+    """Real groups carry the same meta_info keys (DataProto.concat asserts they agree); the
+    reference forward still gets one batch, and each group's own meta_info is left as it was."""
+    t = _trainer()
+    entries = _entries(3, 6, 8)  # 9 rows, trainer dp = 5 -> padded to 10
+    for e in entries:
+        e.sample.full_batch.meta_info.update({"eos_token_id": 2, "pad_token_id": 0})
+    assert t._ensure_ref_log_probs(entries) == 3
+    assert t.ref_policy_wg.batch_sizes == [10]
+    for entry, marker in zip(entries, (3, 6, 8), strict=True):
+        assert entry.sample.full_batch.meta_info == {"eos_token_id": 2, "pad_token_id": 0}
+        assert torch.all(entry.sample.full_batch.batch[REF_LOG_PROB_KEY] == marker + 0.5)
+
+
 def test_replay_batch_carries_reference_log_probs_aligned_with_its_rows():
     t = _trainer()
     entries = _entries(1, 5)

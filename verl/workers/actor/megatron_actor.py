@@ -183,7 +183,9 @@ class MegatronPPOActor(BasePPOActor):
         self.tf_config = tf_config
         self.actor_module = actor_module
         self.actor_optimizer: DistributedOptimizer = actor_optimizer
-        self.use_distributed_opt = bool(self.actor_module[0].ddp_config.use_distributed_optimizer)
+        # the reference policy's model is not DDP-wrapped, so it has no ddp_config
+        ddp_config = getattr(self.actor_module[0], "ddp_config", None)
+        self.use_distributed_opt = bool(ddp_config is not None and ddp_config.use_distributed_optimizer)
         self.use_torch_profiler = self.config.profiler.get("tool") == "torch"
         if self.use_torch_profiler:
             self.prof = Profiler(
