@@ -1,182 +1,121 @@
-<div align="center">
+# Staleness-Aware Experience Replay (SER) for fully asynchronous GRPO
 
-# Stable Asynchrony: Variance-Controlled Off-Policy RL for LLMs
+- Branch 'qwen3-8b_orz-7b' contains the implementation of SER for the Qwen3-8B and ORZ-7B models.
+- Branch 'baselines_qwen3-8b_orz-7b' contains the code for the Hybrid Sync baseline for the Qwen3-8B and ORZ-7B models.
+- Branch 'openpangu-7b' contains the implementation of SER for the OpenPangu-7B model.
+- Branch 'baselines_openpangu-7b' contains the code for the Hybrid Sync baseline for the OpenPangu-7B model.
 
-[![Paper](https://img.shields.io/badge/paper-A42C25?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2602.17616)
-[![Github](https://img.shields.io/badge/VCPO-000000?style=for-the-badge&logo=github&logoColor=000&logoColor=white)](https://github.com/mit-han-lab/vcpo)
+## Installation
 
-</div>
+Requirements: Linux x86-64, NVIDIA GPUs with a CUDA 12.8-capable driver, and internet access to PyPI, GitHub and
+huggingface.co. A system CUDA toolkit is optional. Without `nvcc`, the script builds TransformerEngine against the CUDA
+headers from pip wheels.
 
-<p align="center">
-  <img src="figures/vcpo_multiturn.png" width="85%" />
-</p>
-
-<div align="center">
-  <p>
-    <a href="#overview">Overview</a> •
-    <a href="#results">Results</a> •
-    <a href="#getting-started">Getting Started</a> •
-    <a href="#citation">Citation</a> 
-  </p>
-</div>
-
-## Overview
-
-We introduce Variance Controlled Off-Policy Optimization (VCPO), a framework that adds explicit variance-targeted controls for policy-gradient methods in the off-policy setting, enabling stable and scalable Async RL training.
-
-- ✨ Seamlessly integrates into common policy-gradient methods like REINFORCE/RLOO/GRPO
-- 🚀 **2.5x** faster Async RL training while matching synchronous RL performance
-- 🧠 Robust training stability under high off-policy settings (**at least k=128** steps off-policy)
-
-Async RL pipelines rollout generation with learning, significantly reducing end-to-end training time. But large speedups typically require high policy lag that can cause collapse.
-
-Why? Highly stale rollouts make importance sampling ratios heavy-tailed, so a few trajectories dominate each update and the policy-gradient estimator becomes high-variance. Previous work have tried masking/clipping/whitening IS ratios, algorithmic changes, and system-side changes. These can delay collapse… but still fail at high asynchrony.
-
-To address this, VCPO introduces two techniques to stabilize policy-gradient methods for asynchronous RL training:
-
-1. **ESS-guided step scaling** to dampen unreliable updates, following sqrt scaling for AdamW-style optimizers.
-
-$$
-\eta_{\text{eff}} \propto \sqrt{\rho_{\text{ess}}}, \qquad
-\rho_{\text{ess}} \triangleq \frac{\mathrm{ESS}}{B} \triangleq
-\frac{1}{B}\frac{\left(\sum_{i=1}^{B} w_i\right)^2}{\sum_{i=1}^{B} w_i^2}
-$$
-
-
-2. **Closed-form off-policy optimal baseline (OPOB)** using gradient norm and importance ratios (no learned critic), , implemented with minimal overhead and compatible with DPxTPxSP:
-
-$$
-b_{\text{OPOB}}^\star=\frac{\sum_{i=1}^N w_i^2 \|\nabla_\theta \log \pi_\theta(\tau_i)\|^2 R_i}{\sum_{i=1}^N w_i^2 \|\nabla_\theta \log \pi_\theta(\tau_i)\|^2}
-$$
-
-## Results
-We use `k` to denote the maximum sampler–learner policy lag (i.e., `k` steps off-policy), following the PipelineRL setting. Across math, general reasoning, and tool-use tasks with model sizes from 1.5B to 7B, VCPO enables stable asynchronous training where prior stabilizers fail. In long-context multi-turn RL, VCPO delivers a **2.5×** end-to-end speedup while matching synchronous performance.
-
-<p align="center">
-  <img src="figures/vcpo_results.png" width="85%" />
-</p>
-
-**End-to-end** training time vs. validation accuracy for synchronous (`k=0`) and asynchronous training (lag `k`).  
-Here, **Steps** denotes gradient update steps, and **GPU hours ↓** measures total wall-clock time across sampling + training GPUs
-
-#### Countdown
-
-<div align="center">
-
-| Method | Countdown Acc ↑ | Steps | GPU hours ↓ |
-| --- | ---: | ---: | ---: |
-| Base | 1.6% | -- | -- |
-| Sync (`k=0`) | 38.4% | 400 | 143.2 |
-| VCPO + Async (`k=10`) | **41.9%** | 400 | **89.6** |
-
-</div>
-
-#### MATH-500
-
-<div align="center">
-
-| Method | MATH-500 Acc ↑ | Steps | GPU hours ↓ |
-| --- | ---: | ---: | ---: |
-| Base | 40.2% | -- | -- |
-| Sync (`k=0`) | 72.0% | 400 | 134.4 |
-| VCPO + Async (`k=10`) | 71.6% | 400 | **92.8** |
-
-</div>
-
-#### AIME 2025
-
-<div align="center">
-
-| Method | AIME 2025 Acc ↑ | Steps | GPU hours ↓ |
-| --- | ---: | ---: | ---: |
-| Base | 5.3% | -- | -- |
-| Sync (`k=0`) | 26.7% | 300 | 420.2 |
-| VCPO + Async (`k=2`) | **27.8%** | 220 | **168.9** |
-
-</div>
-
-Async RL already achieves its full speedups at <10-steps off-policy, but we stress-tested far beyond that and found VCPO remains stable up to at least **128 steps off-policy**.
-
-<p align="center">
-  <img src="figures/high_staleness.png" width="85%" />
-</p>
-
-
-## Getting Started
-
-VCPO is implemented for the Megatron backend, with core logic in [megatron_actor.py](verl/workers/actor/megatron_actor.py), [vcpo.py](verl/workers/utils/vcpo.py), and [staleness_utils.py](recipe/fully_async_policy/staleness_utils.py). Training scripts are under [recipe/fully_async_policy/shell/vcpo/](recipe/fully_async_policy/shell/vcpo/).
-
-**1. Install** — follow the [veRL documentation](https://verl.readthedocs.io/en/latest/start/install.html) to set up the environment. Specifically, we use Megatron-Core 0.13.1 with vLLM 0.11.0 following the conda installation instructions.
-
-**2. Prepare data**
-
-```
-hf download lukhuang/vcpo --repo-type dataset --local-dir data
-```
-
-**3. Train**
-
-Edit the model and data paths in the script, then launch
-
-### GSM8K and MATH-500 Experiments
-
-GSM8K experiments use the Qwen2-1.5B model and use the official train-test split.
+`scripts/setup_uv_env.sh` creates a [uv](https://docs.astral.sh/uv/) virtual environment with Python 3.12,
+torch 2.8.0 (cu128), vLLM 0.11.0, flash-attn 2.8.1, FlashInfer 0.3.1, Megatron-Core 0.13.1 and TransformerEngine
+2.6.0.post1, then prints the installed versions as a sanity check.
 
 ```bash
-# Synchronous (k=0)
-bash recipe/fully_async_policy/shell/vcpo/gsm8k/synchronous.sh
-
-# Fully asynchronous VCPO (k=12)
-bash recipe/fully_async_policy/shell/vcpo/gsm8k/vcpo_k=12.sh
+bash scripts/setup_uv_env.sh /path/to/envs/vcpo-env     # default location: $HOME/uv-envs/vcpo-env
+source /path/to/envs/vcpo-env/activate_vcpo.sh           # uv on PATH + venv activated + cd to the repo root
 ```
 
-MATH experiments use the Qwen2.5-7B model and use the official train-test split.
+The script installs uv into `~/.local/bin` if uv is not found. Options (environment variables; see
+`bash scripts/setup_uv_env.sh --help`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ENV_DIR` | `$HOME/uv-envs/vcpo-env` | where to create the venv (the first argument takes precedence) |
+| `UV_ACTIVATE` | unset | script to source that puts `uv` on `PATH` (e.g. one that also sets `UV_CACHE_DIR`) |
+| `INSTALL_UV` | `1` | install uv when it is missing; `0` fails instead |
+| `USE_MEGATRON` | `1` | install Megatron-Core and TransformerEngine (needed by the training scripts) |
+| `FORCE` | `0` | `1` deletes an existing `ENV_DIR` first; without it an existing directory is never touched |
+| `PYTHON_VERSION` / `FLASH_ATTN_WHEEL` | `3.12` / cp312 wheel | change both together |
+| `MAX_JOBS` | `8` | parallel jobs for the TransformerEngine build |
+
+uv's own `UV_CACHE_DIR` and `UV_PYTHON_INSTALL_DIR` are respected. Put them on the same large filesystem as the venv
+when the home directory is small. The generated `activate_vcpo.sh` keeps these settings.
+
+**Always run training from the repository root: the local (forked) `verl` package must shadow the `verl` wheel installed
+as a dependency.**
+
+## Data
+
+The scripts read the datasets straight from the Hugging Face Hub through `hf://` URLs. Nothing needs to be downloaded
+by hand; `datasets` caches the files under `HF_HOME` on first use.
+
+| Role | Dataset | Rows | `data_source` |
+| --- | --- | ---: | --- |
+| train | [elfray/dapo-math-17k](https://huggingface.co/datasets/elfray/dapo-math-17k) | 17,398 | `math_dapo` |
+| validation | [elfray/aime-2024](https://huggingface.co/datasets/elfray/aime-2024) (30 problems × 32) | 960 | `math_dapo` |
+| validation | [elfray/aime-2025](https://huggingface.co/datasets/elfray/aime-2025) (30 problems × 32) | 960 | `aime2025_dapo` |
+| validation | [elfray/math500_x3](https://huggingface.co/datasets/elfray/math500_x3) (500 problems × 3) | 1,500 | `math500_dapo` |
+
+All four use the DAPO prompt ("… The last line of your response should be of the form Answer: $Answer …") in verl's
+parquet schema (`prompt`, `data_source`, `reward_model.ground_truth`, …). Validation metrics are reported per
+`data_source`, so AIME-2024 appears as `math_dapo`. To use local copies, override `TRAIN_FILE` / `TEST_FILE` with
+paths.
+
+## SER Training for OpenPangu-7B
+
+### Prepare the model
+
+The launcher expects openPangu-Embedded-7B re-aliased to the Llama architecture, so that Megatron and vLLM load it
+with their Llama code paths. The weights are unchanged; only `config.json` is rewritten.
+The tokenizer keeps its remote code, so `trust_remote_code=True` is still required.
 
 ```bash
-# Synchronous
-bash recipe/fully_async_policy/shell/vcpo/math/synchronous.sh
-
-# Fully asynchronous training + VCPO
-bash recipe/fully_async_policy/shell/vcpo/math/vcpo_k=10.sh
-
-# Highly off-policy asynchronous training + VCPO
-bash recipe/fully_async_policy/shell/vcpo/math/vcpo_k=16.sh  # k=16 steps off-policy
-bash recipe/fully_async_policy/shell/vcpo/math/vcpo_k=32.sh  # k=32 steps off-policy
-bash recipe/fully_async_policy/shell/vcpo/math/vcpo_k=64.sh  # k=64 steps off-policy
-bash recipe/fully_async_policy/shell/vcpo/math/vcpo_k=128.sh # k=128 steps off-policy
+python scripts/realias_openpangu_to_llama.py --out $HOME/models/openPangu-Embedded-7B-llama
+# downloads FreedomIntelligence/openPangu-Embedded-7B (~16 GB); use --src <dir> for a local copy
 ```
 
-### Long-Horizon Tool-Use Experiments
+`$HOME/models/openPangu-Embedded-7B-llama` is the launcher's default `MODEL_PATH`; set `MODEL_PATH` if you put it
+elsewhere. The launcher also puts `$HF_HOME/modules` on `PYTHONPATH`, so the Ray workers can import the tokenizer's
+remote code, and prepends the BOS token to every prompt (`add_bos_token_to_prompt=True`), as openPangu expects.
 
-We evaluate long-horizon tool use in the SimpleTIR setting, where the model must interleave reasoning with external tool calls. We train using the DAPO dataset and evaluate on a held-out exam-style benchmark (AIME2025).
+### Launch
+
+One launcher in `recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer/`, for one node with 8 H100 GPUs (80 GB
+class):
+
+| Script | Model | GPUs rollout + train | Mini-batch | `tau` / `k` | `min_ess` | Concurrency ramp | Validation sampling |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `grpo_novcpo_8gpu_dapo17k_5+3_…_fresh=0.5_openpangu7b.sh` | openPangu-Embedded-7B (Llama re-aliased) | 5 + 3 | 33 groups × 16 | 8 / 32 | 1.1 | `[5, 12, 20]` | T = 0.8, top-p = 0.7 |
+
+Reuse half-life $\nu \leftarrow$ replay_reuse_halflife
+
+Staleness half-life $h \leftarrow$ replay_tau
+
+Replay staleness threshold $k \leftarrow$ replay_staleness_threshold
+
+ESS threshold $\kappa \leftarrow$ min_ess
+
+Learning rate scale $\lambda \leftarrow$ ess_lr_scale
+
+Fresh-share ratio $f \leftarrow$ replay_min_fresh_ratio
 
 ```bash
-# Synchronous
-bash recipe/fully_async_policy/shell/vcpo/multiturn/synchronous.sh
-
-# Fully asynchronous VCPO
-bash recipe/fully_async_policy/shell/vcpo/multiturn/vcpo_k=2.sh
+source /path/to/envs/vcpo-env/activate_vcpo.sh
+bash "recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=8_k=32_min-ess=1.07_ess-lr-scale=0.5_fresh=0.5_openpangu7b.sh"
 ```
 
-## Citation
+Override a default with an environment variable, or append any Hydra override after the script name:
 
-If you find this work useful, please consider citing:
-
-```bibtex
-@article{huang2026stable,
-  title        = {Stable Asynchrony: Variance-Controlled Off-Policy RL for LLMs},
-  author       = {Luke J. Huang and Zhuoyang Zhang and Qinghao Hu and Shang Yang and Song Han},
-  year         = {2026},
-  month         = feb,
-  eprint       = {2602.17616},
-  archivePrefix= {arXiv},
-  primaryClass = {cs.LG},
-  url          = {https://arxiv.org/abs/2602.17616}
-}
+```bash
+SEED=2 max_updates=300 \
+bash "recipe/fully_async_policy/shell/vcpo/dapo/replay_buffer/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=8_k=32_min-ess=1.07_ess-lr-scale=0.5_fresh=0.5_openpangu7b.sh" \
+    actor_rollout_ref.actor.optim.lr=5e-7
 ```
 
-## License and Attribution
+Checkpoints hold only the Hugging Face export by default. For resumable runs set
+`ckpt_save_contents="['model','optimizer','extra','hf_model']"`, `replay_save_state=True`, `save_queue_state=True` and
+`resume_mode=auto`. `resumable_ckpts_to_keep=N` keeps the resume state only in the N newest checkpoints.
 
-This repository was implemented on top of [veRL](https://github.com/volcengine/verl) at commit 15a9b0f58a8be2445417493ae7911439c9700cf2.
+## Outputs and monitoring
 
-It is licensed under the Apache License, Version 2.0. See [LICENSE](/LICENSE) for details.
+Log metrics go to `logs/<exp_name>/` under the repository root:
+
+- `tensorboard/`: all metrics (`tensorboard --logdir logs`);
+- `global_step_<N>/actor/huggingface/`: Hugging Face exports every `save_freq` updates (`resume_mode=disable`; these
+  checkpoints do not carry optimizer or replay-buffer state).
+
