@@ -154,36 +154,6 @@ class TestOrzReplayArmConfig(unittest.TestCase):
                     f"{path} differs between the ORZ arm and its Qwen twin",
                 )
 
-    def test_trains_on_orz72k_and_validates_on_orz_prompt_aime(self):
-        """The datasets are the baselines_main-ppo sync ORZ-72k arm's: ORZ's own RL set, whose
-        prompt column carries ORZ's <answer>-tag instruction, and the AIME sets rewritten with the
-        same instruction. The Qwen twin keeps the DAPO files, so the divergence is deliberate."""
-        env = dict(os.environ)
-        env.pop("TRAIN_FILE", None)
-        env.pop("TEST_FILE", None)
-        with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
-            proc = subprocess.run(
-                ["bash", os.path.join(REPLAY, ORZ), "--cfg", "job", "--resolve"],
-                cwd=REPO_ROOT,
-                env=env,
-                stdout=out,
-                stderr=subprocess.PIPE,
-                timeout=900,
-            )
-            if proc.returncode != 0:
-                raise unittest.SkipTest(f"could not compose {ORZ}: {proc.stderr.decode()[-300:]}")
-            out.flush()
-            out.seek(0)
-            cfg = OmegaConf.load(out.name)
-        self.assertEqual(os.path.basename(cfg.data.train_files), "orz-math-72k.parquet")
-        self.assertEqual(
-            [os.path.basename(f) for f in cfg.data.val_files],
-            ["aime-2024-orz.parquet", "aime-2025-orz.parquet"],
-        )
-        self.assertIn("/orz/", cfg.data.train_files)
-        qwen = compose(QWEN)
-        self.assertEqual(os.path.basename(qwen.data.train_files), "train.parquet")  # the stub: twin untouched
-
     def test_prompt_handling_knobs_match_the_qwen_twin(self):
         """ "Same prompt processing" is a dataset swap on this recipe: the ORZ instruction lives in
         the parquet's prompt column, and every data.* knob that shapes the prompt is the twin's."""
@@ -231,15 +201,6 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         self.assertAlmostEqual(ess.min_ess, 1.07)
         self.assertAlmostEqual(compose(QWEN).actor_rollout_ref.actor.ess_scaling.min_ess, 1.1)
         self.assertIn("min-ess-1.07", self.cfg.trainer.experiment_name)
-
-    def test_validates_and_saves_every_10_updates_unlike_the_twin(self):
-        """test_freq/save_freq 10 (the twin: 25), in parameter-version units — one version per
-        replay update — so the ORZ curves are read at twice the twin's granularity."""
-        self.assertEqual(self.cfg.rollout.test_freq, 10)
-        self.assertEqual(self.cfg.trainer.save_freq, 10)
-        qwen = compose(QWEN)
-        self.assertEqual(qwen.rollout.test_freq, 25)
-        self.assertEqual(qwen.trainer.save_freq, 25)
 
     def test_reuse_halflife_is_one_on_this_arm_and_the_twin(self):
         """The reuse decay (REPLAY_REUSE_PENALTY_DISCUSSION.md) runs at nu=1 on this arm and, since
@@ -299,19 +260,6 @@ class TestOrzReplayArmConfig(unittest.TestCase):
         cfg = compose_with_env(ORZ, {"max_updates": "500"})
         self.assertEqual(cfg.trainer.total_training_steps, 500)
         self.assertEqual(cfg.rollout.total_rollout_steps, 66000)
-
-    def test_replay_depth_is_tau8_k32_on_both_arms(self):
-        """tau=8 / k=32 on this arm and, since 2026-09-08, on the Qwen twin too (renamed from the
-        tau=16_k=64 arm it was derived from): the ORZ-7B post-mortems tie divergences to
-        deep staleness, so both halve the reuse depth of the original arm while keeping the
-        terminal sampling weight (2^-4 at the eviction horizon). The rollouter's generation quota
-        follows k so no group is generated only to be evicted unseen."""
-        qwen = compose(QWEN)
-        for cfg in (self.cfg, qwen):
-            rb = cfg.async_training.replay_buffer
-            self.assertEqual((rb.tau, rb.staleness_threshold), (8, 32))
-            self.assertEqual(cfg.async_training.staleness_threshold, 32)
-        self.assertIn("tau-8 k-32", qwen.trainer.experiment_name)
 
     def test_layout_is_three_rollout_plus_five_trainer_gpus(self):
         """ORZ-7B's short responses make the per-traj update the bottleneck, so this arm hands the

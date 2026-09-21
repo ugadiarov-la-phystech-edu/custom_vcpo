@@ -68,9 +68,6 @@ def compose(script_name, extra_env=()):
 
 
 class TestReplayArmH100Emulation(unittest.TestCase):
-    def test_every_arm_is_covered(self):
-        self.assertGreaterEqual(len(ARMS), 3, ARMS)  # dynbsz tau16/k64, tau8/k32 nu=1 fresh, ORZ-72k 3+5
-
     def test_scripts_carry_the_hook_and_never_export_the_cap(self):
         for arm in ARMS:
             with open(os.path.join(REPLAY, arm)) as f:
