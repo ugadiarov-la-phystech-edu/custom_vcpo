@@ -14,8 +14,8 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 export PYTHONUNBUFFERED=1
 
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+TRAIN_FILE=${TRAIN_FILE:-"hf://datasets/elfray/dapo-math-17k/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"['hf://datasets/elfray/aime-2024/aime-2024.parquet','hf://datasets/elfray/aime-2025/aime-2025.parquet','hf://datasets/elfray/math500_x3/math500_x3.parquet']"}
 
 SEED=${SEED:-1}
 
@@ -69,8 +69,8 @@ val_temperature=${val_temperature:-0.8}
 val_top_p=${val_top_p:-0.7}
 calculate_log_probs=True
 
-test_freq=${test_freq:-2}
-save_freq=${save_freq:-2}
+test_freq=${test_freq:-3}
+save_freq=${save_freq:-3}
 total_epochs=${total_epochs:-3}
 max_updates=${max_updates:-null}
 updates_per_step=$(( train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs ))
@@ -175,7 +175,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     critic.megatron.seed=${SEED} \
     trainer.logger="['console','tensorboard']" \
-    trainer.project_name=vcpo \
+    trainer.project_name=ser \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train=${val_before_train} \
     trainer.test_freq=${test_freq} \

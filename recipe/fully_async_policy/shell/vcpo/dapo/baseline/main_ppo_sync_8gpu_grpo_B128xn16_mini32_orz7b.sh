@@ -6,15 +6,16 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=main-ppo-sync-deepmath-grpo-orz7b
+#SBATCH --job-name=main-ppo-sync-orz72k-grpo-B128-mini32-orz7b
 
 set -x
 export VLLM_USE_V1=1
+export VLLM_USE_FLASHINFER_SAMPLER=0
 export PYTHONUNBUFFERED=1
 
 MODEL_PATH=${MODEL_PATH:-"Open-Reasoner-Zero/Open-Reasoner-Zero-7B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/deepmath_orz_train.parquet"}
-TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/orz/aime-2024-orz.parquet','/home/jovyan/datasets/math_datasets/orz/aime-2025-orz.parquet']"}
+TRAIN_FILE=${TRAIN_FILE:-"hf://datasets/elfray/dapo-math-17k/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"['hf://datasets/elfray/aime-2024/aime-2024.parquet','hf://datasets/elfray/aime-2025/aime-2025.parquet','hf://datasets/elfray/math500_x3/math500_x3.parquet']"}
 REWARD_FILE=${REWARD_FILE:-"recipe/fully_async_policy/reward/orz_tag_aware_math.py"}
 
 SEED=${SEED:-1}
@@ -24,7 +25,8 @@ max_response_length=$((1024 * 8))
 filter_overlong_prompts=True
 truncation='left'
 
-train_prompt_bsz=${train_prompt_bsz:-32}
+train_prompt_bsz=${train_prompt_bsz:-128}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-32}
 n_resp_per_prompt=${n_resp_per_prompt:-16}
 ppo_epochs=${ppo_epochs:-1}
 
@@ -33,8 +35,9 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
+clip_ratio=0.2
 clip_ratio_low=0.2
-clip_ratio_high=0.28
+clip_ratio_high=0.2
 clip_ratio_c=3.0
 loss_agg_mode="token-mean"
 entropy_coeff=${entropy_coeff:-0}
@@ -42,7 +45,7 @@ calculate_entropy=True
 
 lr=${lr:-1e-6}
 lr_warmup_steps=${lr_warmup_steps:-0}
-weight_decay=${weight_decay:-0}
+weight_decay=${weight_decay:-0.01}
 grad_clip=1.0
 
 train_tp=${train_tp:-1}
@@ -66,12 +69,12 @@ top_k=-1
 val_temperature=${val_temperature:-1.0}
 calculate_log_probs=True
 
-test_freq=${test_freq:-25}
-save_freq=${save_freq:-25}
+test_freq=${test_freq:-3}
+save_freq=${save_freq:-3}
 total_epochs=${total_epochs:-3}
 max_updates=${max_updates:-null}
-updates_per_step=$(( train_prompt_bsz / train_prompt_bsz * ppo_epochs ))
-(( updates_per_step >= 1 )) || { echo "updates_per_step must be >= 1 (train_prompt_bsz / train_prompt_bsz * ppo_epochs)" >&2; exit 2; }
+updates_per_step=$(( train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs ))
+(( updates_per_step >= 1 )) || { echo "updates_per_step must be >= 1 (train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs)" >&2; exit 2; }
 if [[ "${max_updates}" == "null" ]]; then
     total_training_steps=null
 else
@@ -86,7 +89,7 @@ resume_mode=${resume_mode:-disable}
 NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} ppo-epochs-${ppo_epochs} DEEPMATH-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} ORZ72K-AIME24ORZ ORZ-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -116,12 +119,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.strategy=megatron \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
-    actor_rollout_ref.actor.clip_ratio=${clip_ratio_low} \
+    actor_rollout_ref.actor.clip_ratio=${clip_ratio} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=${clip_ratio_c} \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
-    actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_bsz} \
+    actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.ppo_epochs=${ppo_epochs} \
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
@@ -174,7 +177,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     critic.megatron.seed=${SEED} \
     trainer.logger="['console','tensorboard']" \
-    trainer.project_name=vcpo \
+    trainer.project_name=ser \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train=${val_before_train} \
     trainer.test_freq=${test_freq} \
