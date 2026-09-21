@@ -20,10 +20,10 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 export PYTHONUNBUFFERED=1
 
 MODEL_PATH=${MODEL_PATH:-"Open-Reasoner-Zero/Open-Reasoner-Zero-7B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/orz/orz-math-72k.parquet"}
-TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/orz/aime-2024-orz.parquet','/home/jovyan/datasets/math_datasets/orz/aime-2025-orz.parquet']"}
+TRAIN_FILE=${TRAIN_FILE:-"hf://datasets/elfray/dapo-math-17k/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"['hf://datasets/elfray/aime-2024/aime-2024.parquet','hf://datasets/elfray/aime-2025/aime-2025.parquet','hf://datasets/elfray/math500_x3/math500_x3.parquet']"}
 
-project_name='vcpo'
+project_name='ser'
 
 SEED=${SEED:-1}
 
@@ -100,17 +100,17 @@ log_probs_pearson_corr=${log_probs_pearson_corr:-True}
 skip_recompute_old_log_prob=True
 compute_prox_log_prob=False
 
-staleness_threshold=${staleness_threshold:-32.0}
+staleness_threshold=${staleness_threshold:-16.0}
 updates_per_param_sync=1
 num_minibatches_per_update=1
 partial_rollout=True
 use_rollout_log_probs=True
 
 replay_enable=${replay_enable:-True}
-replay_tau=${replay_tau:-8}
-replay_staleness_threshold=${replay_staleness_threshold:-32}
+replay_tau=${replay_tau:-4}
+replay_staleness_threshold=${replay_staleness_threshold:-16}
 replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
-concurrency_ramp=${concurrency_ramp:-"[4, 10, 20]"}
+concurrency_ramp=${concurrency_ramp:-"[7, 14, 24]"}
 ramp_tag=""
 if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 replay_sampling_seed=${replay_sampling_seed:-${SEED}}
@@ -131,8 +131,8 @@ save_queue_state=False
 total_rollout_steps=${total_rollout_steps:-66000}
 max_updates=${max_updates:-null}
 epochs=10000000
-test_freq=${test_freq:-10}
-save_freq=${save_freq:-10}
+test_freq=${test_freq:-12}
+save_freq=${save_freq:-12}
 max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable

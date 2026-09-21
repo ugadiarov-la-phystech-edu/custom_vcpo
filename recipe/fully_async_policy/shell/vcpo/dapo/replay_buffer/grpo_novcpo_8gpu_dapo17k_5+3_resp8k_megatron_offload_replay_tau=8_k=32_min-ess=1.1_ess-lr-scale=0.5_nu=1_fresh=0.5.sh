@@ -20,10 +20,10 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 export PYTHONUNBUFFERED=1
 
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+TRAIN_FILE=${TRAIN_FILE:-"hf://datasets/elfray/dapo-math-17k/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"['hf://datasets/elfray/aime-2024/aime-2024.parquet','hf://datasets/elfray/aime-2025/aime-2025.parquet','hf://datasets/elfray/math500_x3/math500_x3.parquet']"}
 
-project_name='vcpo'
+project_name='ser'
 
 SEED=${SEED:-1}
 
@@ -133,8 +133,8 @@ save_queue_state=False
 total_rollout_steps=${total_rollout_steps:-66000}
 max_updates=${max_updates:-null}
 epochs=10000000
-test_freq=${test_freq:-25}
-save_freq=${save_freq:-25}
+test_freq=${test_freq:-12}
+save_freq=${save_freq:-12}
 max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable
