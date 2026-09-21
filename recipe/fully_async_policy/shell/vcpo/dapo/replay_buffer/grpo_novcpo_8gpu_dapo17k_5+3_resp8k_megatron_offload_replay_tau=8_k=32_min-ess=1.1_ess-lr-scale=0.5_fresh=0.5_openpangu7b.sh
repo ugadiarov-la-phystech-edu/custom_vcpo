@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=./slurm/%A_%x.out
 #SBATCH --error=./slurm/%A_%x.err
-#SBATCH --job-name=grpo-novcpo
+#SBATCH --job-name=grpo-novcpo-replay-ess-fresh0.5-openpangu7b
 
 set -xeuo pipefail
 
@@ -17,12 +17,23 @@ export RAY_ADDRESS="local"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export WANDB_MODE=disabled
 export VLLM_USE_FLASHINFER_SAMPLER=0
+export PYTHONUNBUFFERED=1
 
-MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet"}
+HF_MODULES_CACHE=${HF_MODULES_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}/modules}
+case ":${PYTHONPATH:-}:" in
+    *":${HF_MODULES_CACHE}:"*) ;;
+    *) export PYTHONPATH="${HF_MODULES_CACHE}${PYTHONPATH:+:${PYTHONPATH}}" ;;
+esac
 
-project_name='vcpo'
+MODEL_PATH=${MODEL_PATH:-"$HOME/models/openPangu-Embedded-7B-llama"}
+trust_remote_code=${trust_remote_code:-True}
+add_bos_token_to_prompt=${add_bos_token_to_prompt:-True}
+TRAIN_FILE=${TRAIN_FILE:-"hf://datasets/elfray/dapo-math-17k/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"['hf://datasets/elfray/aime-2024/aime-2024.parquet','hf://datasets/elfray/aime-2025/aime-2025.parquet','hf://datasets/elfray/math500_x3/math500_x3.parquet']"}
+
+project_name='ser'
+
+SEED=${SEED:-1}
 
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -34,12 +45,14 @@ rollout_name="vllm"
 return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-gpu_memory_utilization=0.9
+gpu_memory_utilization=${gpu_memory_utilization:-0.9}
+emu_tag=""
+if [[ -n "${VERL_GPU_MEM_CAP_GB:-}" ]]; then emu_tag=" h100-emu-${VERL_GPU_MEM_CAP_GB}gb-gmu${gpu_memory_utilization}"; fi
 enable_chunked_prefill=True
 calculate_log_probs=True
 
-max_prompt_length=2048
-max_response_length=8192
+max_prompt_length=${max_prompt_length:-2048}
+max_response_length=${max_response_length:-8192}
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 train_tp=1
@@ -51,12 +64,15 @@ precision_dtype="bfloat16"
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
-train_prompt_mini_bsz=33
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-33}
 micro_bsz_per_gpu=1
 use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
 
-bsz_per_dp_rank=33
+bsz_per_dp_rank=${bsz_per_dp_rank:-${train_prompt_mini_bsz}}
+concurrency_ramp=${concurrency_ramp:-"[5, 12, 20]"}
+ramp_tag=""
+if [[ "${concurrency_ramp}" != "null" ]]; then ramp_tag=" ramp-$(echo "${concurrency_ramp}" | tr -d '[] ' | tr ',' '-')"; fi
 
 adv_estimator=grpo
 loss_agg_mode="seq-mean-token-mean"
@@ -68,13 +84,21 @@ use_kl_loss=False
 kl_loss_coef=0.0
 use_kl_in_reward=False
 kl_coef=0.0
-entropy_coeff=0
+entropy_coeff=${entropy_coeff:-0}
 calculate_entropy=True
 grad_clip=1.0
 
-lr=1e-6
+lr=${lr:-1e-6}
 lr_warmup_steps=0
 weight_decay=0.1
+
+update_policy_per_traj=True
+grad_baselining=False
+ess_enable=${ess_enable:-True}
+min_ess=${min_ess:-1.1}
+ess_lr_scale=${ess_lr_scale:-0.5}
+ess_use_clipped=False
+ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
 
 rollout_is="token"
 rollout_is_threshold="2.0"
@@ -87,31 +111,48 @@ log_probs_pearson_corr=${log_probs_pearson_corr:-True}
 skip_recompute_old_log_prob=True
 compute_prox_log_prob=False
 
-staleness_threshold=${staleness_threshold:-2.0}
+staleness_threshold=${staleness_threshold:-32.0}
 updates_per_param_sync=1
-num_minibatches_per_update=4
+num_minibatches_per_update=1
 partial_rollout=True
 use_rollout_log_probs=True
 
-dynamic_filtering_enable=${dynamic_filtering_enable:-True}
-min_buffered_batches=${min_buffered_batches:-1.0}
+replay_enable=${replay_enable:-True}
+replay_tau=${replay_tau:-8}
+replay_staleness_threshold=${replay_staleness_threshold:-32}
+replay_requires_mini_batches=${replay_requires_mini_batches:-0.5}
+replay_sampling_seed=${replay_sampling_seed:-${SEED}}
+replay_reuse_halflife=${replay_reuse_halflife:-1}
+replay_reuse_tag=""
+if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${replay_reuse_halflife}"; fi
+replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}
+replay_fresh_tag=""
+if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
+replay_save_state=${replay_save_state:-False}
 
-opportunistic_enable=${opportunistic_enable:-True}
-opportunistic_max_extra_epochs=${opportunistic_max_extra_epochs:-2}
+dynamic_filtering_enable=False
+min_buffered_batches=1.0
+opportunistic_enable=False
+opportunistic_max_extra_epochs=0
 serialize_validation=${serialize_validation:-True}
 pause_generation_during_save=${pause_generation_during_save:-True}
+save_queue_state=${save_queue_state:-False}
 
-total_rollout_steps=${total_rollout_steps:-$((500 * num_minibatches_per_update * updates_per_param_sync * train_prompt_mini_bsz))}
+total_rollout_steps=${total_rollout_steps:-66000}
+max_updates=${max_updates:-null}
 epochs=10000000
-test_freq=${test_freq:-5}
-save_freq=5
-max_actor_ckpt_to_keep=1
+test_freq=${test_freq:-12}
+save_freq=${save_freq:-12}
+max_actor_ckpt_to_keep=null
+ckpt_save_contents=${ckpt_save_contents:-"['hf_model']"}
+resumable_ckpts_to_keep=${resumable_ckpts_to_keep:-null}
+resume_mode=${resume_mode:-disable}
 
-exp_name=${exp_name:-"GRPO-noVCPO k-${staleness_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} opp-epochs-${opportunistic_max_extra_epochs} dapo-filter ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
-log_dir="logs/${exp_name_safe}"
-CKPTS_DIR="${log_dir}"
-mkdir -p -- "${log_dir}"
+log_dir=${log_dir:-"logs/${exp_name_safe}"}
+CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
+mkdir -p -- "${log_dir}" "${CKPTS_DIR}"
 export TENSORBOARD_DIR="${log_dir}/tensorboard"
 
 trainer_logger="['console','tensorboard']"
@@ -130,10 +171,13 @@ python -m recipe.fully_async_policy.fully_async_main \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
+    data.seed=${SEED} \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.return_raw_chat=${return_raw_chat} \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=8 \
+    data.trust_remote_code=${trust_remote_code} \
+    data.add_bos_token_to_prompt=${add_bos_token_to_prompt} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
@@ -154,11 +198,20 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=${clip_ratio_c} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.trust_remote_code=${trust_remote_code} \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
+    actor_rollout_ref.actor.update_policy_per_traj=${update_policy_per_traj} \
+    actor_rollout_ref.actor.grad_baselining.enable=${grad_baselining} \
+    actor_rollout_ref.actor.ess_scaling.enable=${ess_enable} \
+    actor_rollout_ref.actor.ess_scaling.min_ess=${min_ess} \
+    actor_rollout_ref.actor.ess_scaling.lr_scale=${ess_lr_scale} \
+    actor_rollout_ref.actor.ess_scaling.use_clipped=${ess_use_clipped} \
+    actor_rollout_ref.actor.data_loader_seed=${SEED} \
+    actor_rollout_ref.actor.megatron.seed=${SEED} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${train_cp} \
@@ -215,6 +268,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.calculate_log_probs=${calculate_log_probs} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
+    critic.megatron.seed=${SEED} \
     critic.megatron.tensor_model_parallel_size=${train_tp} \
     critic.megatron.pipeline_model_parallel_size=${train_pp} \
     critic.megatron.context_parallel_size=${train_cp} \
@@ -226,6 +280,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.val_before_train=${val_before_train} \
     trainer.save_freq=${save_freq} \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
+    "actor_rollout_ref.actor.checkpoint.save_contents=${ckpt_save_contents}" \
+    trainer.resume_mode=${resume_mode} \
     trainer.rollout_data_dir="${log_dir}" \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
@@ -234,6 +290,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     rollout.nnodes="${NNODES}" \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
+    trainer.total_training_steps="${max_updates}" \
     rollout.total_epochs="${epochs}" \
     rollout.test_freq="${test_freq}" \
     async_training.staleness_threshold="${staleness_threshold}" \
@@ -247,6 +304,20 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.dynamic_filtering.min_buffered_batches="${min_buffered_batches}" \
     async_training.opportunistic_epochs.enable="${opportunistic_enable}" \
     async_training.opportunistic_epochs.max_extra_epochs="${opportunistic_max_extra_epochs}" \
+    async_training.ppo_epochs=null \
     async_training.serialize_validation="${serialize_validation}" \
     async_training.pause_generation_during_save="${pause_generation_during_save}" \
-    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" "$@"
+    async_training.save_queue_state="${save_queue_state}" \
+    async_training.resumable_ckpts_to_keep="${resumable_ckpts_to_keep}" \
+    async_training.replay_buffer.enable="${replay_enable}" \
+    async_training.replay_buffer.tau="${replay_tau}" \
+    async_training.replay_buffer.staleness_threshold="${replay_staleness_threshold}" \
+    async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
+    async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
+    async_training.ppo_epochs_shuffle_seed=${SEED} \
+    async_training.opportunistic_epochs.shuffle_seed=${SEED} \
+    async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
+    async_training.replay_buffer.save_state="${replay_save_state}" \
+    +async_training.bsz_per_dp_rank="${bsz_per_dp_rank}" \
+    async_training.concurrency_ramp="${concurrency_ramp}" "$@"
