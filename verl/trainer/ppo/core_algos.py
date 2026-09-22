@@ -1452,7 +1452,8 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     Returns:
         kl_estimate
     """
-    forward_score = kl_penalty_forward(logprob, ref_logprob, kl_penalty)
+    # the "+" suffix only selects the straight-through k2 gradient; the value is the base estimator's
+    forward_score = kl_penalty_forward(logprob, ref_logprob, kl_penalty.removesuffix("+"))
     if not kl_penalty.endswith("+") or kl_penalty in ("mse", "k2"):
         return forward_score
 

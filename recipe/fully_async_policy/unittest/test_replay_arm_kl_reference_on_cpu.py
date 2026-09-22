@@ -99,6 +99,15 @@ class TestReplayArmKlReference(unittest.TestCase):
         self.assertIn(" kl-0.003 ", cfg.trainer.experiment_name)
         self.assertNotIn("-reset", cfg.trainer.experiment_name)
 
+    def test_the_straight_through_kl_type_reaches_the_actor_unchanged(self):
+        """kl_loss_type=low_var_kl+ (k3 value, k2 gradient): the "+" must survive Hydra and the arm."""
+        orz = [a for a in ARMS if a.endswith("_orz7b.sh")]
+        if not orz:
+            self.skipTest("no ORZ arm on this branch")
+        cfg = compose(orz[0], (("use_kl_loss", "True"), ("kl_loss_type", "low_var_kl+"), ("kl_loss_coef", "0.1")))
+        self.assertEqual(cfg.actor_rollout_ref.actor.kl_loss_type, "low_var_kl+")
+        self.assertEqual(cfg.actor_rollout_ref.actor.kl_loss_coef, 0.1)
+
     def test_reset_interval_without_the_kl_loss_is_refused(self):
         for arm in ARMS:
             with self.subTest(arm=arm):
