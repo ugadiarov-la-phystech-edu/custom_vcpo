@@ -206,18 +206,28 @@ clip_ratio_c=3.0
 #                      reference); the cached log-probs are dropped, the optimizer state is kept.
 # Watch actor/kl_loss: ~0 right after the start and after every reset; flat-and-high means the term binds.
 # With loss_agg_mode=seq-mean-token-sum-norm the logged value is length-scaled like actor/entropy.
-# Incompatible with OPOB (grad_baselining). Tagged " kl-<coef>[-reset<K>]" in exp_name only when enabled.
+#   kl_loss_is_weighted=True  weights the per-token KL by the truncated rollout IS weight min(pi/mu, c) of the
+#                      policy-gradient term (rollout_is=token), so stale replay tokens the current policy no longer
+#                      visits do not get pushed back toward the reference; actor/kl_loss stays the unweighted
+#                      drift monitor, actor/kl_loss_is_weighted is what the loss sees.
+# Incompatible with OPOB (grad_baselining). Tagged " kl-<coef>[-isw][-reset<K>]" in exp_name only when enabled.
 use_kl_loss=${use_kl_loss:-False}
 if [[ "${use_kl_loss}" == "True" ]]; then kl_loss_coef=${kl_loss_coef:-0.001}; else kl_loss_coef=${kl_loss_coef:-0.0}; fi
 kl_loss_type=${kl_loss_type:-low_var_kl}
 kl_ref_reset_interval=${kl_ref_reset_interval:-null}
+kl_loss_is_weighted=${kl_loss_is_weighted:-False}
 ref_param_offload=${ref_param_offload:-True}
 kl_tag=""
 if [[ "${use_kl_loss}" == "True" ]]; then
     kl_tag=" kl-${kl_loss_coef}"
+    if [[ "${kl_loss_is_weighted}" == "True" ]]; then kl_tag="${kl_tag}-isw"; fi
     if [[ "${kl_ref_reset_interval}" != "null" ]]; then kl_tag="${kl_tag}-reset${kl_ref_reset_interval}"; fi
 elif [[ "${kl_ref_reset_interval}" != "null" ]]; then
     echo "kl_ref_reset_interval=${kl_ref_reset_interval} needs use_kl_loss=True" >&2
+    exit 2
+fi
+if [[ "${kl_loss_is_weighted}" == "True" && "${use_kl_loss}" != "True" ]]; then
+    echo "kl_loss_is_weighted=True needs use_kl_loss=True" >&2
     exit 2
 fi
 use_kl_in_reward=False
@@ -423,6 +433,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.kl_loss_type=${kl_loss_type} \
+    actor_rollout_ref.actor.kl_loss_is_weighted=${kl_loss_is_weighted} \
     actor_rollout_ref.actor.clip_ratio=${clip_ratio} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \

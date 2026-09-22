@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_loss_to_reference
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.torch_functional import masked_mean, masked_sum
@@ -141,16 +141,23 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # add kl loss
     if config.use_kl_loss:
-        ref_log_prob = data["ref_log_prob"]
-        # compute kl loss
-        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
-        kl_loss = agg_loss(
-            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
+        kl_is_weighted = bool(getattr(config, "kl_loss_is_weighted", False))
+        kl_loss, kl_unweighted = kl_loss_to_reference(
+            log_prob=log_prob,
+            ref_log_prob=data["ref_log_prob"],
+            response_mask=response_mask,
+            kl_loss_type=config.kl_loss_type,
+            loss_agg_mode=config.loss_agg_mode,
+            rollout_is_weights=rollout_is_weights,
+            is_weighted=kl_is_weighted,
+            **config.global_batch_info,
         )
 
         policy_loss += kl_loss * config.kl_loss_coef
-        metrics["kl_loss"] = kl_loss.detach().item()
+        metrics["kl_loss"] = kl_unweighted.item()
         metrics["kl_coef"] = config.kl_loss_coef
+        if kl_is_weighted:
+            metrics["kl_loss_is_weighted"] = kl_loss.detach().item()
 
     return policy_loss, metrics
 

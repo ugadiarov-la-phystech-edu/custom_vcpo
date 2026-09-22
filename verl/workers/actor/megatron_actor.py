@@ -48,7 +48,7 @@ from recipe.fully_async_policy.staleness_utils import (
     compute_staleness_statistics,
 )
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import get_policy_loss_fn, kl_loss_to_reference
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
@@ -110,6 +110,30 @@ def _combine_losses(pg_loss, aux_loss, loss_multiplier: float, aux_loss_multipli
     if aux_loss is None:
         return loss
     return loss + (aux_loss if aux_loss_multiplier == 1.0 else aux_loss * aux_loss_multiplier)
+
+
+def _kl_loss_term(config, log_prob, ref_log_prob, response_mask, rollout_is_weights, metrics):
+    """``kl_loss_coef * KL(pi || pi_ref)`` of one micro-batch, IS-weighted when ``kl_loss_is_weighted``.
+
+    ``actor/kl_loss`` stays the UNWEIGHTED aggregate (the drift monitor, comparable across runs);
+    ``actor/kl_loss_is_weighted`` is the value the loss actually sees and is logged only when the
+    weighting is on. ``rollout_is_weights`` are the truncated token weights of the policy-gradient
+    term (None when the batch carries none → error when the weighting is on)."""
+    is_weighted = bool(getattr(config, "kl_loss_is_weighted", False))
+    kl_loss, kl_unweighted = kl_loss_to_reference(
+        log_prob=log_prob,
+        ref_log_prob=ref_log_prob,
+        response_mask=response_mask,
+        kl_loss_type=config.kl_loss_type,
+        loss_agg_mode=config.loss_agg_mode,
+        rollout_is_weights=rollout_is_weights,
+        is_weighted=is_weighted,
+    )
+    metrics["actor/kl_loss"] = kl_unweighted.item()
+    metrics["actor/kl_coef"] = config.kl_loss_coef
+    if is_weighted:
+        metrics["actor/kl_loss_is_weighted"] = kl_loss.detach().item()
+    return kl_loss * config.kl_loss_coef
 
 
 logger = logging.getLogger(__file__)
@@ -659,15 +683,11 @@ class MegatronPPOActor(BasePPOActor):
                 policy_loss = torch.tensor(1.0, device=device)
             else:
                 if self.config.use_kl_loss:
-                    ref_log_prob = data["ref_log_prob"]
-                    # compute kl loss
-                    kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
-
-                    kl_term = kl_loss * self.config.kl_loss_coef
+                    # same (veto-modified) response mask and rollout IS weights as the policy-gradient term
+                    kl_term = _kl_loss_term(
+                        self.config, log_prob, data["ref_log_prob"], response_mask, rollout_is_weights, metrics
+                    )
                     aux_loss = kl_term if aux_loss is None else aux_loss + kl_term
-                    metrics["actor/kl_loss"] = kl_loss.detach().item()
-                    metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                 # return loss and stats
 

@@ -389,3 +389,89 @@ class TestCombineLosses:
         assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": None}, 0.125) == 0.125
         assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": 0.25}, -3.0) == 0.25
         assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": 0.0}, -3.0) == 0.0
+
+
+class TestKlLossTerm:
+    """megatron_actor._kl_loss_term: the KL-to-reference term of loss_func (kl_loss_coef x KL), IS-weighted
+    by the policy-gradient term's rollout_is_weights when actor.kl_loss_is_weighted is on."""
+
+    @staticmethod
+    def _config(is_weighted, coef=0.1, kl_type="low_var_kl+", agg="seq-mean-token-mean"):
+        return SimpleNamespace(
+            kl_loss_type=kl_type, kl_loss_coef=coef, loss_agg_mode=agg, kl_loss_is_weighted=is_weighted
+        )
+
+    @staticmethod
+    def _tensors(seed=0, shape=(3, 5)):
+        g = torch.Generator().manual_seed(seed)
+        log_prob = -torch.rand(shape, generator=g) * 2
+        ref = -torch.rand(shape, generator=g) * 2
+        mask = torch.ones(shape)
+        mask[1, 3:] = 0
+        weights = (torch.rand(shape, generator=g) * 2) * mask
+        return log_prob, ref, mask, weights
+
+    def test_off_is_coef_times_the_unweighted_kl_with_the_old_metrics(self):
+        from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
+
+        log_prob, ref, mask, weights = self._tensors()
+        metrics = {}
+        term = megatron_actor._kl_loss_term(self._config(False), log_prob, ref, mask, weights, metrics)
+        kl = agg_loss(kl_penalty(log_prob, ref, "low_var_kl+"), mask, "seq-mean-token-mean")
+        torch.testing.assert_close(term, kl * 0.1)
+        assert metrics["actor/kl_loss"] == pytest.approx(kl.item())
+        assert metrics["actor/kl_coef"] == 0.1
+        assert "actor/kl_loss_is_weighted" not in metrics  # metric set of earlier runs unchanged
+
+    def test_off_ignores_absent_weights(self):
+        log_prob, ref, mask, _ = self._tensors(seed=1)
+        term = megatron_actor._kl_loss_term(self._config(False), log_prob, ref, mask, None, {})
+        assert torch.isfinite(term)
+
+    def test_on_weights_the_kl_and_keeps_the_unweighted_monitor(self):
+        from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
+
+        log_prob, ref, mask, weights = self._tensors(seed=2)
+        metrics = {}
+        term = megatron_actor._kl_loss_term(self._config(True), log_prob, ref, mask, weights, metrics)
+        kld = kl_penalty(log_prob, ref, "low_var_kl+")
+        weighted = agg_loss(kld * weights, mask, "seq-mean-token-mean")
+        unweighted = agg_loss(kld, mask, "seq-mean-token-mean")
+        torch.testing.assert_close(term, weighted * 0.1)
+        assert metrics["actor/kl_loss"] == pytest.approx(unweighted.item())  # drift monitor: unweighted
+        assert metrics["actor/kl_loss_is_weighted"] == pytest.approx(weighted.item())  # what the loss sees
+        assert metrics["actor/kl_coef"] == 0.1
+
+    def test_on_without_weights_fails_loudly(self):
+        log_prob, ref, mask, _ = self._tensors(seed=3)
+        with pytest.raises(ValueError, match="kl_loss_is_weighted"):
+            megatron_actor._kl_loss_term(self._config(True), log_prob, ref, mask, None, {})
+
+    def test_knob_missing_from_an_old_config_means_off(self):
+        cfg = SimpleNamespace(kl_loss_type="low_var_kl", kl_loss_coef=0.5, loss_agg_mode="token-mean")
+        log_prob, ref, mask, _ = self._tensors(seed=4)
+        metrics = {}
+        term = megatron_actor._kl_loss_term(cfg, log_prob, ref, mask, None, metrics)
+        assert torch.isfinite(term) and "actor/kl_loss_is_weighted" not in metrics
+
+    def test_weighted_term_survives_the_per_traj_combine_unflipped(self):
+        """On the per-traj path the term is combined with the advantage-free 1/N multiplier: a
+        negative-advantage trajectory must still minimise the (weighted) KL."""
+        log_prob, ref, mask, weights = self._tensors(seed=5)
+        lp = log_prob.clone().requires_grad_(True)
+        term = megatron_actor._kl_loss_term(self._config(True), lp, ref, mask, weights, {})
+        pg = (lp * mask).sum() * 0.0  # a score loss placeholder that carries no KL gradient
+        n, adv = 4, -2.0
+        out = megatron_actor._combine_losses(pg, term, adv / n, 1.0 / n)
+        (grad,) = torch.autograd.grad(out, lp)
+        expected = (
+            0.1
+            / n
+            * torch.autograd.grad(megatron_actor._kl_loss_term(self._config(True), lp, ref, mask, weights, {}), lp)[0]
+            / 0.1
+            * 1.0
+        )  # = (1/N) * d(term)/d lp
+        torch.testing.assert_close(grad, expected)
+        # the sign is the KL's own: pushing log_prob toward ref where the weight is positive
+        toward_ref = torch.sign(ref - log_prob) * mask * (weights > 0)
+        assert torch.all(torch.sign(-grad) * toward_ref >= 0)

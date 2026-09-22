@@ -97,6 +97,11 @@ kl_loss_coef: 0.001
 # Type of KL divergence loss. Options: "kl"(k1), "abs", "mse"(k2), "low_var_kl"(k3), "full"
 kl_loss_type: low_var_kl
 
+# Weight the per-token KL by the truncated rollout importance weight min(pi/mu, c) that the policy-gradient
+# term uses (algorithm.rollout_correction.rollout_is=token|sequence must be on), so the reference anchor is
+# only applied where the stale samples still represent the current policy. Requires use_kl_loss.
+kl_loss_is_weighted: false
+
 # Number of PPO epochs per batch
 ppo_epochs: 1
 

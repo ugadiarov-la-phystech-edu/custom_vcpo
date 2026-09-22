@@ -27,7 +27,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_loss_to_reference
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -557,16 +557,23 @@ class DataParallelPPOActor(BasePPOActor):
                             policy_loss -= entropy_agg * entropy_coeff
 
                     if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                        kl_is_weighted = bool(getattr(self.config, "kl_loss_is_weighted", False))
+                        kl_loss, kl_unweighted = kl_loss_to_reference(
+                            log_prob=log_prob,
+                            ref_log_prob=model_inputs["ref_log_prob"],
+                            response_mask=response_mask,
+                            kl_loss_type=self.config.kl_loss_type,
+                            loss_agg_mode=loss_agg_mode,
+                            rollout_is_weights=rollout_is_weights,
+                            is_weighted=kl_is_weighted,
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/kl_loss"] = kl_unweighted.item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        if kl_is_weighted:
+                            kl_weighted_value = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_loss_is_weighted"] = kl_weighted_value
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

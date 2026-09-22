@@ -252,5 +252,50 @@ class TestActorConfig(unittest.TestCase):
         self.assertIn("must be >= n_gpus", str(cm.exception))
 
 
+class TestKlLossIsWeighted(unittest.TestCase):
+    """actor.kl_loss_is_weighted: off by default, reaches the dataclass through Hydra, needs use_kl_loss,
+    and is present in the regenerated trainer yamls."""
+
+    @staticmethod
+    def _config(**kw):
+        return ActorConfig(
+            strategy="fsdp", optim=OptimizerConfig(lr=0.1), ppo_micro_batch_size_per_gpu=4, rollout_n=1, **kw
+        )
+
+    def test_off_by_default(self):
+        self.assertFalse(self._config().kl_loss_is_weighted)
+        self.assertTrue(self._config(use_kl_loss=True, kl_loss_is_weighted=True).kl_loss_is_weighted)
+
+    def test_needs_the_kl_loss(self):
+        with self.assertRaises(ValueError) as cm:
+            self._config(kl_loss_is_weighted=True)
+        self.assertIn("needs use_kl_loss=True", str(cm.exception))
+
+    def test_reaches_the_dataclass_from_yaml(self):
+        from hydra import compose, initialize_config_dir
+
+        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+            cfg = compose(
+                config_name="actor",
+                overrides=[
+                    "strategy=fsdp",
+                    "ppo_micro_batch_size_per_gpu=128",
+                    "use_kl_loss=true",
+                    "kl_loss_is_weighted=true",
+                ],
+            )
+        config = omega_conf_to_dataclass(cfg)
+        self.assertTrue(config.kl_loss_is_weighted)
+        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+            cfg = compose(config_name="actor", overrides=["strategy=fsdp", "ppo_micro_batch_size_per_gpu=128"])
+        self.assertFalse(omega_conf_to_dataclass(cfg).kl_loss_is_weighted)
+
+    def test_generated_trainer_yamls_carry_the_knob(self):
+        """Guards a forgotten scripts/generate_trainer_config.sh."""
+        for name in ("_generated_ppo_trainer.yaml", "_generated_ppo_megatron_trainer.yaml"):
+            with open(os.path.join("verl/trainer/config", name)) as f:
+                self.assertIn("kl_loss_is_weighted: false", f.read(), name)
+
+
 if __name__ == "__main__":
     unittest.main()

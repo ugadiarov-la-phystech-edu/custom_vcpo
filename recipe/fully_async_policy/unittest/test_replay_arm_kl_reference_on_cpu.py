@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The KL-to-reference knobs of the replay arms (use_kl_loss, kl_loss_coef, kl_loss_type,
-kl_ref_reset_interval, ref_param_offload): OFF by default with the composed config and the
+kl_loss_is_weighted, kl_ref_reset_interval, ref_param_offload): OFF by default with the composed config and the
 experiment name of earlier runs unchanged; when switched on they reach Hydra and tag the name.
 
 Composes the real launch scripts with `--cfg job --resolve` (no GPU, no Ray).
@@ -70,6 +70,7 @@ class TestReplayArmKlReference(unittest.TestCase):
                 actor = cfg.actor_rollout_ref.actor
                 self.assertFalse(actor.use_kl_loss)
                 self.assertEqual(actor.kl_loss_coef, 0.0)  # what the arms passed before the knobs existed
+                self.assertFalse(actor.kl_loss_is_weighted)
                 self.assertIsNone(cfg.async_training.kl_ref_reset_interval)
                 self.assertTrue(cfg.actor_rollout_ref.ref.megatron.param_offload)
                 self.assertNotIn(" kl-", cfg.trainer.experiment_name)
@@ -85,7 +86,9 @@ class TestReplayArmKlReference(unittest.TestCase):
                 self.assertEqual(actor.kl_loss_type, "low_var_kl")
                 self.assertEqual(cfg.async_training.kl_ref_reset_interval, 48)
                 self.assertFalse(cfg.actor_rollout_ref.ref.megatron.param_offload)
+                self.assertFalse(actor.kl_loss_is_weighted)
                 self.assertIn(" kl-0.001-reset48 ", cfg.trainer.experiment_name)
+                self.assertNotIn("-isw", cfg.trainer.experiment_name)
                 # the rest of the name is the default one with the tag inserted
                 self.assertEqual(
                     cfg.trainer.experiment_name.replace(" kl-0.001-reset48", ""), compose(arm).trainer.experiment_name
@@ -107,6 +110,32 @@ class TestReplayArmKlReference(unittest.TestCase):
         cfg = compose(orz[0], (("use_kl_loss", "True"), ("kl_loss_type", "low_var_kl+"), ("kl_loss_coef", "0.1")))
         self.assertEqual(cfg.actor_rollout_ref.actor.kl_loss_type, "low_var_kl+")
         self.assertEqual(cfg.actor_rollout_ref.actor.kl_loss_coef, 0.1)
+
+    def test_is_weighted_kl_reaches_hydra_and_tags_the_name(self):
+        """kl_loss_is_weighted=True: the KL term weighted by the policy-gradient term's rollout IS weights."""
+        env = (("use_kl_loss", "True"), ("kl_loss_is_weighted", "True"), ("kl_loss_coef", "0.1"))
+        for arm in ARMS:
+            with self.subTest(arm=arm):
+                cfg = compose(arm, env)
+                self.assertTrue(cfg.actor_rollout_ref.actor.kl_loss_is_weighted)
+                self.assertEqual(cfg.actor_rollout_ref.actor.kl_loss_coef, 0.1)
+                self.assertEqual(cfg.algorithm.rollout_correction.rollout_is, "token")  # the weights exist
+                self.assertIn(" kl-0.1-isw ", cfg.trainer.experiment_name)
+                self.assertEqual(
+                    cfg.trainer.experiment_name.replace(" kl-0.1-isw", ""), compose(arm).trainer.experiment_name
+                )
+
+    def test_is_weighted_tag_precedes_the_reset_tag(self):
+        env = (("use_kl_loss", "True"), ("kl_loss_is_weighted", "True"), ("kl_ref_reset_interval", "48"))
+        cfg = compose(ARMS[-1], env)
+        self.assertIn(" kl-0.001-isw-reset48 ", cfg.trainer.experiment_name)
+
+    def test_is_weighted_kl_without_the_kl_loss_is_refused(self):
+        for arm in ARMS:
+            with self.subTest(arm=arm):
+                proc, _ = _run(arm, (("kl_loss_is_weighted", "True"),))
+                self.assertEqual(proc.returncode, 2)
+                self.assertIn("kl_loss_is_weighted=True needs use_kl_loss=True", proc.stderr.decode())
 
     def test_reset_interval_without_the_kl_loss_is_refused(self):
         for arm in ARMS:

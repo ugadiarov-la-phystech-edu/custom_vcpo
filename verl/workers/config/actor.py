@@ -115,6 +115,9 @@ class ActorConfig(BaseConfig):
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
         kl_loss_type (str): Type of KL loss to use.
+        kl_loss_is_weighted (bool): Weight the per-token KL by the truncated rollout IS weight min(pi/mu, c)
+            the policy-gradient term uses (off-policy / replay correction; needs
+            algorithm.rollout_correction.rollout_is). Requires use_kl_loss.
         ppo_epochs (int): Number of PPO epochs per training step.
         shuffle (bool): Whether to shuffle data during training.
         checkpoint (CheckpointConfig): Configuration for checkpointing.
@@ -157,6 +160,7 @@ class ActorConfig(BaseConfig):
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
+    kl_loss_is_weighted: bool = False
     ppo_epochs: int = 1
     shuffle: bool = False
     data_loader_seed: int = 1
@@ -202,6 +206,9 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        if self.kl_loss_is_weighted and not self.use_kl_loss:
+            raise ValueError("[actor] kl_loss_is_weighted=True needs use_kl_loss=True")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

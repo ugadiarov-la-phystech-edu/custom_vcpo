@@ -1467,6 +1467,46 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     return backward_score - backward_score.detach() + forward_score.detach()
 
 
+def kl_loss_to_reference(
+    log_prob: torch.Tensor,
+    ref_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    kl_loss_type: str,
+    loss_agg_mode: str,
+    rollout_is_weights: Optional[torch.Tensor] = None,
+    is_weighted: bool = False,
+    **agg_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The KL-to-reference loss term shared by the actor backends.
+
+    Returns ``(kl_loss, kl_loss_unweighted)``: the term that goes into the loss (before the coefficient) and the
+    plain, detached aggregate for monitoring (``actor/kl_loss`` keeps its meaning whether or not the weighting is on).
+
+    With ``is_weighted`` the per-token KL is multiplied by ``rollout_is_weights`` — the truncated rollout
+    importance weights ``min(pi/mu, c)`` the policy-gradient term already uses (token level, or sequence level
+    broadcast over the row; zero on padding; detached). On stale replay tokens the uncorrected KL gradient pushes
+    the policy back toward the reference on tokens the current policy no longer visits and fights the
+    IS-corrected policy gradient; the weight removes those pushes. The gradient is ``w * d(kld)/d(log_prob)``
+    (``w * (log_prob - ref_log_prob)`` for the "+" types). The weights are re-detached defensively: they change
+    the measure, not the objective.
+
+    ``is_weighted`` without weights is an error, not a silent fallback to the unweighted term.
+    """
+    kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=kl_loss_type)
+    kl_unweighted = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **agg_kwargs)
+    if not is_weighted:
+        return kl_unweighted, kl_unweighted.detach()
+    if rollout_is_weights is None:
+        raise ValueError(
+            "actor.kl_loss_is_weighted=True needs the rollout IS weights (rollout_is_weights), i.e. "
+            "algorithm.rollout_correction.rollout_is=token|sequence computed in the actor "
+            "(skip_recompute_old_log_prob) or by the trainer; none were found in the batch"
+        )
+    weighted_kld = kld * rollout_is_weights.detach().to(dtype=kld.dtype)
+    kl_weighted = agg_loss(loss_mat=weighted_kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **agg_kwargs)
+    return kl_weighted, kl_unweighted.detach()
+
+
 def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob.
     Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1104
