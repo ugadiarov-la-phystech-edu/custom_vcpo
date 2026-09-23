@@ -276,8 +276,8 @@ class TestOpobMode:
         actor.update_policy_per_traj([_make_minibatch()], grad_baselining=True)
         scale = 1.0 / len(TRAJ_UIDS)
         assert calls["fbb_loss_multipliers"] == pytest.approx([scale] * len(TRAJ_UIDS))
-        # no separate multiplier: the loss falls back to loss_multiplier for the aux terms
-        assert calls["fbb_aux_loss_multipliers"] == [None] * len(TRAJ_UIDS)
+        # the aux terms (entropy bonus; KL is refused with OPOB) get the same 1/N, stated explicitly
+        assert calls["fbb_aux_loss_multipliers"] == pytest.approx([scale] * len(TRAJ_UIDS))
 
     def test_kl_loss_is_rejected(self, patched_env):
         # OPOB scales the accumulated score gradients by the advantage afterwards: a KL term
@@ -383,12 +383,72 @@ class TestCombineLosses:
         assert g_pg.item() == pytest.approx(adv / n)
         assert g_kl.item() == pytest.approx(1.0 / n)  # positive: the KL is still minimised
 
-    def test_aux_multiplier_falls_back_to_the_loss_multiplier(self):
-        # paths that keep real advantages in the tensor set no aux_loss_multiplier
-        assert megatron_actor._resolve_aux_loss_multiplier({}, 0.125) == 0.125
-        assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": None}, 0.125) == 0.125
+    def test_aux_multiplier_falls_back_only_to_a_unit_loss_multiplier(self):
+        # paths that keep real advantages in the tensor set neither key: both multipliers are 1
+        assert megatron_actor._resolve_aux_loss_multiplier({}, 1.0) == 1.0
+        assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": None}, 1.0) == 1.0
         assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": 0.25}, -3.0) == 0.25
         assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": 0.0}, -3.0) == 0.0
+
+
+class TestLossMetaInfo:
+    """megatron_actor._loss_meta_info: the dict forward_step hands to loss_func. It must carry the
+    per-trajectory path's ``aux_loss_multiplier`` — the 2026-09 KL runs (seeds 30-33) collapsed because
+    forward_step rebuilt this dict without it, so loss_func fell back to the advantage-carrying
+    ``loss_multiplier`` and the KL term was multiplied by A_i (sign-flipped on A_i < 0)."""
+
+    @staticmethod
+    def _config():
+        return SimpleNamespace(clip_ratio=0.2, entropy_coeff=0.0, get=lambda k, d=None: {"clip_ratio_c": 3.0}.get(k, d))
+
+    def test_training_dict_carries_the_aux_multiplier(self):
+        data_meta = {"loss_multiplier": -0.5, "aux_loss_multiplier": 0.25, "global_seq_mean_count": 7}
+        meta = megatron_actor._loss_meta_info(data_meta, self._config(), False, True, {"rollout_is": "token"})
+        assert meta["loss_multiplier"] == -0.5
+        assert meta["aux_loss_multiplier"] == 0.25
+        assert meta["global_seq_mean_count"] == 7
+        assert meta["clip_ratio"] == 0.2 and meta["clip_ratio_c"] == 3.0 and meta["entropy_coeff"] == 0.0
+        assert meta["skip_recompute_old_log_prob"] is True and meta["rollout_corr_config"] == {"rollout_is": "token"}
+        assert meta["collect_seq_log_is"] is False
+
+    def test_forward_only_dict_carries_it_too(self):
+        meta = megatron_actor._loss_meta_info(
+            {"loss_multiplier": 0.5, "aux_loss_multiplier": 0.1}, self._config(), True, False, None
+        )
+        assert meta["loss_multiplier"] == 0.5 and meta["aux_loss_multiplier"] == 0.1
+        assert "clip_ratio" not in meta
+
+    def test_absent_key_stays_absent(self):
+        meta = megatron_actor._loss_meta_info({}, self._config(), False, False, None)
+        assert meta["loss_multiplier"] == 1.0 and meta["aux_loss_multiplier"] is None
+
+    def test_regression_negative_advantage_keeps_the_kl_gradient_positive(self):
+        """The exact failure of seeds 30-33: a negative-advantage trajectory on the buffer-free
+        per-traj path must still MINIMISE the KL term once its meta_info has gone through forward_step."""
+        n, adv = 4, -2.0
+        data_meta = {"loss_multiplier": adv / n, "aux_loss_multiplier": 1.0 / n}  # as update_policy_per_traj sets them
+        meta = megatron_actor._loss_meta_info(data_meta, self._config(), False, False, None)
+        lm = megatron_actor._resolve_loss_multiplier(meta)
+        am = megatron_actor._resolve_aux_loss_multiplier(meta, lm)
+        assert am == pytest.approx(1.0 / n)
+        pg = torch.tensor(-1.0, requires_grad=True)
+        kl = torch.tensor(0.3, requires_grad=True)  # kl_coef * KL, positive
+        out = megatron_actor._combine_losses(pg, kl, lm, am)
+        g_pg, g_kl = torch.autograd.grad(out, [pg, kl])
+        assert g_pg.item() == pytest.approx(adv / n)
+        assert g_kl.item() > 0  # was adv/n < 0 on the unfixed code: the KL was pushed UP
+
+    def test_guard_refuses_a_folded_multiplier_without_the_aux_one(self):
+        """A path that folds the advantage into loss_multiplier must say what the aux terms get."""
+        with pytest.raises(ValueError, match="aux_loss_multiplier"):
+            megatron_actor._resolve_aux_loss_multiplier({"loss_multiplier": -0.5}, -0.5)
+        with pytest.raises(ValueError, match="aux_loss_multiplier"):
+            megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": None}, 0.25)
+
+    def test_unit_multiplier_without_the_key_is_the_plain_path(self):
+        # update_policy / the packed per-traj path: no fold, no key, aux terms share the unit multiplier
+        assert megatron_actor._resolve_aux_loss_multiplier({}, 1.0) == 1.0
+        assert megatron_actor._resolve_aux_loss_multiplier({"aux_loss_multiplier": 0.5}, -3.0) == 0.5
 
 
 class TestKlLossTerm:

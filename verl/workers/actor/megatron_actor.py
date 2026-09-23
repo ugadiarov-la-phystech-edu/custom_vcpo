@@ -96,7 +96,44 @@ def _resolve_aux_loss_multiplier(meta_info, loss_multiplier: float) -> float:
     ``aux_loss_multiplier``. Every other path keeps real advantages in the tensor and sets no
     such key, so the terms share ``loss_multiplier`` exactly as before."""
     value = meta_info.get("aux_loss_multiplier", None)
-    return loss_multiplier if value is None else float(value)
+    if value is not None:
+        return float(value)
+    if loss_multiplier != 1.0:
+        # A path that folds the advantage into loss_multiplier MUST say what the aux terms get.
+        # Falling back here silently multiplied the KL term by A_i/N (sign-flipped for A_i < 0):
+        # forward_step rebuilt loss_func's meta_info without the key until 2026-09-23, which is
+        # what collapsed every KL-to-reference run (seeds 30-33).
+        raise ValueError(
+            f"loss_multiplier={loss_multiplier} is folded (not 1.0) but meta_info carries no "
+            "aux_loss_multiplier: the KL / entropy terms would be scaled by the advantage"
+        )
+    return loss_multiplier
+
+
+def _loss_meta_info(data_meta_info, config, forward_only: bool, skip_recompute_old_log_prob: bool, rollout_corr_cfg):
+    """The meta_info forward_step hands to loss_func, rebuilt from the micro-batch's own meta_info.
+
+    Both multipliers of the per-trajectory path travel together: ``loss_multiplier`` (the
+    advantage-folded scale of the policy-gradient term) and ``aux_loss_multiplier`` (the
+    advantage-free scale of the KL / entropy terms)."""
+    meta_info = {
+        "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
+        "rollout_corr_config": rollout_corr_cfg,
+        "loss_multiplier": _resolve_loss_multiplier(data_meta_info),
+        "aux_loss_multiplier": data_meta_info.get("aux_loss_multiplier", None),
+    }
+    if forward_only:
+        return meta_info
+    meta_info.update(
+        {
+            "clip_ratio": config.clip_ratio,
+            "entropy_coeff": config.entropy_coeff,
+            "clip_ratio_c": config.get("clip_ratio_c", 3.0),
+            "global_seq_mean_count": data_meta_info.get("global_seq_mean_count"),
+            "collect_seq_log_is": bool(data_meta_info.get("collect_seq_log_is", False)),
+        }
+    )
+    return meta_info
 
 
 def _combine_losses(pg_loss, aux_loss, loss_multiplier: float, aux_loss_multiplier: float):
@@ -812,24 +849,9 @@ class MegatronPPOActor(BasePPOActor):
                     data_format="thd" if self.config.megatron.use_remove_padding else "bshd",
                 )
 
-            if forward_only:
-                meta_info = {
-                    "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
-                    "rollout_corr_config": rollout_corr_cfg,
-                    "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
-                }
-            else:
-                clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                meta_info = {
-                    "clip_ratio": self.config.clip_ratio,
-                    "entropy_coeff": self.config.entropy_coeff,
-                    "clip_ratio_c": clip_ratio_c,
-                    "skip_recompute_old_log_prob": skip_recompute_old_log_prob,
-                    "rollout_corr_config": rollout_corr_cfg,
-                    "loss_multiplier": _resolve_loss_multiplier(data.meta_info),
-                    "global_seq_mean_count": data.meta_info.get("global_seq_mean_count"),
-                    "collect_seq_log_is": bool(data.meta_info.get("collect_seq_log_is", False)),
-                }
+            meta_info = _loss_meta_info(
+                data.meta_info, self.config, forward_only, skip_recompute_old_log_prob, rollout_corr_cfg
+            )
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
         # batch should be a list of batches inside micro-batches
@@ -1325,6 +1347,8 @@ class MegatronPPOActor(BasePPOActor):
             # Emulate Megatron schedule's loss scaling by num_microbatches=len(minibatch)
             # Scaling loss instead of gradients avoids extra numeric/rounding differences
             minibatch.meta_info["loss_multiplier"] = microbatch_loss_scale
+            # the advantage-free terms (KL to the reference, entropy bonus) always get the plain 1/N
+            minibatch.meta_info["aux_loss_multiplier"] = microbatch_loss_scale
 
             # Per-trajectory updates and gradient statistics.
             for microbatch_idx, microbatch in enumerate(minibatch.split(1)):
