@@ -1,9 +1,11 @@
 # Staleness-Aware Experience Replay (SER) for fully asynchronous GRPO
 
-- Branch 'qwen3-8b_orz-7b' contains the implementation of SER for the Qwen3-8B and ORZ-7B models.
-- Branch 'baselines_qwen3-8b_orz-7b' contains the code for the Hybrid Sync baseline for the Qwen3-8B and ORZ-7B models.
-- Branch 'openpangu-7b' contains the implementation of SER for the OpenPangu-7B model.
-- Branch 'baselines_openpangu-7b' contains the code for the Hybrid Sync baseline for the OpenPangu-7B model.
+ - The 'baselines_qwen3-8b_orz-7b' branch is used to run Hybrid Sync baselines for the Qwen3-8B and ORZ-7B models. It contains code close to vanilla VERL, with changes related to metrics accounting, checkpointing, and reward scoring for ORZ-7B and the MATH-500 dataset.
+ - The 'baselines_openpangu-7b' branch is used to run the Hybrid Sync baseline for OpenPangu-7B; it additionally contains a Megatron port of the OpenPangu-7B architecture and functionality for OpenPangu-specific prompt handling.
+ - The 'qwen3-8b_orz-7b' branch significantly reworks the VERL codebase to implement the SER method, with changes that also affect the Hybrid Sync baseline. It contains the script for launching SER with the Qwen3-8B and Open-Reasoner-Zero-7B models.
+ - Compared to the 'qwen3-8b_orz-7b' branch, the 'openpangu-7b' branch additionally contains a Megatron port of the OpenPangu-7B architecture and functionality for OpenPangu-specific prompt handling. It contains the script for launching SER with the OpenPangu-7B model.
+
+All branches use the same Python environment.
 
 ## Installation
 
