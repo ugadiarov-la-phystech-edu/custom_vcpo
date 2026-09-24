@@ -30,6 +30,12 @@
 # errors", which is all this test claims. (smoke_test_openpangu_3+3.sh adds an entropy bonus and
 # a 100x lr to force visible weight changes; that is a different question.)
 #
+# H100 EMULATION ON AN H200: VERL_GPU_MEM_CAP_GB=80 caps the trainer processes' PyTorch allocator
+# at 80 GiB (verl/utils/gpu_memory_cap.py, actor-role processes only) and gpu_memory_utilization=0.43
+# gives each vLLM engine the arm's H100 budget (0.75 x 79.6 / 140.4 GiB). Set explicitly here - the
+# arm has the same defaults - so the smoke checks the H100 envelope even if the arm's defaults
+# change. On a real H100: VERL_GPU_MEM_CAP_GB= gpu_memory_utilization=0.75.
+#
 # The model is NOT shrunk: the point is the real openPangu path - the custom tokenizer through
 # trust_remote_code, the re-aliased Llama checkpoint in vLLM and FSDP2, BOS, weight sync.
 #
@@ -86,6 +92,10 @@ export total_rollout_steps=${total_rollout_steps:-6}       # = 2 trainer steps o
 export test_freq=${test_freq:-1}                           # validate after every step
 export save_freq=${save_freq:--1}                          # no checkpoints (see header)
 export val_before_train=${val_before_train:-False}
+
+# ---- H100 emulation on the H200 (see the header) ---------------------------------
+export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-80}
+export gpu_memory_utilization=${gpu_memory_utilization:-0.43}
 
 # `--cfg job` and friends make the arm print its config and exit: pass straight through, so
 # the output stays clean YAML and nothing is checked.

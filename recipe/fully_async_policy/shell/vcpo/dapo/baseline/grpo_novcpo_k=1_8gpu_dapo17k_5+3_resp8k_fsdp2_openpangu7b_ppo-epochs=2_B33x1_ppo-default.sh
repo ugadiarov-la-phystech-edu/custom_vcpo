@@ -193,6 +193,14 @@ export RAY_ADDRESS="local"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export WANDB_MODE=disabled
 export VLLM_USE_FLASHINFER_SAMPLER=0
+# H100 EMULATION ON AN H200 (on by default in this arm). verl/utils/gpu_memory_cap.py caps the
+# PyTorch allocator of every ACTOR-role process (the fully-async trainer's DetachActorWorker, via
+# ActorRolloutRefWorker.__init__) at this many GiB; the rollout workers are never capped - vLLM
+# budgets against the device total, so its side of the emulation is gpu_memory_utilization below.
+# Exported before Ray starts, so every worker inherits it. The cap bounds the caching allocator,
+# not the hardware (CUDA context / NCCL buffers sit outside it): fitting under it is evidence the
+# recipe fits an 80 GB card, not proof. VERL_GPU_MEM_CAP_GB= (empty) switches it off.
+export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-80}
 
 export PYTHONUNBUFFERED=1
 
@@ -254,7 +262,11 @@ n_resp_per_prompt=${n_resp_per_prompt:-16}
 # collective.broadcast(group_name="actor_rollout"). Raising it back is how you get that
 # failure again; the cheaper alternative (model_dtype=bf16) would turn this into the 6+2
 # arm's numerics, which is not what this arm is for.
-gpu_memory_utilization=${gpu_memory_utilization:-0.75}
+# DEFAULT 0.43 (H100 emulation on an H200, 140.4 GiB, paired with VERL_GPU_MEM_CAP_GB=80): the
+# same absolute vLLM budget as the 0.75 above on an 80 GB H100 (79.6 GiB): 0.75 x 79.6 / 140.4 =
+# 0.425 -> ~60 GiB per rollout GPU. On a real H100 pass gpu_memory_utilization=0.75 (and
+# VERL_GPU_MEM_CAP_GB= to disable the cap).
+gpu_memory_utilization=${gpu_memory_utilization:-0.43}
 # vLLM v1 warms the sampler with max_num_seqs dummy requests AFTER filling the KV
 # pool, so the transient scales with it; 512 is far above the ~50-60 concurrent
 # sequences these engines actually run at this length.

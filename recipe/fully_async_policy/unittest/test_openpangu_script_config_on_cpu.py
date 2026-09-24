@@ -754,8 +754,13 @@ class TestOpenPanguPpoDefaultArm(unittest.TestCase):
         self.assertIsNone(OmegaConf.select(cfg, "actor_rollout_ref.actor.policy_loss.rollout_correction"))
 
     def test_everything_else_matches_the_is_pg_arm(self):
-        """Only the objective and the names derived from it may differ."""
+        """Only the objective, the names derived from it, and the validation / checkpoint cadence
+        may differ."""
         allowed = set(OBJECTIVE_KEYS) | {
+            "rollout.test_freq",
+            "trainer.test_freq",
+            "trainer.save_freq",
+            "actor_rollout_ref.rollout.gpu_memory_utilization",  # H100-emulation pairing
             "critic.loss_agg_mode",  # interpolates the actor's
             "trainer.experiment_name",
             "trainer.default_local_dir",
@@ -768,6 +773,21 @@ class TestOpenPanguPpoDefaultArm(unittest.TestCase):
                 continue
             with self.subTest(key=key):
                 self.assertEqual(ours.get(key, "<absent>"), theirs.get(key, "<absent>"))
+
+    def test_emulates_an_h100_on_an_h200_by_default(self):
+        """Trainer allocator capped at 80 GiB (exported before Ray starts), vLLM at 0.43 on the
+        H200 = the arm's H100 value 0.75 in absolute GiB; an empty VERL_GPU_MEM_CAP_GB switches
+        the cap off."""
+        self.assertEqual(self.cfg.actor_rollout_ref.rollout.gpu_memory_utilization, 0.43)
+        with open(os.path.join(BASELINE, OPENPANGU_PPO_DEFAULT)) as f:
+            text = f.read()
+        self.assertIn("export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-80}", text)
+        head, _, _ = text.partition("python -m recipe.fully_async_policy.fully_async_main")
+        self.assertIn("export VERL_GPU_MEM_CAP_GB", head, "must be exported before the Ray job starts")
+
+    def test_validates_every_15_versions_and_never_saves(self):
+        self.assertEqual(self.cfg.rollout.test_freq, 15)
+        self.assertEqual(self.cfg.trainer.save_freq, -1)
 
     def test_experiment_name_says_ppo_default(self):
         name = self.cfg.trainer.experiment_name
@@ -828,6 +848,13 @@ class TestOpenPanguPpoDefaultSmoke5plus3(unittest.TestCase):
 
     def test_generation_runs_at_the_arms_length(self):
         self.assertEqual(self.cfg.data.max_response_length, self.arm.data.max_response_length)
+
+    def test_emulates_an_h100_on_the_h200(self):
+        self.assertEqual(self.cfg.actor_rollout_ref.rollout.gpu_memory_utilization, 0.43)
+        with open(os.path.join(BASELINE, SMOKE_PPO_DEFAULT_5P3)) as f:
+            text = f.read()
+        self.assertIn("export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-80}", text)
+        self.assertIn("export gpu_memory_utilization=${gpu_memory_utilization:-0.43}", text)
 
     def test_objective_and_optimizer_are_the_arms(self):
         for path in (*OBJECTIVE_KEYS, "actor_rollout_ref.actor.optim.lr", "actor_rollout_ref.actor.ppo_epochs"):
