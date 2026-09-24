@@ -8,12 +8,14 @@
 #SBATCH --error=./slurm/%A_%x.err
 #SBATCH --job-name=grpo-novcpo
 
-# grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_fsdp2_openpangu7b_ppo-epochs=2_B33x1_is-pg.sh
+# grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_fsdp2_openpangu7b_ppo-epochs=2_B33x1_ppo-default.sh
 #
-# openPangu-Embedded-7B arm of the FSDP2 baseline: identical to
-# ..._5+3_resp8k_fsdp2_ppo-epochs=2_B33x1_is-pg.sh (same data, objective, schedule,
-# layout, backend recipe) except for the model and the two trust_remote_code flags it
-# needs. See THE MODEL below for what was verified about it before this arm existed.
+# openPangu-Embedded-7B, fully-async FSDP2, with the RECIPE'S DEFAULT OBJECTIVE. Self-contained
+# (no wrapper): a copy of ..._fsdp2_openpangu7b_ppo-epochs=2_B33x1_is-pg.sh with the same
+# data, model, BOS, schedule, layout, backend, optimizer, validation and checkpointing, and
+# ONE change - the loss. Every objective knob (importance sampling, clipping, KL, entropy
+# bonus, loss aggregation) is set to its value in recipe/fully_async_policy/config/
+# fully_async_ppo_trainer.yaml as composed without overrides. See THE OBJECTIVE below.
 #
 # THE MODEL. MODEL_PATH points at a LOCAL, RE-ALIASED checkpoint, not the hub id.
 # openPangu ships as a trust_remote_code PanguEmbeddedForCausalLM whose
@@ -77,38 +79,34 @@
 # comparable across backends. Earlier runs of this arm validated at 1.0 / 0.8
 # (val_temperature=1.0 val_top_p=0.8 reproduces them).
 #
-# ARM A of the pair that reproduces the same-named arm of branch 'rollout-dapo' on
-# this (pristine-verl + cumulative_training_time) branch. Both arms share every
-# schedule/optimizer setting below and differ ONLY in how the off-policy gap is
-# corrected:
-#   * A = this file: IS-weighted policy gradient, no trust region -- what the
-#     source arm EXECUTED.
-#   * B = ..._decoupled.sh: 3-policy decoupled PPO, live clip + IS -- what the
-#     source arm DECLARED (bypass_mode=False).
+# THE OBJECTIVE (recipe defaults; the is-pg arm's values in brackets):
+#   * policy_loss.loss_mode=vanilla [rollout_correction]: the stock PPO clipped surrogate,
+#     clip_ratio 0.2/0.2 with dual-clip c=3.0 (the is-pg arm sets the same numbers but its
+#     loss never clips).
+#   * algorithm.rollout_correction: rollout_is=null [token, threshold 2.0], rollout_rs=null,
+#     bypass_mode=False [True], use_policy_gradient=False [True]; no
+#     actor.policy_loss.rollout_correction block [present]. No importance weights are
+#     applied; compute_rollout_correction_and_add_to_batch still runs on the driver and
+#     logs rollout_corr/* diagnostics (KL, ESS) but adds no rollout_is_weights.
+#   * loss_agg_mode=token-mean [seq-mean-token-mean].
+#   * KL: use_kl_loss=False, kl_loss_coef=0.001 (inert while off) [0.0]; use_kl_in_reward=
+#     False, kl_ctrl.kl_coef=0.001 (inert while off) [0.0]. No KL either way.
+#   * entropy_coeff=0 (no entropy bonus), as in the is-pg arm.
+#   * unchanged (already the defaults there): async_training.use_rollout_log_probs=True,
+#     async_training.compute_prox_log_prob=False.
+# WHAT THIS MEANS: the recipe substitutes old_log_probs := rollout_log_probs
+# (use_rollout_log_probs=True with no proximal forward), so the PPO ratio is
+# pi_theta / pi_rollout - the behaviour policy, up to one parameter version stale at k=1,
+# plus the vLLM-vs-trainer numerical gap. That ratio IS the importance weight; it is
+# CLIPPED to [0.8, 1.2] (dual-clip 3.0 for negative advantages) instead of truncated at
+# 2.0, and nothing else corrects for staleness. With ppo_epochs=2 the second pass sees
+# the ratio against the same rollout policy, so the clip binds more there.
+# LOG SURFACE (differs from the is-pg arm): actor/pg_clipfrac and pg_clipfrac_lower exist
+# and are live here; actor/ppo_kl is KL(current || rollout); rollout_corr/* come from the
+# driver's pass over the pull and carry no weights; actor/entropy is measured inside the
+# update (calculate_entropy=True, logging only - it has no gradient effect).
 #
-# WHY THIS IS THE SOURCE ARM'S OBJECTIVE. The source sets
-# async_training.skip_recompute_old_log_prob=True (absent on this branch): the actor
-# uses old_log_prob = log_prob.detach(), so the PPO ratio is exactly 1, clipping and
-# dual-clip never bind, and the entire correction is trunc(pi_theta/pi_rollout, 2.0)
-# recomputed per micro-batch. Base verl has the identical objective natively:
-#   actor.policy_loss.loss_mode=rollout_correction
-#     -> compute_policy_loss_with_rollout_correction (verl/trainer/ppo/core_algos.py):
-#        L = -E[w * log pi * A], w = trunc(pi_theta/pi_rollout, rollout_is_threshold),
-#        computed on the fly per micro-batch, NO PPO clipping, no extra forward pass.
-# use_rollout_log_probs=True keeps old_log_probs := rollout_log_probs, i.e. the
-# 2-policy ("bypass") substitution that loss mode expects.
-#
-# LOG SURFACE (differs from arm B -- do not plot the two together blindly):
-#   * actor/pg_clipfrac and pg_clipfrac_lower do NOT exist here: the loss never
-#     clips. (The source arm logs them as identically 0.)
-#   * actor/ppo_kl is KL(current || rollout) here, but KL(current || old) in arm B.
-#   * rollout_corr/* come from the actor, per micro-batch, and are the real IS
-#     statistics; the driver's own correction pass is degenerate (old == rollout)
-#     and its values are overwritten by the actor's.
-#   * actor/entropy is measured INSIDE the update here (calculate_entropy=True);
-#     arm B measures it at pull time instead.
-#
-# Schedule (identical in both arms, unchanged from the source):
+# Schedule (identical to the is-pg arm):
 #   * require_batches=1: the pull is ONE 33-group mini-batch per trainer step
 #     (B-33x1). Model versions tick per 33-group step.
 #   * TWO AdamW updates per step. The source used driver-side
@@ -294,20 +292,21 @@ log_prob_micro_bsz_per_gpu=1
 
 # ================= Algorithm =================
 adv_estimator=grpo
-loss_agg_mode="seq-mean-token-mean"
+# Recipe defaults for the whole objective (see THE OBJECTIVE in the header).
+loss_agg_mode="token-mean"
 clip_ratio=0.2
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 clip_ratio_c=3.0
 use_kl_loss=False
-kl_loss_coef=0.0
+kl_loss_coef=0.001   # recipe default; inert while use_kl_loss=False
 use_kl_in_reward=False
-kl_coef=0.0
+kl_coef=0.001        # recipe default; inert while use_kl_in_reward=False
 entropy_coeff=${entropy_coeff:-0}
-# Log actor/entropy even with entropy_coeff=0 (honoured via should_calculate_entropy
-# in verl/workers/actor/megatron_actor.py). This arm has no old-log-prob forward, so
-# it is the only source of entropy here -- see the memory note in the header.
-calculate_entropy=True
+# Log actor/entropy even with entropy_coeff=0 (logging only: no gradient effect; the recipe
+# default is False). This arm has no old-log-prob forward, so it is the only source of
+# entropy here -- see the memory note in the header.
+calculate_entropy=${calculate_entropy:-True}
 grad_clip=1.0
 
 # ================= Optimizer =================
@@ -316,20 +315,15 @@ lr_warmup_steps=0
 weight_decay=0.1
 
 # ================= IS / Rollout Correction =================
-# Token-level truncated IS at 2.0, applied as a pure policy-gradient correction with
-# no PPO clipping (the source arm's skip_recompute behaviour, expressed natively).
-# bypass_mode/use_policy_gradient describe exactly this mode, but note they are INERT
-# on the fully-async path: their only consumer, apply_rollout_correction(), is called
-# from verl/trainer/ppo/ray_trainer.py, never from this recipe. What actually selects
-# the behaviour is policy_loss.loss_mode below; the recipe performs the bypass
-# substitution itself via async_training.use_rollout_log_probs=True.
-rollout_is="token"
-rollout_is_threshold="2.0"
+# Recipe defaults: no IS weights, no rejection sampling, no bypass / policy-gradient mode;
+# the loss is the stock PPO clip (loss_mode=vanilla). See THE OBJECTIVE in the header.
+rollout_is=null
+rollout_is_threshold="2.0" # recipe default; inert while rollout_is=null
 rollout_rs=null
 rollout_rs_threshold=null
-bypass_mode=True
-use_policy_gradient=True
-policy_loss_mode="rollout_correction"
+bypass_mode=False
+use_policy_gradient=False
+policy_loss_mode="vanilla"
 
 compute_prox_log_prob=False
 
@@ -379,7 +373,7 @@ max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null} # keep every checkpoint
 resume_mode=${resume_mode:-disable}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO is-pg k-${staleness_threshold} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} fsdp2 B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${bos_tag}"}
+exp_name=${exp_name:-"GRPO-noVCPO ppo-default k-${staleness_threshold} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} fsdp2 B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${bos_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -437,7 +431,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
     actor_rollout_ref.actor.ppo_epochs=${ppo_epochs} \
     actor_rollout_ref.actor.policy_loss.loss_mode=${policy_loss_mode} \
-    "+actor_rollout_ref.actor.policy_loss.rollout_correction={rollout_is:${rollout_is},rollout_is_threshold:${rollout_is_threshold},rollout_rs:${rollout_rs},rollout_rs_threshold:${rollout_rs_threshold}}" \
     actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.fsdp_config.offload_policy=${offload_policy} \
