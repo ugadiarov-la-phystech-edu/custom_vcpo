@@ -114,11 +114,14 @@
 #     same, because megatron_workers.py scales ppo_mini_batch_size by rollout.n
 #     (33*16=528 = the whole pull), so make_iterator(epochs=2) runs the same 2 steps.
 #   * staleness_threshold=1 (see the k=1 note below; the source arm ran k=2),
-#     total_rollout_steps=66000 explicit, test_freq=save_freq=10.
+#     total_rollout_steps=66000 explicit. test_freq=15, save_freq=-1 (no checkpoints; the
+#     is-pg arm validates and saves every 10).
 #   * serialize_validation / pause_generation_during_save: stop-the-world validation
 #     and saves, excluded from fully_async/timing/cumulative_training_time.
 #
-# CHECKPOINTS (save_contents=['hf_model'], max_actor_ckpt_to_keep=null, resume_mode=disable):
+# CHECKPOINTS - OFF by default here (save_freq=-1: no save ever runs); save_freq=N re-enables
+# them with the settings below (save_contents=['hf_model'], max_actor_ckpt_to_keep=null,
+# resume_mode=disable):
 #   * each save writes global_step_N/actor/huggingface/ - config, tokenizer and bf16
 #     safetensors - directly loadable by vLLM / from_pretrained, no merge step. No
 #     optimizer state, no sharded dist_ckpt/ directory at all.
@@ -358,9 +361,10 @@ pause_generation_during_save=${pause_generation_during_save:-True}
 total_rollout_steps=${total_rollout_steps:-66000}
 epochs=10000000
 # test/save freq are in param-version units; versions tick per 33-group step
-# here, so 10 = every 330 groups.
-test_freq=${test_freq:-10}
-save_freq=${save_freq:-10}
+# here, so test_freq=15 = a validation every 495 groups. save_freq=-1 disables checkpoints
+# entirely (the save gate requires save_freq > 0); set save_freq=N to save every N versions.
+test_freq=${test_freq:-15}
+save_freq=${save_freq:--1}
 # Weights only, in huggingface format: no optimizer state (fp32 master + 2 adam moments is ~6x
 # the bf16 weights on the megatron distributed optimizer, and every save here is stop-the-world)
 # and no merge step before offline eval - global_step_N/actor/huggingface/ loads in vLLM as is.
