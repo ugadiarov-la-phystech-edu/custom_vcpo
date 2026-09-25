@@ -761,6 +761,8 @@ class TestOpenPanguPpoDefaultArm(unittest.TestCase):
             "trainer.test_freq",
             "trainer.save_freq",
             "actor_rollout_ref.rollout.gpu_memory_utilization",  # H100-emulation pairing
+            "data.seed",  # SEED knob (the is-pg arm leaves the shuffle unseeded)
+            "actor_rollout_ref.actor.fsdp_config.seed",
             "critic.loss_agg_mode",  # interpolates the actor's
             "trainer.experiment_name",
             "trainer.default_local_dir",
@@ -793,10 +795,35 @@ class TestOpenPanguPpoDefaultArm(unittest.TestCase):
         name = self.cfg.trainer.experiment_name
         self.assertIn("ppo-default", name)
         self.assertNotIn("is-pg", name)
+        self.assertTrue(name.endswith(" seed-1"), name)
         self.assertEqual(
-            name.replace("ppo-default", "is-pg").replace(" token-mean ", " seq-mean-token-mean "),
+            name.removesuffix(" seed-1")
+            .replace("ppo-default", "is-pg")
+            .replace(" token-mean ", " seq-mean-token-mean "),
             self.is_pg.trainer.experiment_name,
         )
+
+    def test_seed_feeds_the_data_shuffle_the_model_and_the_name(self):
+        """As in the FSDP2 sync arm: default 1, env-overridable."""
+        self.assertEqual(self.cfg.data.seed, 1)
+        self.assertEqual(self.cfg.actor_rollout_ref.actor.fsdp_config.seed, 1)
+        cfg = _compose_uncached(OPENPANGU_PPO_DEFAULT, TEST_FILE="/tmp/test.parquet", SEED="7")
+        self.assertEqual(cfg.data.seed, 7)
+        self.assertEqual(cfg.actor_rollout_ref.actor.fsdp_config.seed, 7)
+        self.assertTrue(cfg.trainer.experiment_name.endswith(" seed-7"), cfg.trainer.experiment_name)
+        self.assertIs(cfg.data.shuffle, True)
+
+    def test_seed_must_be_a_non_negative_integer(self):
+        env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet", SEED="abc")
+        proc = subprocess.run(
+            ["bash", os.path.join(BASELINE, OPENPANGU_PPO_DEFAULT), "--cfg", "job"],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("SEED must be a non-negative integer", proc.stderr.decode())
 
     def test_exports_the_hf_modules_cache(self):
         with open(os.path.join(BASELINE, OPENPANGU_PPO_DEFAULT)) as f:

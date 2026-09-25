@@ -240,6 +240,20 @@ TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.par
 
 project_name='vcpo'
 
+# ================= Seeds =================
+# SEED (env-overridable, default 1), as in the FSDP2 sync arm
+# (main_ppo_sync_8gpu_dapo17k_grpo_B128xn16_mini32_openpangu7b_fsdp2.sh), feeds:
+#   * data.seed - the rollouter's training-data shuffle (create_rl_sampler seeds its
+#     torch.Generator with it; before this knob data.seed was null, i.e. an UNSEEDED shuffle
+#     and a different prompt order on every launch);
+#   * actor.fsdp_config.seed - the FSDP worker's model / RNG seed (was verl's fixed 42);
+#   * the experiment name (" seed-<SEED>"), so seeds never share a log dir.
+# Not covered, as on the sync arm: vLLM's sampling seed (RolloutConfig, fixed at 0), and the
+# fully-async pipeline's own nondeterminism (which samples land in which trainer step depends
+# on generation timing), so two runs with the same SEED are NOT bit-identical.
+SEED=${SEED:-1}
+[[ "${SEED}" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer, got '${SEED}'" >&2; exit 2; }
+
 # ================= GPU Layout =================
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -389,7 +403,7 @@ max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null} # keep every checkpoint
 resume_mode=${resume_mode:-disable}
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO ppo-default k-${staleness_threshold} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} fsdp2 B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${bos_tag}"}
+exp_name=${exp_name:-"GRPO-noVCPO ppo-default k-${staleness_threshold} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} fsdp2 B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${bos_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -439,6 +453,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
     actor_rollout_ref.model.trust_remote_code=${trust_remote_code} \
     data.trust_remote_code=${trust_remote_code} \
+    data.seed=${SEED} \
     data.add_bos_token_to_prompt=${add_bos_token_to_prompt} \
     actor_rollout_ref.model.enable_gradient_checkpointing=${enable_gradient_checkpointing} \
     actor_rollout_ref.hybrid_engine=False \
@@ -448,6 +463,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ppo_epochs=${ppo_epochs} \
     actor_rollout_ref.actor.policy_loss.loss_mode=${policy_loss_mode} \
     actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.seed=${SEED} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.fsdp_config.offload_policy=${offload_policy} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${param_offload} \
