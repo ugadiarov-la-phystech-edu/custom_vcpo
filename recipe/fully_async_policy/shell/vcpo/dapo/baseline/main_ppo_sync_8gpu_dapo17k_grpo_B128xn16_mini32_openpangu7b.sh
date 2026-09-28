@@ -167,9 +167,35 @@ top_k=-1
 # Validation sampling identical to the Qwen3-8B twin and the Megatron is-pg openPangu arm.
 val_temperature=${val_temperature:-0.8}
 val_top_p=${val_top_p:-0.7}
-# Cache vLLM's per-token log-probs for the rollout_corr/* diagnostics; no correction
-# is applied (rollout_is null, bypass_mode false: old_log_probs recomputed by the trainer).
+# Cache vLLM's per-token log-probs for the rollout_corr/* diagnostics. By default no
+# correction is applied (rollout_is null, bypass_mode false: old_log_probs recomputed by
+# the trainer); rollout_is=token turns on TIS below.
 calculate_log_probs=True
+
+# ================= FP8 rollout + TIS (FlashRL recipe; off by default) =================
+# rollout_quantization=fp8: vLLM generates with FP8 weights (128x128 block scales,
+# dynamic activations), re-quantized from the bf16 Megatron weights at every refit
+# (verl/utils/vllm/vllm_fp8_utils.py). Norms, biases, embeddings and lm_head stay bf16.
+# rollout_is=token: truncated importance sampling in decoupled mode - every token's
+# PPO-clip loss is multiplied by min(pi_old / pi_vllm, rollout_is_threshold), detached,
+# with pi_old recomputed by the trainer, so the clip ratio stays learner/learner. FP8
+# widens the rollout/train gap and trains badly without it (FlashRL; verl
+# docs/advance/fp8.md), hence fp8 requires rollout_is unless allow_fp8_without_tis=1.
+# Watch training/rollout_probs_diff_* and rollout_corr/rollout_is_* (ESS, fraction_high).
+# On H100/H200 without DeepGEMM, vLLM transposes each FP8 block scale after loading;
+# load_quanted_weights stages and restores those scales at every refit ("Staged N
+# transposed FP8 weight scales" in the log, N = 34 layers x 4 fused linears = 136).
+#   rollout_quantization=fp8 rollout_is=token bash <this script>
+rollout_quantization=${rollout_quantization:-null}
+rollout_is=${rollout_is:-null}
+rollout_is_threshold=${rollout_is_threshold:-2.0}
+if [[ "${rollout_quantization}" != "null" && "${rollout_is}" == "null" && "${allow_fp8_without_tis:-0}" != "1" ]]; then
+    echo "rollout_quantization=${rollout_quantization} needs rollout_is=token (TIS); set allow_fp8_without_tis=1 to override" >&2
+    exit 2
+fi
+rollout_tag=""
+if [[ "${rollout_quantization}" != "null" ]]; then rollout_tag+=" ${rollout_quantization}-rollout"; fi
+if [[ "${rollout_is}" != "null" ]]; then rollout_tag+=" tis-${rollout_is}-${rollout_is_threshold}"; fi
 
 # ================= Trainer =================
 test_freq=${test_freq:-2}    # rollout steps (= 8 optimizer updates)
@@ -202,7 +228,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 openPangu-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 openPangu-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}${rollout_tag}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -226,6 +252,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.trust_remote_code=${trust_remote_code} \
     actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
@@ -276,6 +304,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp} \
     actor_rollout_ref.rollout.dtype=${precision_dtype} \
+    actor_rollout_ref.rollout.quantization=${rollout_quantization} \
     actor_rollout_ref.rollout.enable_chunked_prefill=${enable_chunked_prefill} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
     actor_rollout_ref.rollout.temperature=${temperature} \

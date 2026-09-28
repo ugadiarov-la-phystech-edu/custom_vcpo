@@ -489,6 +489,109 @@ class TestOpenPanguSyncArm(_OpenPanguMegatronArmMixin, unittest.TestCase):
         self.assertIn("bos", self.cfg.trainer.experiment_name)
 
 
+def _run_uncached(script_name, **env_overrides):
+    """compose() caches per script name and ignores env on a cache hit; these knob tests need a
+    fresh composition per environment. Returns (returncode, cfg or None, stderr)."""
+    path = os.path.join(BASELINE, script_name)
+    if not os.path.exists(path):
+        raise unittest.SkipTest(f"{script_name} not found")
+    env = dict(os.environ, TRAIN_FILE="/tmp/train.parquet", TEST_FILE="/tmp/test.parquet", **env_overrides)
+    with tempfile.NamedTemporaryFile("w+", suffix=".yaml") as out:
+        proc = subprocess.run(
+            ["bash", path, "--cfg", "job", "--resolve"],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=out,
+            stderr=subprocess.PIPE,
+            timeout=900,
+        )
+        if proc.returncode != 0:
+            return proc.returncode, None, proc.stderr.decode()
+        out.flush()
+        out.seek(0)
+        return 0, OmegaConf.load(out.name), proc.stderr.decode()
+
+
+class TestOpenPanguSyncFp8TisKnobs(unittest.TestCase):
+    """FP8 rollouts + FlashRL-style TIS on the sync arm: off by default, both on together, a
+    distinct experiment name, and FP8 refused without TIS."""
+
+    # Every composition runs the script with a unique exp_name, so the log dir it creates is
+    # predictable and removed afterwards (the script mkdirs logs/<exp_name> before hydra).
+    def _compose(self, **env):
+        rc, cfg, err = _run_uncached(OPENPANGU_SYNC, **env)
+        if rc == 0 and cfg is not None:
+            self.addCleanup(self._remove_empty_log_dir, cfg.trainer.experiment_name)
+        return rc, cfg, err
+
+    @staticmethod
+    def _remove_empty_log_dir(exp_name):
+        # Only a tree with no files at all is removed: a real run's directory (the default
+        # name is a real run's name) is left completely untouched.
+        log_dir = os.path.join(REPO_ROOT, "logs", exp_name.replace("/", "_"))
+        tree = list(os.walk(log_dir, topdown=False))
+        if any(files for _root, _dirs, files in tree):
+            return
+        for root, _dirs, _files in tree:
+            os.rmdir(root)
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.platform.startswith("win"):
+            raise unittest.SkipTest("bash-only")
+
+    def _ok(self, **env):
+        rc, cfg, err = self._compose(**env)
+        if rc != 0:
+            raise unittest.SkipTest(f"could not compose {OPENPANGU_SYNC}: {err[-300:]}")
+        return cfg
+
+    def test_default_is_bf16_rollout_without_correction(self):
+        cfg = self._ok()
+        self.assertIsNone(cfg.actor_rollout_ref.rollout.quantization)
+        self.assertIsNone(cfg.algorithm.rollout_correction.rollout_is)
+        self.assertFalse(cfg.algorithm.rollout_correction.bypass_mode)
+        self.assertNotIn("fp8", cfg.trainer.experiment_name)
+        self.assertNotIn("tis-", cfg.trainer.experiment_name)
+
+    def test_fp8_with_token_tis_is_the_flashrl_recipe(self):
+        cfg = self._ok(rollout_quantization="fp8", rollout_is="token")
+        rc = cfg.algorithm.rollout_correction
+        self.assertEqual(cfg.actor_rollout_ref.rollout.quantization, "fp8")
+        self.assertEqual(rc.rollout_is, "token")
+        self.assertEqual(float(rc.rollout_is_threshold), 2.0)
+        # decoupled mode: the trainer recomputes old_log_probs, so the PPO ratio stays learner/learner
+        self.assertFalse(rc.bypass_mode)
+        self.assertFalse(rc.use_policy_gradient)
+        self.assertIsNone(rc.rollout_rs)
+        self.assertTrue(cfg.actor_rollout_ref.rollout.calculate_log_probs)
+        self.assertEqual(cfg.actor_rollout_ref.actor.policy_loss.loss_mode, "vanilla")
+        self.assertTrue(cfg.trainer.experiment_name.endswith(" fp8-rollout tis-token-2.0"))
+
+    def test_rollout_tags_precede_the_h100_emu_tag(self):
+        cfg = self._ok(rollout_quantization="fp8", rollout_is="token", VERL_GPU_MEM_CAP_GB="80")
+        name = cfg.trainer.experiment_name
+        self.assertTrue(name.endswith(" fp8-rollout tis-token-2.0 h100-emu-80gb-gmu0.5"), name)
+
+    def test_tis_alone_is_the_bf16_control(self):
+        cfg = self._ok(rollout_is="token")
+        self.assertIsNone(cfg.actor_rollout_ref.rollout.quantization)
+        self.assertEqual(cfg.algorithm.rollout_correction.rollout_is, "token")
+        self.assertTrue(cfg.trainer.experiment_name.endswith(" tis-token-2.0"))
+
+    def test_fp8_without_tis_is_refused(self):
+        rc, cfg, err = self._compose(rollout_quantization="fp8")
+        self.assertEqual(rc, 2)
+        self.assertIsNone(cfg)
+        self.assertIn("needs rollout_is=token", err)
+
+    def test_fp8_without_tis_can_be_forced(self):
+        cfg = self._ok(rollout_quantization="fp8", allow_fp8_without_tis="1")
+        self.assertEqual(cfg.actor_rollout_ref.rollout.quantization, "fp8")
+        self.assertIsNone(cfg.algorithm.rollout_correction.rollout_is)
+        self.assertTrue(cfg.trainer.experiment_name.endswith(" fp8-rollout"))
+
+
 class TestBosFlagDefaultsOffEverywhereElse(unittest.TestCase):
     """The flag exists for openPangu; every other script composes with it off, exactly as before."""
 

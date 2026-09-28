@@ -196,6 +196,9 @@ def load_quanted_weights(weights, model_runner):
 
     weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
 
+    staged_scales = stage_transposed_fp8_scales(model)
+    if staged_scales:
+        logger.info(f"Staged {len(staged_scales)} transposed FP8 weight scales for refit")
     # Monkey patch the param class to their subclass, as certain models
     # will check the param type to call the proper weightloader
     for name, param in model.named_parameters():
@@ -208,6 +211,7 @@ def load_quanted_weights(weights, model_runner):
     for name, param in model.named_parameters():
         if hasattr(param, "subclass_type"):
             param.__class__ = param.orig_type
+    restore_transposed_fp8_scales(staged_scales)
     return loaded_params
 
 
@@ -322,7 +326,78 @@ def process_weights_after_loading_for_vllm11(self, layer) -> None:
 
     del layer.weight_scale_inv
 
+    checkpoint_scale = layer.weight_scale
     maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)
+    _record_replaced_fp8_scale(layer, checkpoint_scale)
+
+
+# On sm90 without DeepGEMM, vLLM 0.11's maybe_post_process_fp8_weight_block swaps
+# layer.weight_scale for a transposed plain Parameter (the CUTLASS block-FP8 kernel
+# wants the other scale order). That Parameter has no weight_loader, and its layout
+# no longer matches the (N/128, K/128) scales quant_weights produces, so a refit
+# would fail in the loader or, for square scales (o_proj), load silently wrong
+# values. The layer remembers the checkpoint layout and the loader attributes here;
+# load_quanted_weights stages a buffer in that layout for each refit and writes the
+# result back transposed into the live storage the CUDA graph points at.
+# Newer verl (vLLM >= 0.18) handles every kernel repack this way
+# (stage_fp8_params_for_loading / process_fp8_weights_after_loading).
+_FP8_TRANSPOSED_SCALE_ATTR = "_verl_fp8_transposed_scale"
+
+
+def _record_replaced_fp8_scale(layer, checkpoint_scale) -> None:
+    live = layer.weight_scale
+    if live is checkpoint_scale:
+        return
+    if tuple(live.shape) != tuple(reversed(checkpoint_scale.shape)):
+        raise RuntimeError(
+            f"unexpected FP8 weight_scale post-processing: {tuple(checkpoint_scale.shape)} -> {tuple(live.shape)}; "
+            "only the sm90 CUTLASS transpose is supported for refit"
+        )
+    # Layout and non-tensor attributes only: this runs inside vLLM's "weights"
+    # memory pool, whose contents do not survive a sleep, so no tensor is kept.
+    loader_attrs = {
+        attr: getattr(checkpoint_scale, attr)
+        for attr in dir(checkpoint_scale)
+        if attr not in dir(torch.nn.Parameter)
+        and not attr.startswith("__")
+        and not torch.is_tensor(getattr(checkpoint_scale, attr))
+    }
+    setattr(
+        layer,
+        _FP8_TRANSPOSED_SCALE_ATTR,
+        (tuple(checkpoint_scale.shape), checkpoint_scale.dtype, loader_attrs),
+    )
+
+
+def stage_transposed_fp8_scales(model) -> list:
+    """Install checkpoint-layout weight_scale buffers so load_weights can fill them.
+
+    Returns (layer, live_param, staged_param) triples for restore_transposed_fp8_scales.
+    The staged buffer is filled with 0xFF bytes (NaN): a scale the incoming stream
+    fails to write poisons the first forward instead of passing as a stale value.
+    """
+    staged = []
+    for layer in model.modules():
+        record = getattr(layer, _FP8_TRANSPOSED_SCALE_ATTR, None)
+        if record is None:
+            continue
+        shape, dtype, loader_attrs = record
+        live = layer.weight_scale
+        buffer = torch.empty(shape, dtype=dtype, device=live.device)
+        buffer.view(torch.uint8).fill_(0xFF)
+        param = torch.nn.Parameter(buffer, requires_grad=False)
+        for attr, value in loader_attrs.items():
+            setattr(param, attr, value)
+        layer.weight_scale = param
+        staged.append((layer, live, param))
+    return staged
+
+
+def restore_transposed_fp8_scales(staged) -> None:
+    """Write each staged scale back, transposed, into the live storage and reinstall it."""
+    for layer, live, param in staged:
+        live.data.copy_(param.data.T)
+        layer.weight_scale = live
 
 
 def process_weights_after_loading_moe_for_vllm10(self, layer) -> None:
