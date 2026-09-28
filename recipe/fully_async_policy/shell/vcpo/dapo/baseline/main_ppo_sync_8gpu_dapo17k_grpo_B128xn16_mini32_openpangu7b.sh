@@ -150,6 +150,14 @@ rollout_mode=async
 # 0.5 is the ceiling with the resident (non-offloaded) trainer on the Qwen3-8B twin;
 # assumed to carry over (see MEMORY). Raise only together with param_offload=True.
 gpu_memory_utilization=${gpu_memory_utilization:-0.5}
+# H100 emulation on bigger cards (verl/utils/gpu_memory_cap.py): exporting VERL_GPU_MEM_CAP_GB=80
+# in the launching shell caps the TRAINER worker allocator at 80 GiB (actor role only; the vLLM
+# servers are separate processes bounded by gpu_memory_utilization). Pair it with the fraction
+# that gives vLLM the same absolute budget as on an 80 GiB H100: gpu_memory_utilization =
+# 0.5*80/<device GiB> (0.28 on a 143.8 GiB H200). The knob is only READ here, never set. Tagged
+# in exp_name so emulated runs never share a log dir with real ones.
+emu_tag=""
+if [[ -n "${VERL_GPU_MEM_CAP_GB:-}" ]]; then emu_tag=" h100-emu-${VERL_GPU_MEM_CAP_GB}gb-gmu${gpu_memory_utilization}"; fi
 rollout_tp=1
 enable_chunked_prefill=True
 max_num_batched_tokens=$((1024 * 10))
@@ -167,6 +175,23 @@ calculate_log_probs=True
 test_freq=${test_freq:-2}    # rollout steps (= 8 optimizer updates)
 save_freq=${save_freq:-2}    # rollout steps
 total_epochs=${total_epochs:-3}
+# Cap on OPTIMIZER UPDATES (null = none: total_epochs decides). One rollout step runs
+# updates_per_step = train_prompt_bsz / ppo_mini_batch_size * ppo_epochs updates, so the
+# cap is rounded UP to whole rollout steps and passed as verl's trainer.total_training_steps:
+# that step runs validation + a checkpoint save regardless of test_freq / save_freq and ends
+# the run (RayPPOTrainer.is_last_step). total_epochs still bounds it from above (a cap beyond
+# the epoch budget is never reached). LR is constant with no warmup: unaffected. A trailing
+# trainer.total_training_steps=N on the command line (the OOM smoke) still overrides this.
+#   export max_updates=200; bash <this script>
+max_updates=${max_updates:-null}
+updates_per_step=$(( train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs ))
+(( updates_per_step >= 1 )) || { echo "updates_per_step must be >= 1 (train_prompt_bsz / train_prompt_mini_bsz * ppo_epochs)" >&2; exit 2; }
+if [[ "${max_updates}" == "null" ]]; then
+    total_training_steps=null
+else
+    [[ "${max_updates}" =~ ^[1-9][0-9]*$ ]] || { echo "max_updates must be a positive integer or null, got '${max_updates}'" >&2; exit 2; }
+    total_training_steps=$(( (max_updates + updates_per_step - 1) / updates_per_step ))
+fi
 val_before_train=${val_before_train:-True}
 save_contents=${save_contents:-"['hf_model']"}
 max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-null} # keep every checkpoint
@@ -177,7 +202,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 openPangu-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 openPangu-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -279,4 +304,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
+    trainer.total_training_steps=${total_training_steps} \
     trainer.total_epochs=${total_epochs} "$@"

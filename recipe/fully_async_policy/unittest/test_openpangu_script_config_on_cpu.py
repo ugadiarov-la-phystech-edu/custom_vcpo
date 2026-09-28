@@ -288,8 +288,8 @@ class _OpenPanguMegatronArmMixin:
 
     def test_no_attention_backend_override_and_no_memory_cap(self):
         """Not ported from the AsyncRL scripts: forced TE fused attention (auto already picks it on
-        Hopper, and forcing removes the flash fallback) and the H200 per-process memory cap, which
-        would throttle an 80 GB H100 trainer to 72 GB."""
+        Hopper, and forcing removes the flash fallback) and a FORCED H200 per-process memory cap, which
+        would throttle an 80 GB H100 trainer to 72 GB (the cap is opt-in via VERL_GPU_MEM_CAP_GB)."""
         otc = OmegaConf.select(self.cfg, "actor_rollout_ref.actor.megatron.override_transformer_config") or {}
         # the stock megatron config carries attention_backend=flash (TE picks fused on Hopper anyway);
         # what must not appear is the forced "fused" of the AsyncRL scripts
@@ -299,7 +299,9 @@ class _OpenPanguMegatronArmMixin:
         self.assertEqual(otc.get("attention_backend"), qwen_otc.get("attention_backend"))
         with open(os.path.join(BASELINE, self.SCRIPT)) as f:
             text = f.read()
-        self.assertNotIn("VERL_GPU_MEM_CAP_GB", text)
+        # the cap is opt-in from the launching shell (verl/utils/gpu_memory_cap.py), never forced by
+        # the arm; only the sync arms carry the read-only emu_tag hook (test_sync_arm_h100_emu_on_cpu)
+        self.assertNotIn("export VERL_GPU_MEM_CAP_GB", text)
         self.assertNotIn("attention_backend=fused", text)
 
     def test_uses_the_bf16_hdo_recipe(self):
@@ -501,6 +503,26 @@ class TestBosFlagDefaultsOffEverywhereElse(unittest.TestCase):
             with self.subTest(script=name):
                 cfg = compose(name, **env)
                 self.assertIs(cfg.data.add_bos_token_to_prompt, False)
+
+    def test_orz_scripts_do_not_prepend_bos(self):
+        # A separate test so that a composition failure (SkipTest) here cannot hide the ones above.
+        for name, env in (
+            (ORZ_DEEPMATH_SYNC, {"TEST_FILE": "/tmp/test.parquet"}),
+            (ORZ72K_SYNC_N16, {"TEST_FILE": "/tmp/test.parquet"}),
+            (ORZ72K_SYNC_N32, {"TEST_FILE": "/tmp/test.parquet"}),
+            (ORZ_MEGATRON, {"TEST_FILE": "/tmp/test.parquet"}),
+            (SMOKE_ORZ_2P3, {}),
+        ):
+            with self.subTest(script=name):
+                cfg = compose(name, **env)
+                self.assertIs(cfg.data.add_bos_token_to_prompt, False)
+
+
+ORZ_DEEPMATH_SYNC = "main_ppo_sync_8gpu_deepmath_grpo_B32xn16_orz7b.sh"
+ORZ72K_SYNC_N16 = "main_ppo_sync_8gpu_orz72k_grpo_B128xn16_mini32_orz7b.sh"
+ORZ72K_SYNC_N32 = "main_ppo_sync_8gpu_orz72k_grpo_B128xn32_mini32_orz7b.sh"
+ORZ_MEGATRON = "grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1_is-pg_orz7b.sh"
+SMOKE_ORZ_2P3 = "smoke_test_orz7b_2+3.sh"
 
 
 class TestMegatronScriptsExportTheHfModulesCache(unittest.TestCase):
